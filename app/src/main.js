@@ -61,6 +61,7 @@ Dostepne narzedzia:
 - write_file {"path":"plik","content":"...","mode":"overwrite albo append"}
 - mkdir {"path":"folder"}
 - replace_text {"path":"plik","old":"tekst","new":"tekst","count":1}
+- create_pdf {"path":"raport.pdf","title":"Tytul","markdown":"# Tresc"} albo {"path":"raport.pdf","title":"Tytul","html":"<h1>Tresc</h1>"}
 - run_powershell {"command":"npm test","timeout":60}
 
 Gdy konczysz:
@@ -70,6 +71,7 @@ Zasady:
 - Nie probuj obchodzic sandboxa ani prosic o sciezki spoza root.
 - Przed edycja czytaj plik, chyba ze go tworzysz.
 - Komend shell uzywaj oszczednie; UI poprosi uzytkownika o zatwierdzenie.
+- Gdy narzedzie zwroci blad, nie poddawaj sie od razu: przeczytaj powod, wybierz obejscie i sprobuj dalej. Typowe obejscia: mkdir dla brakujacego folderu, zapis do innego pliku w workspace, zapis HTML/Markdown zamiast formatu docelowego, create_pdf dla PDF, albo krotka prosba do uzytkownika tylko gdy naprawde brakuje informacji.
 - Note ma byc publiczna i krotka: plan, hipoteza albo decyzja, bez dlugiego ukrytego rozumowania.`;
 
 const SKILL_CATALOG = [
@@ -410,10 +412,11 @@ function getSkillsForUi() {
 
 function getActiveSkillsPrompt() {
   const installed = new Set(loadSkillStore().installed);
-  const active = SKILL_CATALOG.filter((skill) => installed.has(skill.id));
-  if (!active.length) return "";
-  return active
-    .map((skill) => `- ${skill.name}: ${skill.instructions}`)
+  return SKILL_CATALOG
+    .map((skill) => {
+      const state = installed.has(skill.id) ? "aktywny" : "dostepny";
+      return `- ${skill.name} (${state}, local-only): ${skill.instructions}`;
+    })
     .join("\n");
 }
 
@@ -560,8 +563,10 @@ Aktualny model: ${model.displayName || model.id}.
 Intensywnosc pracy: ${reasoning.label}.
 Instrukcja intensywnosci: ${reasoning.instruction}${skillsPrompt ? `
 
-Aktywne lokalne skills:
-${skillsPrompt}` : ""}`;
+Dostepne lokalne skills:
+${skillsPrompt}
+
+Skills sa lokalnymi instrukcjami pracy, nie zewnetrznymi API. Jesli zadanie pasuje do skilla, uzyj go samodzielnie i zapisz artefakty w workspace.` : ""}`;
 }
 
 function createInitialMessages() {
@@ -736,6 +741,27 @@ function getModelPath() {
   return path.resolve(BIELIK_HOME, config.file);
 }
 
+function appendServerOptionArgs(serverArgs, config) {
+  const numberOptions = [
+    ["threads", "--threads"],
+    ["threadsBatch", "--threads-batch"],
+    ["batchSize", "--batch-size"],
+    ["ubatchSize", "--ubatch-size"],
+    ["parallel", "--parallel"],
+  ];
+  for (const [key, flag] of numberOptions) {
+    if (config[key] !== undefined && config[key] !== null) {
+      serverArgs.push(flag, String(config[key]));
+    }
+  }
+  if (config.flashAttention !== undefined) serverArgs.push("--flash-attn", String(config.flashAttention));
+  if (config.cacheTypeK) serverArgs.push("--cache-type-k", String(config.cacheTypeK));
+  if (config.cacheTypeV) serverArgs.push("--cache-type-v", String(config.cacheTypeV));
+  if (Array.isArray(config.extraServerArgs)) {
+    for (const arg of config.extraServerArgs) serverArgs.push(String(arg));
+  }
+}
+
 async function isServerReady(port = DEFAULT_PORT) {
   try {
     const res = await fetch(`http://127.0.0.1:${port}/v1/models`, { signal: AbortSignal.timeout(1500) });
@@ -756,46 +782,14 @@ async function getServerModelId(port = DEFAULT_PORT) {
   }
 }
 
-async function ensureServer(port = DEFAULT_PORT) {
-  const config = getModelConfig();
-  if (!config || config.kind !== "local-gguf") {
-    throw new Error("Ten model nie jest lokalnym GGUF. Claude Opus 4.5 wymaga API, nie lokalnego runtime.");
-  }
-
-  if (await isServerReady(port)) {
-    const liveModel = await getServerModelId(port);
-    const expectedFile = path.basename(getModelPath());
-    const matchesCurrent = runningModelId === selectedModelId ||
-      liveModel === config.serverModel ||
-      (liveModel && liveModel.includes(expectedFile));
-    if (matchesCurrent) {
-      runningModelId = selectedModelId;
-      emit("status", { status: "server-ready", detail: `Uzywam aktywnego serwera: ${config.displayName}.` });
-      return;
-    }
-    if (serverOwned) {
-      await stopOwnedServer();
-    } else {
-      throw new Error(`Port ${port} zajmuje inny model (${liveModel || "nieznany"}). Zamknij ten serwer albo uruchom ponownie aplikacje.`);
-    }
-  }
-
-  const serverExe = getRuntimeServerExe();
-  const modelPath = getModelPath();
-  if (!serverExe) throw new Error("Nie znaleziono runtime/llama-server.exe.");
-  const fileStatus = getModelFileStatus(config);
-  if (!fileStatus.available) {
-    const percent = Math.round((fileStatus.progress || 0) * 100);
-    throw new Error(`Model nie jest jeszcze gotowy: ${config.displayName} (${percent}%).`);
-  }
-
+async function launchServerProcess(config, modelPath, port, contextTokens, gpuLayers) {
   await fsp.mkdir(path.join(BIELIK_HOME, "logs"), { recursive: true });
   const outLog = fs.openSync(path.join(BIELIK_HOME, "logs", "local-codex-server.out.log"), "a");
   const errLog = fs.openSync(path.join(BIELIK_HOME, "logs", "local-codex-server.err.log"), "a");
+  const serverExe = getRuntimeServerExe();
+  if (!serverExe) throw new Error("Nie znaleziono runtime/llama-server.exe.");
 
-  emit("status", { status: "server-starting", detail: `Uruchamiam: ${config.displayName}.` });
-  const contextTokens = customModelSettings.contextTokens ?? config.contextTokens ?? 8192;
-  const gpuLayers = customModelSettings.gpuLayers ?? config.gpuLayers ?? 99;
+  emit("status", { status: "server-starting", detail: `Uruchamiam: ${config.displayName} (ctx ${contextTokens}, GPU layers ${gpuLayers}).` });
   const serverArgs = [
     "-m", modelPath,
     "-c", String(contextTokens),
@@ -810,6 +804,7 @@ async function ensureServer(port = DEFAULT_PORT) {
   if (config.reasoningBudget !== undefined) {
     serverArgs.push("--reasoning-budget", String(config.reasoningBudget));
   }
+  appendServerOptionArgs(serverArgs, config);
 
   let child;
   try {
@@ -844,6 +839,61 @@ async function ensureServer(port = DEFAULT_PORT) {
     await sleep(1000);
   }
   throw new Error("Serwer nie odpowiedzial w ciagu 180 sekund.");
+}
+
+async function ensureServer(port = DEFAULT_PORT) {
+  const config = getModelConfig();
+  if (!config || config.kind !== "local-gguf") {
+    throw new Error("Ten model nie jest lokalnym GGUF. Claude Opus 4.5 wymaga API, nie lokalnego runtime.");
+  }
+
+  if (await isServerReady(port)) {
+    const liveModel = await getServerModelId(port);
+    const expectedFile = path.basename(getModelPath());
+    const matchesCurrent = runningModelId === selectedModelId ||
+      liveModel === config.serverModel ||
+      (liveModel && liveModel.includes(expectedFile));
+    if (matchesCurrent) {
+      runningModelId = selectedModelId;
+      emit("status", { status: "server-ready", detail: `Uzywam aktywnego serwera: ${config.displayName}.` });
+      return;
+    }
+    if (serverOwned) {
+      await stopOwnedServer();
+    } else {
+      throw new Error(`Port ${port} zajmuje inny model (${liveModel || "nieznany"}). Zamknij ten serwer albo uruchom ponownie aplikacje.`);
+    }
+  }
+
+  const modelPath = getModelPath();
+  const fileStatus = getModelFileStatus(config);
+  if (!fileStatus.available) {
+    const percent = Math.round((fileStatus.progress || 0) * 100);
+    throw new Error(`Model nie jest jeszcze gotowy: ${config.displayName} (${percent}%).`);
+  }
+
+  const contextTokens = customModelSettings.contextTokens ?? config.contextTokens ?? 8192;
+  const configuredGpuLayers = customModelSettings.gpuLayers ?? config.gpuLayers ?? 99;
+  const gpuLayerAttempts = customModelSettings.gpuLayers != null
+    ? [configuredGpuLayers]
+    : [...new Set([configuredGpuLayers, ...(config.gpuLayerFallbacks || [])])];
+  let lastError = null;
+  for (let i = 0; i < gpuLayerAttempts.length; i += 1) {
+    try {
+      await launchServerProcess(config, modelPath, port, contextTokens, gpuLayerAttempts[i]);
+      return;
+    } catch (error) {
+      lastError = error;
+      await stopOwnedServer({ force: true });
+      if (i < gpuLayerAttempts.length - 1) {
+        emit("status", {
+          status: "server-starting",
+          detail: `Start nie wyszedl (${error.message || String(error)}). Probuje GPU layers ${gpuLayerAttempts[i + 1]}.`,
+        });
+      }
+    }
+  }
+  throw lastError || new Error("Nie udalo sie uruchomic modelu.");
 }
 
 async function stopOwnedServer(options = {}) {
@@ -1137,6 +1187,122 @@ function textPreview(value, limit = 26000) {
   return text.length > limit ? `${text.slice(0, limit)}\n...[truncated]` : text;
 }
 
+function htmlEscape(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll("\"", "&quot;");
+}
+
+function simpleMarkdownToHtml(markdown) {
+  const lines = String(markdown ?? "").split(/\r?\n/);
+  const html = [];
+  let inList = false;
+  let inCode = false;
+  let codeLines = [];
+  const closeList = () => {
+    if (inList) {
+      html.push("</ul>");
+      inList = false;
+    }
+  };
+  for (const line of lines) {
+    if (line.trim().startsWith("```")) {
+      if (inCode) {
+        html.push(`<pre><code>${htmlEscape(codeLines.join("\n"))}</code></pre>`);
+        codeLines = [];
+        inCode = false;
+      } else {
+        closeList();
+        inCode = true;
+      }
+      continue;
+    }
+    if (inCode) {
+      codeLines.push(line);
+      continue;
+    }
+    const trimmed = line.trim();
+    if (!trimmed) {
+      closeList();
+      html.push("<div class=\"spacer\"></div>");
+    } else if (trimmed.startsWith("### ")) {
+      closeList();
+      html.push(`<h3>${htmlEscape(trimmed.slice(4))}</h3>`);
+    } else if (trimmed.startsWith("## ")) {
+      closeList();
+      html.push(`<h2>${htmlEscape(trimmed.slice(3))}</h2>`);
+    } else if (trimmed.startsWith("# ")) {
+      closeList();
+      html.push(`<h1>${htmlEscape(trimmed.slice(2))}</h1>`);
+    } else if (/^[-*]\s+/.test(trimmed)) {
+      if (!inList) {
+        html.push("<ul>");
+        inList = true;
+      }
+      html.push(`<li>${htmlEscape(trimmed.replace(/^[-*]\s+/, ""))}</li>`);
+    } else {
+      closeList();
+      html.push(`<p>${htmlEscape(trimmed)}</p>`);
+    }
+  }
+  closeList();
+  if (inCode) html.push(`<pre><code>${htmlEscape(codeLines.join("\n"))}</code></pre>`);
+  return html.join("\n");
+}
+
+async function createPdfFile(args) {
+  const target = normalizeInsideRoot(args.path || "output.pdf");
+  const pdfPath = target.toLowerCase().endsWith(".pdf") ? target : `${target}.pdf`;
+  await fsp.mkdir(path.dirname(pdfPath), { recursive: true });
+  await fsp.mkdir(path.join(workspaceRoot, ".tmp"), { recursive: true });
+
+  const title = String(args.title || path.basename(pdfPath, ".pdf"));
+  const contentHtml = args.html
+    ? String(args.html)
+    : simpleMarkdownToHtml(args.markdown ?? args.content ?? "");
+  const pageHtml = `<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<title>${htmlEscape(title)}</title>
+<style>
+  body { font-family: "Segoe UI", Arial, sans-serif; color: #111827; margin: 42px; font-size: 12.5px; line-height: 1.55; }
+  h1 { font-size: 25px; margin: 0 0 18px; color: #0f172a; }
+  h2 { font-size: 18px; margin: 22px 0 10px; color: #0f172a; }
+  h3 { font-size: 14px; margin: 16px 0 8px; color: #1f2937; }
+  p { margin: 0 0 9px; }
+  ul { margin: 0 0 10px 20px; padding: 0; }
+  li { margin: 0 0 5px; }
+  pre { background: #f3f4f6; border: 1px solid #d1d5db; border-radius: 6px; padding: 10px; white-space: pre-wrap; }
+  .spacer { height: 8px; }
+</style>
+</head>
+<body>${contentHtml}</body>
+</html>`;
+
+  const tempHtml = path.join(workspaceRoot, ".tmp", `pdf-${crypto.randomUUID()}.html`);
+  await fsp.writeFile(tempHtml, pageHtml, "utf8");
+  const pdfWindow = new BrowserWindow({
+    show: false,
+    webPreferences: { offscreen: true, contextIsolation: true, nodeIntegration: false },
+  });
+  try {
+    await pdfWindow.loadFile(tempHtml);
+    const data = await pdfWindow.webContents.printToPDF({
+      pageSize: args.pageSize || "A4",
+      printBackground: true,
+      margins: { marginType: "default" },
+    });
+    await fsp.writeFile(pdfPath, data);
+  } finally {
+    try { pdfWindow.destroy(); } catch { /* ignore */ }
+    try { await fsp.rm(tempHtml, { force: true }); } catch { /* ignore */ }
+  }
+  return { path: relativeToRoot(pdfPath), bytes: fs.statSync(pdfPath).size, title };
+}
+
 async function readTextIfExists(file) {
   try {
     const stat = await fsp.stat(file);
@@ -1166,6 +1332,30 @@ function makeLineDiff(before, after) {
     }
   }
   return rows;
+}
+
+function getToolRecoveryHint(error, action) {
+  const message = String(error?.message || error);
+  const tool = action?.tool || "narzedzie";
+  if (/poza sandbox|Sciezka wychodzi/i.test(message)) {
+    return "Uzyj sciezki wzglednej w aktualnym workspace albo utworz podfolder w workspace i zapisz tam wynik. Nie probuj zapisywac poza sandboxiem.";
+  }
+  if (/ENOENT|nie znaleziono|Nie znaleziono/i.test(message)) {
+    return "Sprawdz ls/pwd, utworz brakujacy folder przez mkdir albo przeczytaj plik o poprawnej nazwie zanim ponowisz operacje.";
+  }
+  if (/EACCES|EPERM|access denied|odmowa/i.test(message)) {
+    return "Brak uprawnien. Zapisz alternatywny plik w workspace, np. output/ lub exports/, i poinformuj uzytkownika o obejściu.";
+  }
+  if (tool === "write_file" || tool === "replace_text") {
+    return "Jesli edycja pliku nie jest mozliwa, zapisz poprawiona wersje jako nowy plik obok oryginalu albo w exports/ i wyjasnij roznice.";
+  }
+  if (tool === "create_pdf") {
+    return "Jesli PDF nie powstal, zapisz zrodlo HTML/Markdown w workspace i sprobuj ponownie create_pdf z prostszym HTML.";
+  }
+  if (/zablokowane|odrzucil|blocked/i.test(message)) {
+    return "Komenda lub akcja zostala zablokowana. Uzyj bezpieczniejszego lokalnego narzedzia, plikow w workspace albo popros o zgode tylko na minimalna potrzebna komende.";
+  }
+  return "Przeanalizuj blad, wybierz najbezpieczniejsze obejscie i kontynuuj. Nie koncz zadania, jesli istnieje lokalna alternatywa.";
 }
 
 async function askApproval(request) {
@@ -1326,6 +1516,15 @@ async function executeTool(action) {
       before: textPreview(before),
       after: textPreview(after),
     });
+  } else if (tool === "create_pdf") {
+    result = await createPdfFile(args);
+    emit("file-change", {
+      path: result.path,
+      action: "create_pdf",
+      diff: [],
+      before: "",
+      after: `PDF: ${result.title} (${result.bytes} bytes)`,
+    });
   } else if (tool === "run_powershell") {
     result = await runPowerShell(String(args.command ?? ""), args.timeout);
   } else {
@@ -1406,13 +1605,14 @@ async function runAgent(userText) {
         toolPayload = { ok: true, result };
       } catch (error) {
         if (signal.aborted) throw new Error("Przerwano przez uzytkownika.");
-        toolPayload = { ok: false, error: error.message };
-        emit("tool-result", { tool: action.tool, ok: false, error: error.message });
+        const recoveryHint = getToolRecoveryHint(error, action);
+        toolPayload = { ok: false, error: error.message, recoveryHint };
+        emit("tool-result", { tool: action.tool, ok: false, error: error.message, recoveryHint });
       }
 
       messages.push({
         role: "user",
-        content: `Wynik narzedzia. Kontynuuj albo zakoncz finalem:\n${JSON.stringify(toolPayload, null, 2)}`,
+        content: `Wynik narzedzia. Kontynuuj albo zakoncz finalem. Jesli ok=false, masz obowiazek sprobowac obejscia z recoveryHint przed finalem:\n${JSON.stringify(toolPayload, null, 2)}`,
       });
     }
     const msg = "Osiagnieto limit krokow. Napisz, zeby kontynuowac.";

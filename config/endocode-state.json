@@ -1,16 +1,16 @@
 {
-  "selectedModelId": "deepseek-coder-v2-lite-q4km",
-  "reasoningLevel": "medium",
+  "selectedModelId": "zen4-coder-pro-iq2s",
+  "reasoningLevel": "max",
   "accessLevel": "sandbox",
   "customModelSettings": {
-    "temperature": 0.2,
-    "maxTokens": 1280,
-    "maxSteps": 0,
+    "temperature": 0.12,
+    "maxTokens": 2048,
+    "maxSteps": 48,
     "topP": 1,
     "topK": 0,
     "repeatPenalty": 1,
-    "contextTokens": 8192,
-    "gpuLayers": 99
+    "contextTokens": null,
+    "gpuLayers": null
   },
   "maxMessages": 100,
   "workspaceRoot": "C:\\Users\\Kejlo\\Desktop\\testy-ai"

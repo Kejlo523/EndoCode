@@ -143,6 +143,7 @@ function addInlineEvent(kind, title, body = "", extraHtml = "") {
     note: `<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.3"/><path d="M8 5v4M8 11v.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>`,
     error: `<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M8 1l7 13H1L8 1z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" fill="none"/></svg>`,
     change: `<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M3 8l3 3 7-7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
+    activity: `<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="2" fill="currentColor"/><path d="M2 8h2M12 8h2M8 2v2M8 12v2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>`,
   };
 
   const div = document.createElement("div");
@@ -162,6 +163,52 @@ function addInlineEvent(kind, title, body = "", extraHtml = "") {
   conversation.appendChild(div);
   conversation.scrollTop = conversation.scrollHeight;
   updateWelcome();
+  return div;
+}
+
+function upsertInlineEvent(activityId, kind, title, body = "") {
+  const safeBody = String(body ?? "").slice(0, 1400);
+  let el = conversation.querySelector(`.inline-event[data-activity-id="${activityId}"]`);
+  if (!el) {
+    el = addInlineEvent(kind, title, safeBody);
+    el.setAttribute("data-activity-id", activityId);
+  } else {
+    el.setAttribute("data-title", title);
+    el.setAttribute("data-body", safeBody);
+    const titleEl = el.querySelector(".inline-event-title");
+    const detailEl = el.querySelector(".inline-event-detail");
+    if (titleEl) titleEl.textContent = title;
+    if (detailEl) detailEl.textContent = safeBody;
+    else if (safeBody) {
+      const bodyEl = el.querySelector(".inline-event-body");
+      if (bodyEl) {
+        const div = document.createElement("div");
+        div.className = "inline-event-detail";
+        div.textContent = safeBody;
+        bodyEl.appendChild(div);
+      }
+    }
+    conversation.scrollTop = conversation.scrollHeight;
+  }
+}
+
+function compactJsonPreview(value) {
+  try {
+    return JSON.stringify(value, null, 2).slice(0, 900);
+  } catch {
+    return String(value ?? "").slice(0, 900);
+  }
+}
+
+function toolActionDetail(tool, args, note = "") {
+  const parts = [];
+  if (note) parts.push(note);
+  if (tool === "run_powershell" && args?.command) parts.push(args.command);
+  else if (tool === "write_file" && args?.path) parts.push(`plik: ${args.path}`);
+  else if (tool === "replace_text" && args?.path) parts.push(`plik: ${args.path}`);
+  else if (tool === "create_pdf" && args?.path) parts.push(`PDF: ${args.path}`);
+  else if (args && Object.keys(args).length) parts.push(compactJsonPreview(args));
+  return parts.join("\n");
 }
 
 function toolActionLabel(tool, args) {
@@ -173,6 +220,7 @@ function toolActionLabel(tool, args) {
     case "cd": return `cd ${args?.path || ""}`;
     case "pwd": return "Sprawdza ścieżkę";
     case "mkdir": return `mkdir ${args?.path || ""}`;
+    case "create_pdf": return `Tworzy PDF: ${args?.path || ""}`;
     case "run_powershell": return `Komenda PowerShell`;
     default: return `Narzędzie: ${tool}`;
   }
@@ -755,7 +803,7 @@ window.endocode.onEvent((event) => {
     return;
   }
   if (event.type === "run-start") {
-    addInlineEvent("note", "Start", "Rozpoczęto zadanie.");
+    addInlineEvent("activity", "Agent startuje", "Rozpoczęto zadanie.");
     showLive("Przygotowuje...");
     return;
   }
@@ -766,7 +814,7 @@ window.endocode.onEvent((event) => {
     return;
   }
   if (event.type === "note") {
-    addInlineEvent("note", "Notatka", event.note);
+    addInlineEvent("activity", "Model planuje", event.note);
     showLive("Notatka", event.note);
     return;
   }
@@ -793,23 +841,29 @@ window.endocode.onEvent((event) => {
     return;
   }
   if (event.type === "content-delta") {
-    showLive("Generuje odpowiedź...");
+    const preview = (event.full || event.text || "").trim().slice(0, 1200);
+    if (preview) upsertInlineEvent("model-writing", "activity", "Model pisze", preview);
+    showLive("Model pisze...", preview.slice(-140));
     return;
   }
   if (event.type === "tool-start") {
     const label = toolActionLabel(event.tool, event.args);
-    addInlineEvent("tool", label, event.note || "");
+    addInlineEvent("tool", label, toolActionDetail(event.tool, event.args, event.note || ""));
     showLive(label);
     return;
   }
   if (event.type === "tool-result") {
     if (!event.ok) {
-      addInlineEvent("error", `Błąd: ${event.tool}`, event.error || "");
+      addInlineEvent("error", `Błąd: ${event.tool}`, `${event.error || ""}${event.recoveryHint ? `\nObejście: ${event.recoveryHint}` : ""}`);
+    } else {
+      addInlineEvent("activity", `Zakończono: ${event.tool}`, compactJsonPreview(event.result || {}));
     }
     return;
   }
   if (event.type === "file-change") {
-    addInlineEvent("change", `${event.action === "write_file" ? "Zapisano" : "Edycja"}: ${event.path}`, "", renderDiff(event.diff));
+    const actionLabel = event.action === "write_file" ? "Zapisano" : event.action === "create_pdf" ? "Utworzono PDF" : "Edycja";
+    const body = event.action === "create_pdf" ? (event.after || "") : "";
+    addInlineEvent("change", `${actionLabel}: ${event.path}`, body, renderDiff(event.diff));
     showLive(`Zapisano: ${event.path}`);
     return;
   }

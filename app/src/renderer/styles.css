@@ -546,6 +546,12 @@ select:focus { border-color: var(--border-focus); }
   color: var(--accent);
 }
 
+.inline-event.activity {
+  background: rgba(188, 140, 255, 0.06);
+  border: 1px solid rgba(188, 140, 255, 0.16);
+  color: var(--violet);
+}
+
 .inline-event.error {
   background: var(--danger-bg);
   border: 1px solid rgba(248, 81, 73, 0.15);
@@ -566,6 +572,7 @@ select:focus { border-color: var(--border-focus); }
   font-size: 11px;
   margin-top: 2px;
   font-family: var(--mono);
+  white-space: pre-wrap;
 }
 .inline-event-time { font-size: 10px; color: var(--text-muted); flex-shrink: 0; }
 

@@ -1,334 +1,395 @@
 <!doctype html>
 <html lang="pl">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>EndoCode</title>
-    <link rel="stylesheet" href="./styles.css" />
-  </head>
-  <body>
-    <div class="app-shell">
-      <!-- ── SIDEBAR ── -->
-      <aside class="sidebar" id="sidebar">
-        <div class="sidebar-top">
-          <div class="brand-block">
-            <div class="brand-icon">
-              <svg viewBox="0 0 48 48" fill="none" width="32" height="32">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>EndoCode</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+
+<body>
+  <div class="app-shell">
+    <!-- ── SIDEBAR ── -->
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-top">
+        <div class="brand-block">
+          <div class="brand-icon">
+            <svg viewBox="0 0 48 48" fill="none" width="32" height="32">
+              <defs>
+                <linearGradient id="ig" x1="10" y1="10" x2="38" y2="38">
+                  <stop offset="0%" stop-color="#00d4aa" />
+                  <stop offset="100%" stop-color="#00b4d8" />
+                </linearGradient>
+              </defs>
+              <rect width="48" height="48" rx="12" fill="#0f3460" />
+              <path d="M12 16 L20 24 L12 32" stroke="url(#ig)" stroke-width="2.5" stroke-linecap="round"
+                stroke-linejoin="round" fill="none" />
+              <path d="M24 16 L36 16 M24 24 L34 24 M24 32 L36 32 M24 16 L24 32" stroke="url(#ig)" stroke-width="2.5"
+                stroke-linecap="round" stroke-linejoin="round" fill="none" />
+            </svg>
+          </div>
+          <span class="brand-name">EndoCode</span>
+        </div>
+
+        <button class="new-chat-btn" id="newChatBtn" title="Nowy czat">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+            <path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+          </svg>
+          <span>Nowy czat</span>
+        </button>
+      </div>
+
+      <div class="chat-history-section">
+        <div class="section-label">Historia</div>
+        <div class="chat-history-list" id="chatHistoryList">
+          <!-- chat items injected by JS -->
+        </div>
+      </div>
+
+      <div class="sidebar-bottom">
+        <button class="sidebar-menu-btn" id="skillsBtn" title="Skills">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+            <rect x="1" y="1" width="6" height="6" rx="1.5" stroke="currentColor" stroke-width="1.3" />
+            <rect x="9" y="1" width="6" height="6" rx="1.5" stroke="currentColor" stroke-width="1.3" />
+            <rect x="1" y="9" width="6" height="6" rx="1.5" stroke="currentColor" stroke-width="1.3" />
+            <rect x="9" y="9" width="6" height="6" rx="1.5" stroke="currentColor" stroke-width="1.3" />
+          </svg>
+          <span>Skills</span>
+        </button>
+
+        <div class="workspace-selector">
+          <div class="section-label">Workspace</div>
+          <button class="workspace-btn" id="chooseWorkspace" title="Zmień folder">
+            <svg width="15" height="15" viewBox="0 0 16 16" fill="none">
+              <path d="M2 4h5l1.5 2H14v7H2V4z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"
+                fill="none" />
+            </svg>
+            <span class="workspace-path" id="workspaceLabel">...</span>
+          </button>
+        </div>
+
+        <div class="system-monitor" id="systemMonitor">
+          <div class="section-label">System</div>
+          <div class="monitor-row">
+            <span class="monitor-label">CPU</span>
+            <div class="monitor-bar">
+              <div class="monitor-fill" id="cpuBar" style="width:0%"></div>
+            </div>
+            <span class="monitor-value" id="cpuValue">0%</span>
+          </div>
+          <div class="monitor-row">
+            <span class="monitor-label">GPU</span>
+            <div class="monitor-bar">
+              <div class="monitor-fill gpu" id="gpuBar" style="width:0%"></div>
+            </div>
+            <span class="monitor-value" id="gpuValue">—</span>
+          </div>
+          <div class="monitor-row">
+            <span class="monitor-label">RAM</span>
+            <div class="monitor-bar">
+              <div class="monitor-fill ram" id="ramBar" style="width:0%"></div>
+            </div>
+            <span class="monitor-value" id="ramValue">0%</span>
+          </div>
+          <div class="monitor-row">
+            <span class="monitor-label">VRAM</span>
+            <div class="monitor-bar">
+              <div class="monitor-fill vram" id="vramBar" style="width:0%"></div>
+            </div>
+            <span class="monitor-value" id="vramValue">—</span>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <!-- ── MAIN PANEL ── -->
+    <main class="main-panel">
+      <header class="topbar">
+        <div class="topbar-left">
+          <h1 class="chat-title" id="chatTitle">Nowy czat</h1>
+          <div class="context-indicator" id="contextIndicator" title="Kontekst rozmowy">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+              <circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.3" />
+              <path d="M8 5v3l2 2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+            </svg>
+            <span id="contextText">0 / 32 wiadomości</span>
+          </div>
+        </div>
+        <div class="topbar-controls">
+          <div class="control-pill">
+            <label class="pill-label" for="modelSelect">Model</label>
+            <select id="modelSelect"></select>
+          </div>
+          <div class="control-pill">
+            <label class="pill-label" for="reasoningSelect">Tryb</label>
+            <select id="reasoningSelect"></select>
+          </div>
+          <button class="access-toggle" id="accessToggle" title="Przełącz poziom dostępu">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" id="accessIcon">
+              <rect x="3" y="7" width="10" height="7" rx="1.5" stroke="currentColor" stroke-width="1.3" />
+              <path d="M5 7V5a3 3 0 016 0v2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+            </svg>
+            <span id="accessLabel">Sandbox</span>
+          </button>
+          <button class="settings-btn" id="settingsBtn" title="Ustawienia modelu">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+              <circle cx="8" cy="8" r="2" stroke="currentColor" stroke-width="1.3" />
+              <path
+                d="M8 1v2M8 13v2M1 8h2M13 8h2M3.05 3.05l1.41 1.41M11.54 11.54l1.41 1.41M3.05 12.95l1.41-1.41M11.54 4.46l1.41-1.41"
+                stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
+            </svg>
+          </button>
+          <button class="settings-btn kill-server-btn" id="killServerBtn" title="Kill switch: zabij proces modelu">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+              <path d="M8 1.8v6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+              <path d="M4.4 4.3a5 5 0 107.2 0" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+            </svg>
+          </button>
+        </div>
+      </header>
+
+      <section class="conversation-area" id="conversationArea">
+        <div class="conversation-scroll" id="conversation">
+          <!-- Welcome screen shown when empty -->
+          <div class="welcome-screen" id="welcomeScreen">
+            <div class="welcome-icon">
+              <svg viewBox="0 0 48 48" fill="none" width="56" height="56">
                 <defs>
-                  <linearGradient id="ig" x1="10" y1="10" x2="38" y2="38">
-                    <stop offset="0%" stop-color="#00d4aa"/>
-                    <stop offset="100%" stop-color="#00b4d8"/>
+                  <linearGradient id="wg" x1="10" y1="10" x2="38" y2="38">
+                    <stop offset="0%" stop-color="#00d4aa" />
+                    <stop offset="100%" stop-color="#00b4d8" />
                   </linearGradient>
                 </defs>
-                <rect width="48" height="48" rx="12" fill="#0f3460"/>
-                <path d="M12 16 L20 24 L12 32" stroke="url(#ig)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
-                <path d="M24 16 L36 16 M24 24 L34 24 M24 32 L36 32 M24 16 L24 32" stroke="url(#ig)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+                <path d="M12 16 L20 24 L12 32" stroke="url(#wg)" stroke-width="2.5" stroke-linecap="round"
+                  stroke-linejoin="round" fill="none" />
+                <path d="M24 16 L36 16 M24 24 L34 24 M24 32 L36 32 M24 16 L24 32" stroke="url(#wg)" stroke-width="2.5"
+                  stroke-linecap="round" stroke-linejoin="round" fill="none" />
               </svg>
             </div>
-            <span class="brand-name">EndoCode</span>
-          </div>
-
-          <button class="new-chat-btn" id="newChatBtn" title="Nowy czat">
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
-            <span>Nowy czat</span>
-          </button>
-        </div>
-
-        <div class="chat-history-section">
-          <div class="section-label">Historia</div>
-          <div class="chat-history-list" id="chatHistoryList">
-            <!-- chat items injected by JS -->
+            <h2>Co chcesz zbudować?</h2>
+            <p class="welcome-sub">Opisz zadanie — EndoCode przeczyta pliki, zaproponuje zmiany i uruchomi komendy.</p>
           </div>
         </div>
+      </section>
 
-        <div class="sidebar-bottom">
-          <button class="sidebar-menu-btn" id="skillsBtn" title="Skills">
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="1" y="1" width="6" height="6" rx="1.5" stroke="currentColor" stroke-width="1.3"/><rect x="9" y="1" width="6" height="6" rx="1.5" stroke="currentColor" stroke-width="1.3"/><rect x="1" y="9" width="6" height="6" rx="1.5" stroke="currentColor" stroke-width="1.3"/><rect x="9" y="9" width="6" height="6" rx="1.5" stroke="currentColor" stroke-width="1.3"/></svg>
-            <span>Skills</span>
-          </button>
+      <!-- ── LIVE ACTIVITY BAR ── -->
+      <div class="live-activity hidden" id="liveActivity">
+        <div class="live-pulse"></div>
+        <span class="live-label" id="liveLabel">Myśli...</span>
+        <span class="live-detail" id="liveDetail"></span>
+      </div>
 
-          <div class="workspace-selector">
-            <div class="section-label">Workspace</div>
-            <button class="workspace-btn" id="chooseWorkspace" title="Zmień folder">
-              <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M2 4h5l1.5 2H14v7H2V4z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" fill="none"/></svg>
-              <span class="workspace-path" id="workspaceLabel">...</span>
-            </button>
-          </div>
-
-          <div class="system-monitor" id="systemMonitor">
-            <div class="section-label">System</div>
-            <div class="monitor-row">
-              <span class="monitor-label">CPU</span>
-              <div class="monitor-bar"><div class="monitor-fill" id="cpuBar" style="width:0%"></div></div>
-              <span class="monitor-value" id="cpuValue">0%</span>
-            </div>
-            <div class="monitor-row">
-              <span class="monitor-label">GPU</span>
-              <div class="monitor-bar"><div class="monitor-fill gpu" id="gpuBar" style="width:0%"></div></div>
-              <span class="monitor-value" id="gpuValue">—</span>
-            </div>
-            <div class="monitor-row">
-              <span class="monitor-label">RAM</span>
-              <div class="monitor-bar"><div class="monitor-fill ram" id="ramBar" style="width:0%"></div></div>
-              <span class="monitor-value" id="ramValue">0%</span>
-            </div>
-            <div class="monitor-row">
-              <span class="monitor-label">VRAM</span>
-              <div class="monitor-bar"><div class="monitor-fill vram" id="vramBar" style="width:0%"></div></div>
-              <span class="monitor-value" id="vramValue">—</span>
-            </div>
-          </div>
-        </div>
-      </aside>
-
-      <!-- ── MAIN PANEL ── -->
-      <main class="main-panel">
-        <header class="topbar">
-          <div class="topbar-left">
-            <h1 class="chat-title" id="chatTitle">Nowy czat</h1>
-            <div class="context-indicator" id="contextIndicator" title="Kontekst rozmowy">
-              <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.3"/><path d="M8 5v3l2 2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
-              <span id="contextText">0 / 32 wiadomości</span>
-            </div>
-          </div>
-          <div class="topbar-controls">
-            <div class="control-pill">
-              <label class="pill-label" for="modelSelect">Model</label>
-              <select id="modelSelect"></select>
-            </div>
-            <div class="control-pill">
-              <label class="pill-label" for="reasoningSelect">Tryb</label>
-              <select id="reasoningSelect"></select>
-            </div>
-            <button class="access-toggle" id="accessToggle" title="Przełącz poziom dostępu">
-              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" id="accessIcon">
-                <rect x="3" y="7" width="10" height="7" rx="1.5" stroke="currentColor" stroke-width="1.3"/>
-                <path d="M5 7V5a3 3 0 016 0v2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
-              </svg>
-              <span id="accessLabel">Sandbox</span>
-            </button>
-            <button class="settings-btn" id="settingsBtn" title="Ustawienia modelu">
-              <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-                <circle cx="8" cy="8" r="2" stroke="currentColor" stroke-width="1.3"/>
-                <path d="M8 1v2M8 13v2M1 8h2M13 8h2M3.05 3.05l1.41 1.41M11.54 11.54l1.41 1.41M3.05 12.95l1.41-1.41M11.54 4.46l1.41-1.41" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
-              </svg>
-            </button>
-            <button class="settings-btn kill-server-btn" id="killServerBtn" title="Kill switch: zabij proces modelu">
-              <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-                <path d="M8 1.8v6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-                <path d="M4.4 4.3a5 5 0 107.2 0" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
-              </svg>
-            </button>
-          </div>
-        </header>
-
-        <section class="conversation-area" id="conversationArea">
-          <div class="conversation-scroll" id="conversation">
-            <!-- Welcome screen shown when empty -->
-            <div class="welcome-screen" id="welcomeScreen">
-              <div class="welcome-icon">
-                <svg viewBox="0 0 48 48" fill="none" width="56" height="56">
-                  <defs><linearGradient id="wg" x1="10" y1="10" x2="38" y2="38"><stop offset="0%" stop-color="#00d4aa"/><stop offset="100%" stop-color="#00b4d8"/></linearGradient></defs>
-                  <path d="M12 16 L20 24 L12 32" stroke="url(#wg)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
-                  <path d="M24 16 L36 16 M24 24 L34 24 M24 32 L36 32 M24 16 L24 32" stroke="url(#wg)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+      <!-- ── COMPOSER ── -->
+      <div class="composer-wrapper">
+        <form class="composer" id="composer">
+          <textarea id="prompt" rows="1" placeholder="Opisz zadanie lub zadaj pytanie..." autocomplete="off"></textarea>
+          <div class="composer-actions">
+            <div class="composer-meta">
+              <span class="composer-workspace" id="composerWorkspace">
+                <svg width="12" height="12" viewBox="0 0 16 16" fill="none">
+                  <path d="M2 4h5l1.5 2H14v7H2V4z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"
+                    fill="none" />
                 </svg>
-              </div>
-              <h2>Co chcesz zbudować?</h2>
-              <p class="welcome-sub">Opisz zadanie — EndoCode przeczyta pliki, zaproponuje zmiany i uruchomi komendy.</p>
+                <span id="composerWsName">workspace</span>
+              </span>
+              <span class="composer-access" id="composerAccess">
+                <svg width="12" height="12" viewBox="0 0 16 16" fill="none">
+                  <rect x="3" y="7" width="10" height="7" rx="1.5" stroke="currentColor" stroke-width="1.1" />
+                  <path d="M5 7V5a3 3 0 016 0v2" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" />
+                </svg>
+                Sandbox
+              </span>
+            </div>
+            <div class="composer-buttons">
+              <button id="stopBtn" type="button" class="stop-btn hidden" title="Zatrzymaj">
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+                  <rect x="3" y="3" width="10" height="10" rx="2" fill="currentColor" />
+                </svg>
+                Stop
+              </button>
+              <button id="send" type="submit" title="Wyślij (Ctrl+Enter)">
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                  <path d="M3 13V3l11 5-11 5z" fill="currentColor" />
+                </svg>
+              </button>
             </div>
           </div>
-        </section>
+        </form>
+      </div>
+    </main>
+  </div>
 
-        <!-- ── LIVE ACTIVITY BAR ── -->
-        <div class="live-activity hidden" id="liveActivity">
-          <div class="live-pulse"></div>
-          <span class="live-label" id="liveLabel">Myśli...</span>
-          <span class="live-detail" id="liveDetail"></span>
-        </div>
-
-        <!-- ── COMPOSER ── -->
-        <div class="composer-wrapper">
-          <form class="composer" id="composer">
-            <textarea id="prompt" rows="1" placeholder="Opisz zadanie lub zadaj pytanie..." autocomplete="off"></textarea>
-            <div class="composer-actions">
-              <div class="composer-meta">
-                <span class="composer-workspace" id="composerWorkspace">
-                  <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M2 4h5l1.5 2H14v7H2V4z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" fill="none"/></svg>
-                  <span id="composerWsName">workspace</span>
-                </span>
-                <span class="composer-access" id="composerAccess">
-                  <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><rect x="3" y="7" width="10" height="7" rx="1.5" stroke="currentColor" stroke-width="1.1"/><path d="M5 7V5a3 3 0 016 0v2" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/></svg>
-                  Sandbox
-                </span>
-              </div>
-              <div class="composer-buttons">
-                <button id="stopBtn" type="button" class="stop-btn hidden" title="Zatrzymaj">
-                  <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><rect x="3" y="3" width="10" height="10" rx="2" fill="currentColor"/></svg>
-                  Stop
-                </button>
-                <button id="send" type="submit" title="Wyślij (Ctrl+Enter)">
-                  <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 13V3l11 5-11 5z" fill="currentColor"/></svg>
-                </button>
-              </div>
-            </div>
-          </form>
-        </div>
-      </main>
-    </div>
-
-    <!-- ── APPROVAL MODAL ── -->
-    <div class="modal-overlay hidden" id="approvalModal">
-      <div class="modal-card">
-        <div class="modal-header">
-          <svg width="18" height="18" viewBox="0 0 16 16" fill="none"><path d="M8 1l7 13H1L8 1z" stroke="#ffb347" stroke-width="1.3" stroke-linejoin="round" fill="none"/><path d="M8 6v3M8 11v.5" stroke="#ffb347" stroke-width="1.5" stroke-linecap="round"/></svg>
-          <span class="modal-title">Zatwierdź komendę</span>
-        </div>
-        <div class="modal-cwd" id="approvalCwd"></div>
-        <pre class="modal-command" id="approvalCommand"></pre>
-        <div class="modal-actions">
-          <button class="modal-btn reject" id="rejectCommand">Odrzuć</button>
-          <button class="modal-btn approve" id="approveCommand">Uruchom</button>
-        </div>
+  <!-- ── APPROVAL MODAL ── -->
+  <div class="modal-overlay hidden" id="approvalModal">
+    <div class="modal-card">
+      <div class="modal-header">
+        <svg width="18" height="18" viewBox="0 0 16 16" fill="none">
+          <path d="M8 1l7 13H1L8 1z" stroke="#ffb347" stroke-width="1.3" stroke-linejoin="round" fill="none" />
+          <path d="M8 6v3M8 11v.5" stroke="#ffb347" stroke-width="1.5" stroke-linecap="round" />
+        </svg>
+        <span class="modal-title">Zatwierdź komendę</span>
+      </div>
+      <div class="modal-cwd" id="approvalCwd"></div>
+      <pre class="modal-command" id="approvalCommand"></pre>
+      <div class="modal-actions">
+        <button class="modal-btn reject" id="rejectCommand">Odrzuć</button>
+        <button class="modal-btn approve" id="approveCommand">Uruchom</button>
       </div>
     </div>
+  </div>
 
-    <!-- ── SKILLS PANEL ── -->
-    <div class="modal-overlay hidden" id="skillsModal">
-      <div class="modal-card skills-card">
-        <div class="modal-header">
-          <svg width="18" height="18" viewBox="0 0 16 16" fill="none"><rect x="1" y="1" width="6" height="6" rx="1.5" stroke="#00d4aa" stroke-width="1.3"/><rect x="9" y="1" width="6" height="6" rx="1.5" stroke="#00d4aa" stroke-width="1.3"/><rect x="1" y="9" width="6" height="6" rx="1.5" stroke="#00d4aa" stroke-width="1.3"/><rect x="9" y="9" width="6" height="6" rx="1.5" stroke="#00d4aa" stroke-width="1.3"/></svg>
-          <span class="modal-title">Skills</span>
-          <button class="modal-close" id="closeSkills">&times;</button>
-        </div>
-        <div class="skills-toolbar">
-          <span class="skills-count" id="skillsCount">0 / 10 aktywnych</span>
-          <button class="modal-btn approve" id="installRecommendedSkills">Zainstaluj 10</button>
-        </div>
-        <div class="skills-list" id="skillsList">
-          <div class="skills-empty">Ładowanie...</div>
-        </div>
+  <!-- ── SKILLS PANEL ── -->
+  <div class="modal-overlay hidden" id="skillsModal">
+    <div class="modal-card skills-card">
+      <div class="modal-header">
+        <svg width="18" height="18" viewBox="0 0 16 16" fill="none">
+          <rect x="1" y="1" width="6" height="6" rx="1.5" stroke="#00d4aa" stroke-width="1.3" />
+          <rect x="9" y="1" width="6" height="6" rx="1.5" stroke="#00d4aa" stroke-width="1.3" />
+          <rect x="1" y="9" width="6" height="6" rx="1.5" stroke="#00d4aa" stroke-width="1.3" />
+          <rect x="9" y="9" width="6" height="6" rx="1.5" stroke="#00d4aa" stroke-width="1.3" />
+        </svg>
+        <span class="modal-title">Skills</span>
+        <button class="modal-close" id="closeSkills">&times;</button>
+      </div>
+      <div class="skills-toolbar">
+        <span class="skills-count" id="skillsCount">0 / 10 aktywnych</span>
+        <button class="modal-btn approve" id="installRecommendedSkills">Zainstaluj 10</button>
+      </div>
+      <div class="skills-list" id="skillsList">
+        <div class="skills-empty">Ładowanie...</div>
       </div>
     </div>
+  </div>
 
-    <!-- ── SETTINGS MODAL ── -->
-    <div class="modal-overlay hidden" id="settingsModal">
-      <div class="modal-card settings-card">
-        <div class="modal-header">
-          <svg width="18" height="18" viewBox="0 0 16 16" fill="none">
-            <circle cx="8" cy="8" r="2" stroke="#00d4aa" stroke-width="1.3"/>
-            <path d="M8 1v2M8 13v2M1 8h2M13 8h2M3.05 3.05l1.41 1.41M11.54 11.54l1.41 1.41M3.05 12.95l1.41-1.41M11.54 4.46l1.41-1.41" stroke="#00d4aa" stroke-width="1.2" stroke-linecap="round"/>
-          </svg>
-          <span class="modal-title">Ustawienia modelu</span>
-          <button class="modal-close" id="closeSettings">&times;</button>
-        </div>
-        <div class="settings-body" id="settingsBody">
-          <!-- Temperature -->
-          <div class="setting-row">
-            <div class="setting-info">
-              <label class="setting-name">Temperature</label>
-              <div class="setting-desc">Kontroluje losowość odpowiedzi. Niższe = bardziej deterministyczne, wyższe = bardziej kreatywne.</div>
-            </div>
-            <div class="setting-control">
-              <input type="range" id="set_temperature" min="0" max="2" step="0.05" value="0.2">
-              <span class="setting-value" id="val_temperature">0.2</span>
-            </div>
+  <!-- ── SETTINGS MODAL ── -->
+  <div class="modal-overlay hidden" id="settingsModal">
+    <div class="modal-card settings-card">
+      <div class="modal-header">
+        <svg width="18" height="18" viewBox="0 0 16 16" fill="none">
+          <circle cx="8" cy="8" r="2" stroke="#00d4aa" stroke-width="1.3" />
+          <path
+            d="M8 1v2M8 13v2M1 8h2M13 8h2M3.05 3.05l1.41 1.41M11.54 11.54l1.41 1.41M3.05 12.95l1.41-1.41M11.54 4.46l1.41-1.41"
+            stroke="#00d4aa" stroke-width="1.2" stroke-linecap="round" />
+        </svg>
+        <span class="modal-title">Ustawienia modelu</span>
+        <button class="modal-close" id="closeSettings">&times;</button>
+      </div>
+      <div class="settings-body" id="settingsBody">
+        <!-- Temperature -->
+        <div class="setting-row">
+          <div class="setting-info">
+            <label class="setting-name">Temperature</label>
+            <div class="setting-desc">Kontroluje losowość odpowiedzi. Niższe = bardziej deterministyczne, wyższe =
+              bardziej kreatywne.</div>
           </div>
-          <!-- Max Tokens -->
-          <div class="setting-row">
-            <div class="setting-info">
-              <label class="setting-name">Max Tokens (odpowiedź)</label>
-              <div class="setting-desc">Maksymalna długość pojedynczej odpowiedzi modelu w tokenach.</div>
-            </div>
-            <div class="setting-control">
-              <input type="range" id="set_maxTokens" min="256" max="8192" step="128" value="1300">
-              <span class="setting-value" id="val_maxTokens">1300</span>
-            </div>
-          </div>
-          <!-- Max Steps -->
-          <div class="setting-row">
-            <div class="setting-info">
-              <label class="setting-name">Limit kroków</label>
-              <div class="setting-desc">Ile kroków agent może wykonać. 0 = bez limitu (∞). Domyślnie zależy od trybu pracy.</div>
-            </div>
-            <div class="setting-control">
-              <input type="range" id="set_maxSteps" min="0" max="100" step="1" value="14">
-              <span class="setting-value" id="val_maxSteps">14</span>
-            </div>
-          </div>
-          <!-- Top P -->
-          <div class="setting-row">
-            <div class="setting-info">
-              <label class="setting-name">Top P (nucleus sampling)</label>
-              <div class="setting-desc">Ogranicz tokeny do tych, których suma prawdopodobieństwa wynosi top_p. Mniejsze = bardziej skupione.</div>
-            </div>
-            <div class="setting-control">
-              <input type="range" id="set_topP" min="0.1" max="1" step="0.05" value="1">
-              <span class="setting-value" id="val_topP">1.0</span>
-            </div>
-          </div>
-          <!-- Top K -->
-          <div class="setting-row">
-            <div class="setting-info">
-              <label class="setting-name">Top K</label>
-              <div class="setting-desc">Ogranicz wybór do K najbardziej prawdopodobnych tokenów. 0 = wyłączone.</div>
-            </div>
-            <div class="setting-control">
-              <input type="range" id="set_topK" min="0" max="200" step="1" value="0">
-              <span class="setting-value" id="val_topK">0</span>
-            </div>
-          </div>
-          <!-- Repeat Penalty -->
-          <div class="setting-row">
-            <div class="setting-info">
-              <label class="setting-name">Repeat Penalty</label>
-              <div class="setting-desc">Kara za powtarzanie tokenów. 1.0 = brak kary, wyższe = mniej powtórzeń.</div>
-            </div>
-            <div class="setting-control">
-              <input type="range" id="set_repeatPenalty" min="1" max="2" step="0.05" value="1">
-              <span class="setting-value" id="val_repeatPenalty">1.0</span>
-            </div>
-          </div>
-          <!-- Context Tokens -->
-          <div class="setting-row">
-            <div class="setting-info">
-              <label class="setting-name">Context Window (tokeny)</label>
-              <div class="setting-desc">Rozmiar okna kontekstu serwera. Większe = więcej pamięci rozmowy, ale więcej VRAM. Wymaga restartu serwera.</div>
-            </div>
-            <div class="setting-control">
-              <input type="range" id="set_contextTokens" min="1024" max="32768" step="1024" value="8192">
-              <span class="setting-value" id="val_contextTokens">8192</span>
-            </div>
-          </div>
-          <!-- GPU Layers -->
-          <div class="setting-row">
-            <div class="setting-info">
-              <label class="setting-name">GPU Layers (offload)</label>
-              <div class="setting-desc">Ile warstw modelu załadować na GPU. Więcej = szybciej, ale więcej VRAM. 0 = tylko CPU. Wymaga restartu serwera.</div>
-            </div>
-            <div class="setting-control">
-              <input type="range" id="set_gpuLayers" min="0" max="99" step="1" value="99">
-              <span class="setting-value" id="val_gpuLayers">99</span>
-            </div>
-          </div>
-          <!-- Max Messages (compaction) -->
-          <div class="setting-row">
-            <div class="setting-info">
-              <label class="setting-name">Max wiadomości (kompaktowanie)</label>
-              <div class="setting-desc">Po ilu wiadomościach następuje kompaktowanie kontekstu. Niższe = mniej lag przy długich czatach.</div>
-            </div>
-            <div class="setting-control">
-              <input type="range" id="set_maxMessages" min="8" max="128" step="4" value="32">
-              <span class="setting-value" id="val_maxMessages">32</span>
-            </div>
+          <div class="setting-control">
+            <input type="range" id="set_temperature" min="0" max="2" step="0.05" value="0.2">
+            <span class="setting-value" id="val_temperature">0.2</span>
           </div>
         </div>
-        <div class="settings-actions">
-          <button class="modal-btn reject" id="resetSettings">Resetuj do domyślnych</button>
-          <button class="modal-btn approve" id="applySettings">Zastosuj</button>
+        <!-- Max Tokens -->
+        <div class="setting-row">
+          <div class="setting-info">
+            <label class="setting-name">Max Tokens (odpowiedź)</label>
+            <div class="setting-desc">Maksymalna długość pojedynczej odpowiedzi modelu w tokenach.</div>
+          </div>
+          <div class="setting-control">
+            <input type="range" id="set_maxTokens" min="256" max="8192" step="128" value="1300">
+            <span class="setting-value" id="val_maxTokens">1300</span>
+          </div>
+        </div>
+        <!-- Max Steps -->
+        <div class="setting-row">
+          <div class="setting-info">
+            <label class="setting-name">Limit kroków</label>
+            <div class="setting-desc">Ile kroków agent może wykonać. 0 = bez limitu (∞). Domyślnie zależy od trybu
+              pracy.</div>
+          </div>
+          <div class="setting-control">
+            <input type="range" id="set_maxSteps" min="0" max="100" step="1" value="14">
+            <span class="setting-value" id="val_maxSteps">14</span>
+          </div>
+        </div>
+        <!-- Top P -->
+        <div class="setting-row">
+          <div class="setting-info">
+            <label class="setting-name">Top P (nucleus sampling)</label>
+            <div class="setting-desc">Ogranicz tokeny do tych, których suma prawdopodobieństwa wynosi top_p. Mniejsze =
+              bardziej skupione.</div>
+          </div>
+          <div class="setting-control">
+            <input type="range" id="set_topP" min="0.1" max="1" step="0.05" value="1">
+            <span class="setting-value" id="val_topP">1.0</span>
+          </div>
+        </div>
+        <!-- Top K -->
+        <div class="setting-row">
+          <div class="setting-info">
+            <label class="setting-name">Top K</label>
+            <div class="setting-desc">Ogranicz wybór do K najbardziej prawdopodobnych tokenów. 0 = wyłączone.</div>
+          </div>
+          <div class="setting-control">
+            <input type="range" id="set_topK" min="0" max="200" step="1" value="0">
+            <span class="setting-value" id="val_topK">0</span>
+          </div>
+        </div>
+        <!-- Repeat Penalty -->
+        <div class="setting-row">
+          <div class="setting-info">
+            <label class="setting-name">Repeat Penalty</label>
+            <div class="setting-desc">Kara za powtarzanie tokenów. 1.0 = brak kary, wyższe = mniej powtórzeń.</div>
+          </div>
+          <div class="setting-control">
+            <input type="range" id="set_repeatPenalty" min="1" max="2" step="0.05" value="1">
+            <span class="setting-value" id="val_repeatPenalty">1.0</span>
+          </div>
+        </div>
+        <!-- Context Tokens -->
+        <div class="setting-row">
+          <div class="setting-info">
+            <label class="setting-name">Context Window (tokeny)</label>
+            <div class="setting-desc">Rozmiar okna kontekstu serwera. Większe = więcej pamięci rozmowy, ale więcej VRAM.
+              Wymaga restartu serwera.</div>
+          </div>
+          <div class="setting-control">
+            <input type="range" id="set_contextTokens" min="1024" max="32768" step="1024" value="8192">
+            <span class="setting-value" id="val_contextTokens">8192</span>
+          </div>
+        </div>
+        <!-- GPU Layers -->
+        <div class="setting-row">
+          <div class="setting-info">
+            <label class="setting-name">GPU Layers (offload)</label>
+            <div class="setting-desc">Ile warstw modelu załadować na GPU. Więcej = szybciej, ale więcej VRAM. 0 = tylko
+              CPU. Wymaga restartu serwera.</div>
+          </div>
+          <div class="setting-control">
+            <input type="range" id="set_gpuLayers" min="0" max="99" step="1" value="99">
+            <span class="setting-value" id="val_gpuLayers">99</span>
+          </div>
+        </div>
+        <!-- Max Messages (compaction) -->
+        <div class="setting-row">
+          <div class="setting-info">
+            <label class="setting-name">Max wiadomości (kompaktowanie)</label>
+            <div class="setting-desc">Po ilu wiadomościach następuje kompaktowanie kontekstu. Niższe = mniej lag przy
+              długich czatach.</div>
+          </div>
+          <div class="setting-control">
+            <input type="range" id="set_maxMessages" min="8" max="128" step="4" value="32">
+            <span class="setting-value" id="val_maxMessages">32</span>
+          </div>
         </div>
       </div>
+      <div class="settings-actions">
+        <button class="modal-btn reject" id="resetSettings">Resetuj do domyślnych</button>
+        <button class="modal-btn approve" id="applySettings">Zastosuj</button>
+      </div>
     </div>
+  </div>
 
-    <script src="./renderer.js"></script>
-  </body>
+  <script src="./renderer.js"></script>
+</body>
+
 </html>

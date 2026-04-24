@@ -1,6 +1,27 @@
 {
-  "defaultModelId": "qwen25-coder-14b-q4km",
+  "defaultModelId": "zen4-coder-pro-iq2s",
   "models": [
+    {
+      "id": "zen4-coder-pro-iq2s",
+      "displayName": "Zen4 Coder Pro i1 IQ2_S",
+      "kind": "local-gguf",
+      "serverModel": "zen4-coder-pro.i1-IQ2_S",
+      "file": "models/zen4-coder-pro.i1-IQ2_S.gguf",
+      "expectedBytes": 23641442464,
+      "contextTokens": 24576,
+      "gpuLayers": 24,
+      "gpuLayerFallbacks": [20, 16, 12],
+      "threads": 16,
+      "threadsBatch": 20,
+      "batchSize": 2048,
+      "ubatchSize": 512,
+      "parallel": 1,
+      "flashAttention": "on",
+      "cacheTypeK": "q8_0",
+      "cacheTypeV": "q8_0",
+      "source": "mradermacher/zen4-coder-pro-i1-GGUF",
+      "description": "Domyslny mocny lokalny coder 80B/Qwen3Next w quancie IQ2_S. Config pod RTX 3060 12 GB + i7-13700K + 32 GB RAM: hybryda GPU/CPU, flash-attn, q8 KV cache i bezpieczny kontekst 24K."
+    },
     {
       "id": "qwen25-coder-14b-q4km",
       "displayName": "Qwen2.5-Coder 14B Q4_K_M",
