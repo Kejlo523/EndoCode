@@ -1,6 +1,6 @@
 const { contextBridge, ipcRenderer } = require("electron");
 
-contextBridge.exposeInMainWorld("bielik", {
+contextBridge.exposeInMainWorld("endocode", {
   getState: () => ipcRenderer.invoke("app:state"),
   selectWorkspace: () => ipcRenderer.invoke("app:select-workspace"),
   resetChat: () => ipcRenderer.invoke("app:reset-chat"),
@@ -9,6 +9,12 @@ contextBridge.exposeInMainWorld("bielik", {
   send: (text) => ipcRenderer.invoke("agent:send", text),
   abort: () => ipcRenderer.invoke("agent:abort"),
   approve: (approvalId, approved) => ipcRenderer.invoke("approval:reply", approvalId, approved),
+  getSystemInfo: () => ipcRenderer.invoke("app:system-info"),
+  getContextInfo: () => ipcRenderer.invoke("app:context-info"),
+  setAccessLevel: (level) => ipcRenderer.invoke("app:set-access-level", level),
+  saveChat: (session) => ipcRenderer.invoke("app:save-chat", session),
+  loadChats: () => ipcRenderer.invoke("app:load-chats"),
+  deleteChat: (chatId) => ipcRenderer.invoke("app:delete-chat", chatId),
   onEvent: (callback) => {
     const listener = (_event, payload) => callback(payload);
     ipcRenderer.on("agent:event", listener);

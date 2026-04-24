@@ -2,8 +2,9 @@ const { app, BrowserWindow, dialog, ipcMain } = require("electron");
 const path = require("node:path");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
-const { spawn } = require("node:child_process");
+const { spawn, execSync } = require("node:child_process");
 const crypto = require("node:crypto");
+const os = require("node:os");
 
 const DEFAULT_PORT = 8088;
 const MAX_FILE_BYTES = 220000;
@@ -73,6 +74,10 @@ let serverOwned = false;
 let runningModelId = null;
 let runInProgress = false;
 let runAbortController = null;
+let accessLevel = "sandbox"; // "sandbox" or "full"
+let chatHistory = [];
+let currentChatId = null;
+let previousCpuInfo = os.cpus();
 
 function emit(type, payload = {}) {
   if (mainWindow && !mainWindow.isDestroyed()) {
@@ -158,14 +163,79 @@ function loadModelCatalog() {
 }
 
 function loadAppSettings() {
-  return readJsonFile(path.join(BIELIK_HOME, "config", "local-codex-state.json"), {});
+  return readJsonFile(path.join(BIELIK_HOME, "config", "endocode-state.json"), {});
 }
 
 function saveAppSettings() {
-  writeJsonFile(path.join(BIELIK_HOME, "config", "local-codex-state.json"), {
+  writeJsonFile(path.join(BIELIK_HOME, "config", "endocode-state.json"), {
     selectedModelId,
     reasoningLevel: selectedReasoning,
+    accessLevel,
   });
+}
+
+function getChatHistoryPath() {
+  return path.join(BIELIK_HOME, "config", "chat-history.json");
+}
+
+function loadChatHistory() {
+  try {
+    const data = fs.readFileSync(getChatHistoryPath(), "utf8");
+    chatHistory = JSON.parse(data);
+  } catch {
+    chatHistory = [];
+  }
+  return chatHistory;
+}
+
+function saveChatHistory() {
+  writeJsonFile(getChatHistoryPath(), chatHistory);
+}
+
+function getSystemInfo() {
+  const cpus = os.cpus();
+  let cpuPercent = 0;
+  if (previousCpuInfo && previousCpuInfo.length === cpus.length) {
+    let totalIdle = 0, totalTick = 0;
+    for (let i = 0; i < cpus.length; i++) {
+      const prev = previousCpuInfo[i].times;
+      const curr = cpus[i].times;
+      const idle = curr.idle - prev.idle;
+      const total = (curr.user - prev.user) + (curr.nice - prev.nice) + (curr.sys - prev.sys) + (curr.irq - prev.irq) + idle;
+      totalIdle += idle;
+      totalTick += total;
+    }
+    cpuPercent = totalTick > 0 ? Math.round(((totalTick - totalIdle) / totalTick) * 100) : 0;
+  }
+  previousCpuInfo = cpus;
+
+  const totalMem = os.totalmem();
+  const freeMem = os.freemem();
+  const usedMem = totalMem - freeMem;
+  const ramPercent = Math.round((usedMem / totalMem) * 100);
+
+  let gpuPercent = -1;
+  try {
+    const out = execSync('nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits', { timeout: 2000, windowsHide: true }).toString().trim();
+    gpuPercent = parseInt(out, 10) || 0;
+  } catch { /* no nvidia-smi */ }
+
+  return {
+    cpu: cpuPercent,
+    gpu: gpuPercent,
+    ramPercent,
+    ramUsedGB: (usedMem / 1073741824).toFixed(1),
+    ramTotalGB: (totalMem / 1073741824).toFixed(1),
+  };
+}
+
+function getContextInfo() {
+  return {
+    messageCount: messages.length,
+    maxMessages: MAX_MESSAGES,
+    willCompactAt: MAX_MESSAGES,
+    isNearCompaction: messages.length > MAX_MESSAGES - 4,
+  };
 }
 
 const initialSettings = loadAppSettings();
@@ -232,6 +302,7 @@ function getModelFileStatus(model) {
 function normalizeInsideRoot(rawPath = ".") {
   const base = path.isAbsolute(String(rawPath)) ? String(rawPath) : path.join(cwd, String(rawPath));
   const resolved = path.resolve(base);
+  if (accessLevel === "full") return resolved;
   const rel = path.relative(workspaceRoot, resolved);
   if (rel.startsWith("..") || path.isAbsolute(rel)) {
     throw new Error(`Sciezka wychodzi poza sandbox: ${rawPath}`);
@@ -799,12 +870,12 @@ function getState() {
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 1240,
-    height: 820,
+    width: 1280,
+    height: 860,
     minWidth: 960,
     minHeight: 640,
-    backgroundColor: "#111418",
-    title: "Local Codex",
+    backgroundColor: "#1a1a2e",
+    title: "EndoCode",
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
@@ -816,6 +887,9 @@ function createWindow() {
 
 app.whenReady().then(async () => {
   await fsp.mkdir(workspaceRoot, { recursive: true });
+  loadChatHistory();
+  const settings = loadAppSettings();
+  if (settings.accessLevel) accessLevel = settings.accessLevel;
   createWindow();
 });
 
@@ -828,10 +902,10 @@ app.on("before-quit", async () => {
   await stopOwnedServer();
 });
 
-ipcMain.handle("app:state", () => getState());
+ipcMain.handle("app:state", () => ({ ...getState(), accessLevel }));
 ipcMain.handle("app:select-workspace", async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
-    title: "Wybierz sandbox workspace",
+    title: "Wybierz workspace",
     properties: ["openDirectory", "createDirectory"],
     defaultPath: workspaceRoot,
   });
@@ -842,6 +916,7 @@ ipcMain.handle("app:select-workspace", async () => {
 });
 ipcMain.handle("app:reset-chat", () => {
   messages = createInitialMessages();
+  currentChatId = null;
   emit("status", { status: "chat-reset", detail: "Wyczyszczono kontekst rozmowy." });
 });
 ipcMain.handle("app:set-model", async (_event, modelId) => {
@@ -873,4 +948,27 @@ ipcMain.handle("agent:abort", () => {
 });
 ipcMain.handle("approval:reply", (_event, approvalId, approved) => {
   ipcMain.emit(`approval:${approvalId}`, _event, approved);
+});
+ipcMain.handle("app:system-info", () => getSystemInfo());
+ipcMain.handle("app:context-info", () => getContextInfo());
+ipcMain.handle("app:set-access-level", (_event, level) => {
+  if (level !== "sandbox" && level !== "full") throw new Error(`Nieznany poziom: ${level}`);
+  accessLevel = level;
+  saveAppSettings();
+  emit("status", { status: "access-changed", detail: `Poziom dostepu: ${level === "full" ? "Pelny" : "Sandbox"}` });
+  return { accessLevel };
+});
+ipcMain.handle("app:save-chat", (_event, session) => {
+  const idx = chatHistory.findIndex((c) => c.id === session.id);
+  if (idx >= 0) chatHistory[idx] = session;
+  else chatHistory.unshift(session);
+  if (chatHistory.length > 50) chatHistory.length = 50;
+  saveChatHistory();
+  return chatHistory;
+});
+ipcMain.handle("app:load-chats", () => loadChatHistory());
+ipcMain.handle("app:delete-chat", (_event, chatId) => {
+  chatHistory = chatHistory.filter((c) => c.id !== chatId);
+  saveChatHistory();
+  return chatHistory;
 });

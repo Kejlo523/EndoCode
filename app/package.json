@@ -1,7 +1,7 @@
 {
-  "name": "local-codex",
-  "version": "0.1.0",
-  "description": "Local Codex-like desktop shell for GGUF coding models",
+  "name": "endocode",
+  "version": "1.0.0",
+  "description": "EndoCode — local AI coding agent desktop shell",
   "main": "src/main.js",
   "author": "Kejlo",
   "license": "MIT",
@@ -12,8 +12,8 @@
     "pack": "electron-builder --win dir"
   },
   "build": {
-    "appId": "local.bielik.codex",
-    "productName": "Local Codex",
+    "appId": "dev.endocode.app",
+    "productName": "EndoCode",
     "asar": false,
     "files": [
       "src/**/*",

@@ -3,106 +3,189 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Local Codex</title>
+    <title>EndoCode</title>
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
     <div class="app-shell">
-      <aside class="sidebar">
-        <div class="brand-block">
-          <div class="brand-mark">LC</div>
-          <div>
-            <div class="brand">Local Codex</div>
-            <div class="brand-sub">GGUF agent workspace</div>
+      <!-- ── SIDEBAR ── -->
+      <aside class="sidebar" id="sidebar">
+        <div class="sidebar-top">
+          <div class="brand-block">
+            <div class="brand-icon">
+              <svg viewBox="0 0 48 48" fill="none" width="32" height="32">
+                <defs>
+                  <linearGradient id="ig" x1="10" y1="10" x2="38" y2="38">
+                    <stop offset="0%" stop-color="#00d4aa"/>
+                    <stop offset="100%" stop-color="#00b4d8"/>
+                  </linearGradient>
+                </defs>
+                <rect width="48" height="48" rx="12" fill="#0f3460"/>
+                <path d="M12 16 L20 24 L12 32" stroke="url(#ig)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+                <path d="M24 16 L36 16 M24 24 L34 24 M24 32 L36 32 M24 16 L24 32" stroke="url(#ig)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+              </svg>
+            </div>
+            <span class="brand-name">EndoCode</span>
+          </div>
+
+          <button class="new-chat-btn" id="newChatBtn" title="Nowy czat">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+            <span>Nowy czat</span>
+          </button>
+        </div>
+
+        <div class="chat-history-section">
+          <div class="section-label">Historia</div>
+          <div class="chat-history-list" id="chatHistoryList">
+            <!-- chat items injected by JS -->
           </div>
         </div>
 
-        <div class="control-group">
-          <label class="field">
-            <span>Model</span>
-            <select id="modelSelect"></select>
-          </label>
-          <label class="field">
-            <span>Tryb</span>
-            <select id="reasoningSelect"></select>
-          </label>
-        </div>
+        <div class="sidebar-bottom">
+          <button class="sidebar-menu-btn" id="skillsBtn" title="Skills">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="1" y="1" width="6" height="6" rx="1.5" stroke="currentColor" stroke-width="1.3"/><rect x="9" y="1" width="6" height="6" rx="1.5" stroke="currentColor" stroke-width="1.3"/><rect x="1" y="9" width="6" height="6" rx="1.5" stroke="currentColor" stroke-width="1.3"/><rect x="9" y="9" width="6" height="6" rx="1.5" stroke="currentColor" stroke-width="1.3"/></svg>
+            <span>Skills</span>
+          </button>
 
-        <div class="model-card">
-          <div class="card-label">Aktywny model</div>
-          <div class="model-name" id="activeModelName">...</div>
-          <div class="model-meta" id="activeModelMeta">...</div>
-        </div>
+          <div class="workspace-selector">
+            <div class="section-label">Workspace</div>
+            <button class="workspace-btn" id="chooseWorkspace" title="Zmień folder">
+              <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M2 4h5l1.5 2H14v7H2V4z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" fill="none"/></svg>
+              <span class="workspace-path" id="workspaceLabel">...</span>
+            </button>
+          </div>
 
-        <div class="workspace-card">
-          <div class="card-label">Workspace</div>
-          <div class="workspace-path" id="workspaceLabel">...</div>
-        </div>
-
-        <div class="sidebar-actions">
-          <button id="chooseWorkspace" title="Wybierz sandbox">Folder</button>
-          <button id="resetChat" title="Wyczyść kontekst">Wyczyść</button>
+          <div class="system-monitor" id="systemMonitor">
+            <div class="section-label">System</div>
+            <div class="monitor-row">
+              <span class="monitor-label">CPU</span>
+              <div class="monitor-bar"><div class="monitor-fill" id="cpuBar" style="width:0%"></div></div>
+              <span class="monitor-value" id="cpuValue">0%</span>
+            </div>
+            <div class="monitor-row">
+              <span class="monitor-label">GPU</span>
+              <div class="monitor-bar"><div class="monitor-fill gpu" id="gpuBar" style="width:0%"></div></div>
+              <span class="monitor-value" id="gpuValue">—</span>
+            </div>
+            <div class="monitor-row">
+              <span class="monitor-label">RAM</span>
+              <div class="monitor-bar"><div class="monitor-fill ram" id="ramBar" style="width:0%"></div></div>
+              <span class="monitor-value" id="ramValue">0%</span>
+            </div>
+          </div>
         </div>
       </aside>
 
-      <main class="main">
-        <header class="session-bar">
-          <div>
-            <div class="eyebrow" id="statusKicker">Gotowy</div>
-            <h1>Sesja</h1>
+      <!-- ── MAIN PANEL ── -->
+      <main class="main-panel">
+        <header class="topbar">
+          <div class="topbar-left">
+            <h1 class="chat-title" id="chatTitle">Nowy czat</h1>
+            <div class="context-indicator" id="contextIndicator" title="Kontekst rozmowy">
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.3"/><path d="M8 5v3l2 2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
+              <span id="contextText">0 / 32 wiadomości</span>
+            </div>
           </div>
-          <div class="session-stats">
-            <div>
-              <span>Status</span>
-              <strong id="status">Gotowy</strong>
+          <div class="topbar-controls">
+            <div class="control-pill">
+              <label class="pill-label" for="modelSelect">Model</label>
+              <select id="modelSelect"></select>
             </div>
-            <div>
-              <span>Zdarzenia</span>
-              <strong id="eventCount">0</strong>
+            <div class="control-pill">
+              <label class="pill-label" for="reasoningSelect">Tryb</label>
+              <select id="reasoningSelect"></select>
             </div>
+            <button class="access-toggle" id="accessToggle" title="Przełącz poziom dostępu">
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" id="accessIcon">
+                <rect x="3" y="7" width="10" height="7" rx="1.5" stroke="currentColor" stroke-width="1.3"/>
+                <path d="M5 7V5a3 3 0 016 0v2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+              </svg>
+              <span id="accessLabel">Sandbox</span>
+            </button>
           </div>
         </header>
 
-        <section class="workspace">
-          <section class="chat-pane">
-            <div class="conversation" id="conversation"></div>
-            <div class="live-activity hidden" id="liveActivity">
-              <div class="live-activity-header">
-                <div class="live-pulse"></div>
-                <span class="live-label" id="liveLabel">Myśli...</span>
+        <section class="conversation-area" id="conversationArea">
+          <div class="conversation-scroll" id="conversation">
+            <!-- Welcome screen shown when empty -->
+            <div class="welcome-screen" id="welcomeScreen">
+              <div class="welcome-icon">
+                <svg viewBox="0 0 48 48" fill="none" width="56" height="56">
+                  <defs><linearGradient id="wg" x1="10" y1="10" x2="38" y2="38"><stop offset="0%" stop-color="#00d4aa"/><stop offset="100%" stop-color="#00b4d8"/></linearGradient></defs>
+                  <path d="M12 16 L20 24 L12 32" stroke="url(#wg)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+                  <path d="M24 16 L36 16 M24 24 L34 24 M24 32 L36 32 M24 16 L24 32" stroke="url(#wg)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+                </svg>
               </div>
-              <div class="live-detail" id="liveDetail"></div>
+              <h2>Co chcesz zbudować?</h2>
+              <p class="welcome-sub">Opisz zadanie — EndoCode przeczyta pliki, zaproponuje zmiany i uruchomi komendy.</p>
             </div>
-            <form class="composer" id="composer">
-              <textarea id="prompt" rows="3" placeholder="Zadanie dla lokalnego modelu..."></textarea>
-              <div class="composer-buttons">
-                <button id="send" type="submit">Wyślij</button>
-                <button id="stopBtn" type="button" class="stop-btn hidden" title="Zatrzymaj agenta">Stop</button>
-              </div>
-            </form>
-          </section>
-
-          <aside class="activity-pane">
-            <div class="activity-head">
-              <div>
-                <div class="panel-title">Aktywność</div>
-                <div class="activity-sub" id="activitySub">Ostatnie kroki</div>
-              </div>
-            </div>
-            <div id="timeline" class="timeline"></div>
-          </aside>
+          </div>
         </section>
+
+        <!-- ── LIVE ACTIVITY BAR ── -->
+        <div class="live-activity hidden" id="liveActivity">
+          <div class="live-pulse"></div>
+          <span class="live-label" id="liveLabel">Myśli...</span>
+          <span class="live-detail" id="liveDetail"></span>
+        </div>
+
+        <!-- ── COMPOSER ── -->
+        <div class="composer-wrapper">
+          <form class="composer" id="composer">
+            <textarea id="prompt" rows="1" placeholder="Opisz zadanie lub zadaj pytanie..." autocomplete="off"></textarea>
+            <div class="composer-actions">
+              <div class="composer-meta">
+                <span class="composer-workspace" id="composerWorkspace">
+                  <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M2 4h5l1.5 2H14v7H2V4z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" fill="none"/></svg>
+                  <span id="composerWsName">workspace</span>
+                </span>
+                <span class="composer-access" id="composerAccess">
+                  <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><rect x="3" y="7" width="10" height="7" rx="1.5" stroke="currentColor" stroke-width="1.1"/><path d="M5 7V5a3 3 0 016 0v2" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/></svg>
+                  Sandbox
+                </span>
+              </div>
+              <div class="composer-buttons">
+                <button id="stopBtn" type="button" class="stop-btn hidden" title="Zatrzymaj">
+                  <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><rect x="3" y="3" width="10" height="10" rx="2" fill="currentColor"/></svg>
+                  Stop
+                </button>
+                <button id="send" type="submit" title="Wyślij (Ctrl+Enter)">
+                  <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 13V3l11 5-11 5z" fill="currentColor"/></svg>
+                </button>
+              </div>
+            </div>
+          </form>
+        </div>
       </main>
     </div>
 
-    <div class="modal hidden" id="approvalModal">
+    <!-- ── APPROVAL MODAL ── -->
+    <div class="modal-overlay hidden" id="approvalModal">
       <div class="modal-card">
-        <div class="modal-title">Zatwierdź komendę</div>
-        <div class="modal-small" id="approvalCwd"></div>
-        <pre id="approvalCommand"></pre>
+        <div class="modal-header">
+          <svg width="18" height="18" viewBox="0 0 16 16" fill="none"><path d="M8 1l7 13H1L8 1z" stroke="#ffb347" stroke-width="1.3" stroke-linejoin="round" fill="none"/><path d="M8 6v3M8 11v.5" stroke="#ffb347" stroke-width="1.5" stroke-linecap="round"/></svg>
+          <span class="modal-title">Zatwierdź komendę</span>
+        </div>
+        <div class="modal-cwd" id="approvalCwd"></div>
+        <pre class="modal-command" id="approvalCommand"></pre>
         <div class="modal-actions">
-          <button id="rejectCommand">Odrzuć</button>
-          <button id="approveCommand">Uruchom</button>
+          <button class="modal-btn reject" id="rejectCommand">Odrzuć</button>
+          <button class="modal-btn approve" id="approveCommand">Uruchom</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── SKILLS PANEL (placeholder) ── -->
+    <div class="modal-overlay hidden" id="skillsModal">
+      <div class="modal-card skills-card">
+        <div class="modal-header">
+          <svg width="18" height="18" viewBox="0 0 16 16" fill="none"><rect x="1" y="1" width="6" height="6" rx="1.5" stroke="#00d4aa" stroke-width="1.3"/><rect x="9" y="1" width="6" height="6" rx="1.5" stroke="#00d4aa" stroke-width="1.3"/><rect x="1" y="9" width="6" height="6" rx="1.5" stroke="#00d4aa" stroke-width="1.3"/><rect x="9" y="9" width="6" height="6" rx="1.5" stroke="#00d4aa" stroke-width="1.3"/></svg>
+          <span class="modal-title">Skills</span>
+          <button class="modal-close" id="closeSkills">&times;</button>
+        </div>
+        <div class="skills-placeholder">
+          <p>Moduł Skills będzie wkrótce dostępny.</p>
+          <p class="muted-text">Tutaj pojawią się automatyzacje, szablony i rozszerzenia.</p>
         </div>
       </div>
     </div>
