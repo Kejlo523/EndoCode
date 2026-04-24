@@ -1,5 +1,16 @@
 {
   "selectedModelId": "qwen25-coder-14b-q4km",
   "reasoningLevel": "medium",
-  "accessLevel": "sandbox"
+  "accessLevel": "sandbox",
+  "customModelSettings": {
+    "temperature": 0.2,
+    "maxTokens": 1280,
+    "maxSteps": 0,
+    "topP": 1,
+    "topK": 0,
+    "repeatPenalty": 1,
+    "contextTokens": 8192,
+    "gpuLayers": 99
+  },
+  "maxMessages": 100
 }

@@ -1,0 +1,18 @@
+[
+  {
+    "id": "ce5f74ed-cad7-47f4-8d7c-e4035e61fb4a",
+    "title": "zmień nazwę strony na energetyk",
+    "createdAt": "2026-04-24T18:39:38.208Z",
+    "updatedAt": "2026-04-24T18:39:38.208Z",
+    "messages": [
+      {
+        "role": "user",
+        "text": "zmień nazwę strony na energetyk"
+      },
+      {
+        "role": "assistant",
+        "text": "Osiagnieto limit krokow. Napisz, zeby kontynuowac."
+      }
+    ]
+  }
+]

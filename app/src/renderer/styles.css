@@ -52,6 +52,19 @@ body {
 
 button, textarea, select, input { font: inherit; color: inherit; }
 button, select, textarea { outline: none; }
+
+/* Fix white option/select background */
+select {
+  background-color: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+}
+select option {
+  background-color: var(--surface);
+  color: var(--text);
+}
+select:focus { border-color: var(--border-focus); }
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
@@ -292,6 +305,7 @@ button, select, textarea { outline: none; }
 }
 .monitor-fill.gpu { background: var(--violet); }
 .monitor-fill.ram { background: var(--blue); }
+.monitor-fill.vram { background: var(--amber); }
 
 .monitor-value {
   font-size: 10px;
@@ -907,9 +921,128 @@ button, select, textarea { outline: none; }
   margin-top: 6px;
 }
 
+/* ══════════════ SETTINGS MODAL ══════════════ */
+.settings-card {
+  max-width: 640px;
+  max-height: 85vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.settings-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.setting-row {
+  display: grid;
+  grid-template-columns: 1fr 200px;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 4px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.setting-row:last-child { border-bottom: none; }
+
+.setting-info { min-width: 0; }
+
+.setting-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  display: block;
+}
+
+.setting-desc {
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.4;
+  margin-top: 2px;
+}
+
+.setting-control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.setting-control input[type="range"] {
+  flex: 1;
+  height: 4px;
+  -webkit-appearance: none;
+  appearance: none;
+  background: var(--surface-3);
+  border-radius: 2px;
+  outline: none;
+  cursor: pointer;
+}
+
+.setting-control input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--bg);
+  box-shadow: 0 0 0 1px var(--accent-dim);
+  cursor: pointer;
+  transition: transform 0.15s;
+}
+.setting-control input[type="range"]::-webkit-slider-thumb:hover {
+  transform: scale(1.2);
+}
+.setting-control input[type="range"]::-webkit-slider-thumb:active {
+  transform: scale(1.3);
+  box-shadow: 0 0 0 2px var(--accent-glow-strong);
+}
+
+.setting-value {
+  font-size: 12px;
+  font-weight: 600;
+  font-family: var(--mono);
+  color: var(--accent);
+  min-width: 40px;
+  text-align: right;
+}
+
+.settings-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border-subtle);
+  margin-top: 8px;
+}
+
+/* ── Settings gear button ── */
+.settings-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all var(--transition);
+}
+.settings-btn:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+  transform: rotate(30deg);
+}
+
 /* ══════════════ RESPONSIVE ══════════════ */
 @media (max-width: 900px) {
   .app-shell { grid-template-columns: 240px 1fr; }
+  .setting-row { grid-template-columns: 1fr; gap: 8px; }
 }
 
 @media (max-width: 700px) {

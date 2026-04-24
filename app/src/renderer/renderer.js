@@ -39,6 +39,15 @@ const gpuBar = document.getElementById("gpuBar");
 const gpuValue = document.getElementById("gpuValue");
 const ramBar = document.getElementById("ramBar");
 const ramValue = document.getElementById("ramValue");
+const vramBar = document.getElementById("vramBar");
+const vramValue = document.getElementById("vramValue");
+
+// Settings modal refs
+const settingsBtn = document.getElementById("settingsBtn");
+const settingsModal = document.getElementById("settingsModal");
+const closeSettings = document.getElementById("closeSettings");
+const applySettings = document.getElementById("applySettings");
+const resetSettings = document.getElementById("resetSettings");
 
 // ── State ──
 let pendingApprovalId = null;
@@ -333,6 +342,13 @@ async function updateSystemMonitor() {
     }
     ramBar.style.width = `${info.ramPercent}%`;
     ramValue.textContent = `${info.ramUsedGB}G`;
+    if (info.vramPercent >= 0) {
+      vramBar.style.width = `${info.vramPercent}%`;
+      vramValue.textContent = `${(info.vramUsedMB / 1024).toFixed(1)}G`;
+    } else {
+      vramBar.style.width = "0%";
+      vramValue.textContent = "N/A";
+    }
   } catch { /* ignore */ }
 }
 
@@ -606,3 +622,91 @@ init();
 setInterval(() => { if (!appBusy) refreshState(); }, 8000);
 setInterval(updateSystemMonitor, 2500);
 setInterval(() => { if (appBusy) updateContextInfo(); }, 3000);
+
+// ══════════════ SETTINGS MODAL ══════════════
+const SETTINGS_FIELDS = [
+  { id: "temperature", slider: "set_temperature", display: "val_temperature", decimals: 2 },
+  { id: "maxTokens", slider: "set_maxTokens", display: "val_maxTokens", decimals: 0 },
+  { id: "maxSteps", slider: "set_maxSteps", display: "val_maxSteps", decimals: 0, formatFn: (v) => v == 0 ? "∞" : String(v) },
+  { id: "topP", slider: "set_topP", display: "val_topP", decimals: 2 },
+  { id: "topK", slider: "set_topK", display: "val_topK", decimals: 0 },
+  { id: "repeatPenalty", slider: "set_repeatPenalty", display: "val_repeatPenalty", decimals: 2 },
+  { id: "contextTokens", slider: "set_contextTokens", display: "val_contextTokens", decimals: 0 },
+  { id: "gpuLayers", slider: "set_gpuLayers", display: "val_gpuLayers", decimals: 0 },
+  { id: "maxMessages", slider: "set_maxMessages", display: "val_maxMessages", decimals: 0 },
+];
+
+// Wire up live value display for all sliders
+for (const field of SETTINGS_FIELDS) {
+  const slider = document.getElementById(field.slider);
+  const display = document.getElementById(field.display);
+  if (slider && display) {
+    slider.addEventListener("input", () => {
+      const val = parseFloat(slider.value);
+      display.textContent = field.formatFn ? field.formatFn(val) : (field.decimals > 0 ? val.toFixed(field.decimals) : String(Math.round(val)));
+    });
+  }
+}
+
+async function openSettingsModal() {
+  try {
+    const settings = await window.endocode.getModelSettings();
+    const eff = settings._effective || {};
+    // Populate sliders with current values
+    setSlider("set_temperature", "val_temperature", settings.temperature ?? eff.temperature, 2);
+    setSlider("set_maxTokens", "val_maxTokens", settings.maxTokens ?? eff.maxTokens, 0);
+    setSlider("set_maxSteps", "val_maxSteps", settings.maxSteps ?? eff.maxSteps, 0, (v) => v == 0 ? "∞" : String(v));
+    setSlider("set_topP", "val_topP", settings.topP ?? 1.0, 2);
+    setSlider("set_topK", "val_topK", settings.topK ?? 0, 0);
+    setSlider("set_repeatPenalty", "val_repeatPenalty", settings.repeatPenalty ?? 1.0, 2);
+    setSlider("set_contextTokens", "val_contextTokens", settings.contextTokens ?? eff.contextTokens, 0);
+    setSlider("set_gpuLayers", "val_gpuLayers", settings.gpuLayers ?? eff.gpuLayers, 0);
+    setSlider("set_maxMessages", "val_maxMessages", settings.maxMessages ?? 32, 0);
+  } catch { /* ignore */ }
+  settingsModal.classList.remove("hidden");
+}
+
+function setSlider(sliderId, displayId, value, decimals, formatFn) {
+  const slider = document.getElementById(sliderId);
+  const display = document.getElementById(displayId);
+  if (slider) slider.value = value;
+  if (display) display.textContent = formatFn ? formatFn(value) : (decimals > 0 ? Number(value).toFixed(decimals) : String(Math.round(value)));
+}
+
+function collectSettingsFromUI() {
+  return {
+    temperature: parseFloat(document.getElementById("set_temperature").value),
+    maxTokens: parseInt(document.getElementById("set_maxTokens").value, 10),
+    maxSteps: parseInt(document.getElementById("set_maxSteps").value, 10),
+    topP: parseFloat(document.getElementById("set_topP").value),
+    topK: parseInt(document.getElementById("set_topK").value, 10),
+    repeatPenalty: parseFloat(document.getElementById("set_repeatPenalty").value),
+    contextTokens: parseInt(document.getElementById("set_contextTokens").value, 10),
+    gpuLayers: parseInt(document.getElementById("set_gpuLayers").value, 10),
+    maxMessages: parseInt(document.getElementById("set_maxMessages").value, 10),
+  };
+}
+
+settingsBtn.addEventListener("click", () => openSettingsModal());
+closeSettings.addEventListener("click", () => settingsModal.classList.add("hidden"));
+
+applySettings.addEventListener("click", async () => {
+  const values = collectSettingsFromUI();
+  try {
+    await window.endocode.setModelSettings(values);
+    addInlineEvent("note", "Ustawienia", "Zastosowano nowe ustawienia modelu.");
+    settingsModal.classList.add("hidden");
+  } catch (e) {
+    addInlineEvent("error", "Ustawienia", e.message || String(e));
+  }
+});
+
+resetSettings.addEventListener("click", async () => {
+  try {
+    await window.endocode.resetModelSettings();
+    addInlineEvent("note", "Ustawienia", "Przywrócono domyślne ustawienia.");
+    await openSettingsModal(); // refresh sliders
+  } catch (e) {
+    addInlineEvent("error", "Ustawienia", e.message || String(e));
+  }
+});

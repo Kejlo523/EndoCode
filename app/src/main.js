@@ -8,7 +8,7 @@ const os = require("node:os");
 
 const DEFAULT_PORT = 8088;
 const MAX_FILE_BYTES = 220000;
-const MAX_MESSAGES = 32;
+let MAX_MESSAGES = 32;
 
 const REASONING_LEVELS = {
   low: {
@@ -78,6 +78,18 @@ let accessLevel = "sandbox"; // "sandbox" or "full"
 let chatHistory = [];
 let currentChatId = null;
 let previousCpuInfo = os.cpus();
+
+// Custom model settings (overrides per-reasoning defaults when set)
+let customModelSettings = {
+  temperature: null,     // null = use reasoning profile default
+  maxTokens: null,
+  maxSteps: null,        // null = use reasoning profile, 0 = unlimited
+  topP: null,
+  topK: null,
+  repeatPenalty: null,
+  contextTokens: null,   // override for model context window
+  gpuLayers: null,       // override for GPU offload layers
+};
 
 function emit(type, payload = {}) {
   if (mainWindow && !mainWindow.isDestroyed()) {
@@ -171,6 +183,8 @@ function saveAppSettings() {
     selectedModelId,
     reasoningLevel: selectedReasoning,
     accessLevel,
+    customModelSettings,
+    maxMessages: MAX_MESSAGES,
   });
 }
 
@@ -215,9 +229,14 @@ function getSystemInfo() {
   const ramPercent = Math.round((usedMem / totalMem) * 100);
 
   let gpuPercent = -1;
+  let vramUsedMB = -1;
+  let vramTotalMB = -1;
   try {
-    const out = execSync('nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits', { timeout: 2000, windowsHide: true }).toString().trim();
-    gpuPercent = parseInt(out, 10) || 0;
+    const out = execSync('nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits', { timeout: 2000, windowsHide: true }).toString().trim();
+    const parts = out.split(',').map(s => s.trim());
+    gpuPercent = parseInt(parts[0], 10) || 0;
+    vramUsedMB = parseInt(parts[1], 10) || 0;
+    vramTotalMB = parseInt(parts[2], 10) || 0;
   } catch { /* no nvidia-smi */ }
 
   return {
@@ -226,6 +245,9 @@ function getSystemInfo() {
     ramPercent,
     ramUsedGB: (usedMem / 1073741824).toFixed(1),
     ramTotalGB: (totalMem / 1073741824).toFixed(1),
+    vramUsedMB,
+    vramTotalMB,
+    vramPercent: vramTotalMB > 0 ? Math.round((vramUsedMB / vramTotalMB) * 100) : -1,
   };
 }
 
@@ -461,16 +483,23 @@ async function stopOwnedServer() {
 
 async function callModel(messages, abortSignal) {
   const reasoning = getReasoningProfile();
+  const temp = customModelSettings.temperature ?? reasoning.temperature;
+  const maxTok = customModelSettings.maxTokens ?? reasoning.maxTokens;
+  const body = {
+    model: getModelConfig().serverModel,
+    messages,
+    temperature: temp,
+    max_tokens: maxTok,
+    stream: true,
+  };
+  if (customModelSettings.topP != null) body.top_p = customModelSettings.topP;
+  if (customModelSettings.topK != null) body.top_k = customModelSettings.topK;
+  if (customModelSettings.repeatPenalty != null) body.repeat_penalty = customModelSettings.repeatPenalty;
+
   const res = await fetch(`http://127.0.0.1:${DEFAULT_PORT}/v1/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: getModelConfig().serverModel,
-      messages,
-      temperature: reasoning.temperature,
-      max_tokens: reasoning.maxTokens,
-      stream: true,
-    }),
+    body: JSON.stringify(body),
     signal: abortSignal,
   });
   if (!res.ok) {
@@ -787,9 +816,33 @@ async function executeTool(action) {
 let messages = createInitialMessages();
 
 function compactMessages() {
-  if (messages.length > MAX_MESSAGES) {
-    messages = [messages[0], ...messages.slice(-(MAX_MESSAGES - 1))];
+  if (messages.length <= MAX_MESSAGES) return;
+  // Keep system prompt + summarize old messages + keep recent ones
+  const systemMsg = messages[0];
+  const keepRecent = Math.min(Math.floor(MAX_MESSAGES * 0.6), MAX_MESSAGES - 2);
+  const oldMessages = messages.slice(1, messages.length - keepRecent);
+  const recentMessages = messages.slice(-keepRecent);
+  // Create summary of old context
+  let summaryParts = [];
+  for (const msg of oldMessages) {
+    if (msg.role === "user") {
+      const text = String(msg.content || "").slice(0, 150);
+      if (text.startsWith("Wynik narzedzia")) continue; // skip tool results
+      summaryParts.push(`Uzytkownik: ${text}`);
+    } else if (msg.role === "assistant") {
+      try {
+        const parsed = JSON.parse(msg.content);
+        if (parsed.final) summaryParts.push(`Agent zakonczyl: ${String(parsed.final).slice(0, 100)}`);
+        else if (parsed.note) summaryParts.push(`Agent: ${parsed.note}`);
+      } catch { summaryParts.push(`Agent: ${String(msg.content).slice(0, 80)}`); }
+    }
   }
+  const summaryText = summaryParts.length > 0
+    ? `[Kompaktowanie kontekstu] Podsumowanie wczesniejszej rozmowy:\n${summaryParts.slice(-10).join("\n")}`
+    : "[Kompaktowanie kontekstu] Wczesniejsze wiadomosci zostaly usuniete.";
+  const summaryMsg = { role: "user", content: summaryText };
+  messages = [systemMsg, summaryMsg, ...recentMessages];
+  emit("status", { status: "context-compacted", detail: `Skompaktowano kontekst: ${messages.length} wiadomosci.` });
 }
 
 async function runAgent(userText) {
@@ -803,10 +856,14 @@ async function runAgent(userText) {
     emit("run-start", { text: userText });
 
     const reasoning = getReasoningProfile();
-    for (let step = 1; step <= reasoning.maxSteps; step += 1) {
+    const effectiveMaxSteps = customModelSettings.maxSteps === 0
+      ? 999999
+      : (customModelSettings.maxSteps ?? reasoning.maxSteps);
+    for (let step = 1; step <= effectiveMaxSteps; step += 1) {
       if (signal.aborted) throw new Error("Przerwano przez uzytkownika.");
       compactMessages();
-      emit("status", { status: "model-thinking", detail: `${getModelConfig().displayName} przygotowuje krok ${step}/${reasoning.maxSteps}.` });
+      const stepLabel = effectiveMaxSteps >= 999999 ? `krok ${step} (∞)` : `krok ${step}/${effectiveMaxSteps}`;
+      emit("status", { status: "model-thinking", detail: `${getModelConfig().displayName} — ${stepLabel}` });
       const raw = await callModel(messages, signal);
       emit("model-raw", { raw });
       const action = parseJsonAction(raw);
@@ -865,6 +922,8 @@ function getState() {
     modelPath: getModelPath(),
     serverExe: getRuntimeServerExe(),
     port: DEFAULT_PORT,
+    customModelSettings,
+    maxMessages: MAX_MESSAGES,
   };
 }
 
@@ -890,6 +949,10 @@ app.whenReady().then(async () => {
   loadChatHistory();
   const settings = loadAppSettings();
   if (settings.accessLevel) accessLevel = settings.accessLevel;
+  if (settings.customModelSettings) {
+    Object.assign(customModelSettings, settings.customModelSettings);
+  }
+  if (settings.maxMessages) MAX_MESSAGES = Math.max(8, settings.maxMessages);
   createWindow();
 });
 
@@ -971,4 +1034,41 @@ ipcMain.handle("app:delete-chat", (_event, chatId) => {
   chatHistory = chatHistory.filter((c) => c.id !== chatId);
   saveChatHistory();
   return chatHistory;
+});
+ipcMain.handle("app:get-model-settings", () => ({
+  ...customModelSettings,
+  maxMessages: MAX_MESSAGES,
+  // Include current effective values for display
+  _effective: {
+    temperature: customModelSettings.temperature ?? getReasoningProfile().temperature,
+    maxTokens: customModelSettings.maxTokens ?? getReasoningProfile().maxTokens,
+    maxSteps: customModelSettings.maxSteps ?? getReasoningProfile().maxSteps,
+    contextTokens: customModelSettings.contextTokens ?? getModelConfig().contextTokens ?? 8192,
+    gpuLayers: customModelSettings.gpuLayers ?? getModelConfig().gpuLayers ?? 99,
+  },
+}));
+ipcMain.handle("app:set-model-settings", async (_event, settings) => {
+  if (settings.temperature !== undefined) customModelSettings.temperature = settings.temperature;
+  if (settings.maxTokens !== undefined) customModelSettings.maxTokens = settings.maxTokens;
+  if (settings.maxSteps !== undefined) customModelSettings.maxSteps = settings.maxSteps;
+  if (settings.topP !== undefined) customModelSettings.topP = settings.topP;
+  if (settings.topK !== undefined) customModelSettings.topK = settings.topK;
+  if (settings.repeatPenalty !== undefined) customModelSettings.repeatPenalty = settings.repeatPenalty;
+  if (settings.contextTokens !== undefined) customModelSettings.contextTokens = settings.contextTokens;
+  if (settings.gpuLayers !== undefined) customModelSettings.gpuLayers = settings.gpuLayers;
+  if (settings.maxMessages !== undefined) MAX_MESSAGES = Math.max(8, settings.maxMessages);
+  saveAppSettings();
+  // If context/gpu changed, need server restart
+  if (settings.contextTokens !== undefined || settings.gpuLayers !== undefined) {
+    if (serverOwned) {
+      await stopOwnedServer();
+      emit("status", { status: "settings-changed", detail: "Zmieniono ustawienia serwera — restart przy nastepnym zapytaniu." });
+    }
+  }
+  return { customModelSettings, maxMessages: MAX_MESSAGES };
+});
+ipcMain.handle("app:reset-model-settings", () => {
+  customModelSettings = { temperature: null, maxTokens: null, maxSteps: null, topP: null, topK: null, repeatPenalty: null, contextTokens: null, gpuLayers: null };
+  saveAppSettings();
+  return { customModelSettings, maxMessages: MAX_MESSAGES };
 });

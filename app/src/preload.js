@@ -15,6 +15,9 @@ contextBridge.exposeInMainWorld("endocode", {
   saveChat: (session) => ipcRenderer.invoke("app:save-chat", session),
   loadChats: () => ipcRenderer.invoke("app:load-chats"),
   deleteChat: (chatId) => ipcRenderer.invoke("app:delete-chat", chatId),
+  getModelSettings: () => ipcRenderer.invoke("app:get-model-settings"),
+  setModelSettings: (settings) => ipcRenderer.invoke("app:set-model-settings", settings),
+  resetModelSettings: () => ipcRenderer.invoke("app:reset-model-settings"),
   onEvent: (callback) => {
     const listener = (_event, payload) => callback(payload);
     ipcRenderer.on("agent:event", listener);
