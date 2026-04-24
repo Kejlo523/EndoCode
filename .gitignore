@@ -2,6 +2,7 @@ downloads/
 logs/
 runtime/
 models/*.gguf
+models/vision/*.gguf
 workspace/.tmp/
 __pycache__/
 *.pyc

@@ -23,6 +23,30 @@ const composerAccess = document.getElementById("composerAccess");
 const liveActivity = document.getElementById("liveActivity");
 const liveLabel = document.getElementById("liveLabel");
 const liveDetail = document.getElementById("liveDetail");
+
+const attachBtn = document.getElementById("attachBtn");
+const fileInput = document.getElementById("fileInput");
+const attachmentPreview = document.getElementById("attachmentPreview");
+const attachmentImage = document.getElementById("attachmentImage");
+const attachmentRemove = document.getElementById("attachmentRemove");
+let currentAttachmentBase64 = null;
+let visionEnabled = false;
+
+async function checkVisionSkill() {
+  try {
+    const skills = await window.endocode.listSkills();
+    visionEnabled = skills.some(s => s.id === "vision" && s.installed);
+    if (visionEnabled) {
+      attachBtn.classList.remove("hidden");
+      attachBtn.title = "Załącz obraz (obsługiwane przez Vision VLM)";
+    } else {
+      attachBtn.classList.add("hidden");
+      attachBtn.title = "Zainstaluj skill Vision, aby móc załączać obrazy";
+    }
+  } catch (e) {
+    console.error("Błąd podczas sprawdzania skilla vision:", e);
+  }
+}
 const approvalModal = document.getElementById("approvalModal");
 const approvalCwd = document.getElementById("approvalCwd");
 const approvalCommand = document.getElementById("approvalCommand");
@@ -126,13 +150,41 @@ function updateWelcome() {
   }
 }
 
+function smartScroll() {
+  const distanceToBottom = conversation.scrollHeight - conversation.scrollTop - conversation.clientHeight;
+  if (distanceToBottom < 150) {
+    conversation.scrollTop = conversation.scrollHeight;
+  }
+}
+
 // ── Messages ──
-function addMessage(role, text) {
+function addMessage(role, text, imageBase64 = null) {
   const div = document.createElement("div");
   div.className = `message ${role}`;
-  div.textContent = text;
+  
+  if (imageBase64) {
+    const img = document.createElement("img");
+    img.src = imageBase64;
+    img.style.maxWidth = "260px";
+    img.style.maxHeight = "260px";
+    img.style.borderRadius = "var(--radius-sm)";
+    img.style.display = "block";
+    if (text && text !== "[Wysłano obraz]") {
+      img.style.marginBottom = "10px";
+    }
+    div.appendChild(img);
+  }
+  
+  if (text && text !== "[Wysłano obraz]") {
+    const span = document.createElement("span");
+    span.textContent = text;
+    div.appendChild(span);
+  } else if (!imageBase64) {
+    div.textContent = text || "";
+  }
+  
   conversation.appendChild(div);
-  conversation.scrollTop = conversation.scrollHeight;
+  smartScroll();
   updateWelcome();
 }
 
@@ -161,13 +213,13 @@ function addInlineEvent(kind, title, body = "", extraHtml = "") {
     <span class="inline-event-time">${new Date().toLocaleTimeString("pl-PL", { hour: "2-digit", minute: "2-digit" })}</span>
   `;
   conversation.appendChild(div);
-  conversation.scrollTop = conversation.scrollHeight;
+  smartScroll();
   updateWelcome();
   return div;
 }
 
 function upsertInlineEvent(activityId, kind, title, body = "") {
-  const safeBody = String(body ?? "").slice(0, 1400);
+  const safeBody = String(body ?? "").slice(0, 50000);
   let el = conversation.querySelector(`.inline-event[data-activity-id="${activityId}"]`);
   if (!el) {
     el = addInlineEvent(kind, title, safeBody);
@@ -188,15 +240,15 @@ function upsertInlineEvent(activityId, kind, title, body = "") {
         bodyEl.appendChild(div);
       }
     }
-    conversation.scrollTop = conversation.scrollHeight;
+    smartScroll();
   }
 }
 
 function compactJsonPreview(value) {
   try {
-    return JSON.stringify(value, null, 2).slice(0, 900);
+    return JSON.stringify(value, null, 2).slice(0, 50000);
   } catch {
-    return String(value ?? "").slice(0, 900);
+    return String(value ?? "").slice(0, 50000);
   }
 }
 
@@ -297,7 +349,7 @@ function createThinkingBubble() {
     bubble.classList.toggle("expanded");
   });
   conversation.appendChild(bubble);
-  conversation.scrollTop = conversation.scrollHeight;
+  smartScroll();
   updateWelcome();
   return bubble;
 }
@@ -307,6 +359,7 @@ function appendThinkingText(bubble, text) {
   if (content) {
     content.textContent += text;
     if (bubble.classList.contains("expanded")) content.scrollTop = content.scrollHeight;
+    smartScroll();
   }
 }
 
@@ -651,6 +704,7 @@ if (skillsList) {
       addInlineEvent("error", "Skills", e.message || String(e));
       await loadSkills();
     }
+    checkVisionSkill(); // Update UI after install/uninstall
   });
 }
 
@@ -736,23 +790,69 @@ promptEl.addEventListener("input", () => {
   promptEl.style.height = Math.min(promptEl.scrollHeight, 180) + "px";
 });
 
+// ── Attachments ──
+function setAttachment(base64DataUrl) {
+  currentAttachmentBase64 = base64DataUrl;
+  attachmentImage.src = base64DataUrl;
+  attachmentPreview.classList.remove("hidden");
+}
+function clearAttachment() {
+  currentAttachmentBase64 = null;
+  attachmentImage.src = "";
+  attachmentPreview.classList.add("hidden");
+  fileInput.value = "";
+}
+attachmentRemove.addEventListener("click", clearAttachment);
+attachBtn.addEventListener("click", () => {
+  if (!visionEnabled) return;
+  fileInput.click();
+});
+fileInput.addEventListener("change", (e) => {
+  if (!visionEnabled) return;
+  const file = e.target.files[0];
+  if (file && (file.type === "image/png" || file.type === "image/jpeg" || file.type === "image/webp")) {
+    const reader = new FileReader();
+    reader.onload = (e) => setAttachment(e.target.result);
+    reader.readAsDataURL(file);
+  }
+});
+promptEl.addEventListener("paste", (e) => {
+  if (!visionEnabled) return;
+  const items = (e.clipboardData || e.originalEvent?.clipboardData)?.items;
+  if (!items) return;
+  for (const item of items) {
+    if (item.type.indexOf("image") === 0) {
+      e.preventDefault();
+      const file = item.getAsFile();
+      const reader = new FileReader();
+      reader.onload = (ev) => setAttachment(ev.target.result);
+      reader.readAsDataURL(file);
+      break;
+    }
+  }
+});
+
 // ── Submit ──
 let firstUserMessage = null;
 
 composer.addEventListener("submit", async (event) => {
   event.preventDefault();
   const text = promptEl.value.trim();
-  if (!text) return;
+  if (!text && !currentAttachmentBase64) return;
   promptEl.value = "";
   promptEl.style.height = "auto";
 
-  if (!firstUserMessage) firstUserMessage = text;
-  addMessage("user", text);
-  chatTitle.textContent = text.length > 40 ? text.slice(0, 40) + "..." : text;
+  const attachedBase64 = currentAttachmentBase64;
+  clearAttachment();
+
+  if (!firstUserMessage) firstUserMessage = text || "Obraz";
+  addMessage("user", text || "[Wysłano obraz]", attachedBase64);
+  chatTitle.textContent = (text || "Obraz").length > 40 ? (text || "Obraz").slice(0, 40) + "..." : (text || "Obraz");
   setBusy(true);
 
   try {
-    await window.endocode.send(text);
+    const payload = attachedBase64 ? { text, imageBase64: attachedBase64.split(",")[1] } : text;
+    await window.endocode.send(payload);
   } catch (e) {
     addInlineEvent("error", "Błąd", e.message || String(e));
   } finally {
@@ -841,9 +941,9 @@ window.endocode.onEvent((event) => {
     return;
   }
   if (event.type === "content-delta") {
-    const preview = (event.full || event.text || "").trim().slice(0, 1200);
+    const preview = (event.full || event.text || "").trim().slice(0, 50000);
     if (preview) upsertInlineEvent("model-writing", "activity", "Model pisze", preview);
-    showLive("Model pisze...", preview.slice(-140));
+    showLive("Model pisze...", preview.slice(-500));
     return;
   }
   if (event.type === "tool-start") {
@@ -883,6 +983,7 @@ window.endocode.onEvent((event) => {
 
 // ══════════════ INIT ══════════════
 async function init() {
+  await checkVisionSkill();
   await refreshState();
   await loadChatHistory();
   await updateSystemMonitor();

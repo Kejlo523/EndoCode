@@ -7,6 +7,7 @@ const crypto = require("node:crypto");
 const os = require("node:os");
 const { pipeline } = require("node:stream/promises");
 const { Readable } = require("node:stream");
+const https = require("node:https");
 
 const DEFAULT_PORT = 8088;
 const MAX_FILE_BYTES = 220000;
@@ -59,6 +60,7 @@ Dostepne narzedzia:
 - pwd {}
 - cd {"path":"folder"}
 - ls {"path":".","maxEntries":100}
+- analyze_image {"path":"plik.jpg"}
 - read_file {"path":"plik","maxBytes":30000}
 - write_file {"path":"plik","content":"...","mode":"overwrite albo append"}
 - mkdir {"path":"folder"}
@@ -76,9 +78,14 @@ Zasady:
 - Nie probuj obchodzic sandboxa ani prosic o sciezki spoza root.
 - Przed edycja czytaj plik, chyba ze go tworzysz.
 - Komend shell uzywaj oszczednie; UI poprosi uzytkownika o zatwierdzenie.
+- Zanim pobierzesz obraz z URL uzywajac download_file, upewnij sie ze adres istnieje. Uzywaj analyze_image aby sprawdzic pobrany obraz (tylko jpg/png/webp) i przeanalizowac, czy zawiera to, czego potrzebujesz.
 - Eksplorujac web (fetch_url), upewnij sie, ze strona jest "legit" i bezpieczna, np. czytajac o niej informacje. Zawsze analizuj URL przed pobraniem czegokolwiek. Pobieranie plikow (download_file) wywola prosbe o zgode w UI.
-- Jesli nie masz pewnosci co do jakiejs informacji albo podejrzewasz "fake news", ZAWSZE uzyj fetch_url, aby zweryfikowac fakty w innych stronach w sieci. Narzedzie extract_media uzywaj do wyciagania linkow do zdjec.
-- Gdy narzedzie zwroci blad, nie poddawaj sie od razu: przeczytaj powod, wybierz obejscie i sprobuj dalej. Typowe obejscia: mkdir dla brakujacego folderu, zapis do innego pliku w workspace, zapis HTML/Markdown zamiast formatu docelowego, create_pdf dla PDF, albo krotka prosba do uzytkownika tylko gdy naprawde brakuje informacji.
+- Jesli nie masz pewnosci co do jakiejs informacji albo podejrzewasz "fake news", ZAWSZE uzyj fetch_url, aby zweryfikowac fakty w innych stronach w sieci. Narzedzie extract_media uzywaj do wyciagania rzeczywistych linkow z poprawnej strony.
+- NIE ZMYSLAJ LINKOW URL! Jesli dostaniesz 404, musisz wrocic do poprawnej domeny/artykulu i pobrac prawidlowe linki (np. za pomoca extract_media).
+- Gdy tworzysz jeden lub więcej plików (np. SVG, PDF, skrypty), ZAWSZE najpierw upewnij się, że docelowy folder istnieje używając 'ls' lub od razu stwórz go używając 'mkdir' (względnie do obecnego katalogu, nie wychodź poza workspace). Dopiero potem zapisuj pliki.
+- ZAWSZE generuj i zapisuj pliki pojedynczo. Jeśli masz 5 plików do utworzenia, użyj narzędzia 'write_file' 5 razy w osobnych krokach. NIGDY nie wyrzucaj zawartości wielu plików naraz w czacie jako gigantyczny tekst – to bez sensu i zapycha czat. Każdy plik to oddzielne zadanie i oddzielne wywołanie 'write_file'.
+- Gdy narzedzie zwroci blad (np. brak narzedzia/undefined), wybierz inne z listy. Jesli write_file zwroci blad np. za dlugiego ciagu, zapisz plik od nowa partiami w trybie 'append'. Po zapisie kodu/skryptu zrob check (np. run_powershell), zeby zweryfikowac poprawnosc i dzialanie pliku.
+- Gdy narzedzie zwroci inny blad, nie poddawaj sie od razu: przeczytaj powod, wybierz obejscie i sprobuj dalej. Typowe obejscia: mkdir dla brakujacego folderu, podzial na czesci (append), zapis do innego pliku w workspace.
 - Note ma byc publiczna i krotka: plan, hipoteza albo decyzja, bez dlugiego ukrytego rozumowania.`;
 
 const SKILL_CATALOG = [
@@ -152,10 +159,18 @@ const SKILL_CATALOG = [
     summary: "Ekstrakcja tekstu, tabel, metadanych i porzadkowanie plikow.",
     instructions: "Dla ekstrakcji danych czytaj pliki lokalnie, zapisuj surowe i oczyszczone wyniki osobno, a transformacje opisuj w sposob audytowalny. Nie wysylaj danych do zewnetrznych serwisow.",
   },
+  {
+    id: "vision",
+    name: "Vision (VLM Support)",
+    category: "Zdolności Agenta",
+    summary: "Włącza obsługę załączników obrazów na czacie oraz narzędzie analyze_image. Podczas instalacji pobiera lekki model VLM.",
+    instructions: "Gdy używasz analyze_image lub wiesz, że użytkownik dostarczył obraz, polegasz na zewnętrznym asystencie wizji (Moondream2). Pamiętaj, aby opierać się na jego odczytach i przekazywać wnioski użytkownikowi wprost, ponieważ główny model działa bez obsługi obrazów.",
+  },
 ];
 
 let mainWindow;
 let serverProcess = null;
+let visionServerProcess = null;
 let serverOwned = false;
 let runningModelId = null;
 let runInProgress = false;
@@ -163,6 +178,7 @@ let runAbortController = null;
 let accessLevel = "sandbox"; // "sandbox" or "full"
 let chatHistory = [];
 let currentChatId = null;
+const VISION_PORT = 11435;
 let previousCpuInfo = os.cpus();
 
 // Custom model settings (overrides per-reasoning defaults when set)
@@ -453,6 +469,9 @@ function refreshSystemPrompt() {
 async function installSkill(skillId) {
   const skill = getSkillById(skillId);
   if (!skill) throw new Error(`Nieznany skill: ${skillId}`);
+  if (skillId === "vision") {
+    await ensureVisionSupport();
+  }
   const store = loadSkillStore();
   if (!store.installed.includes(skillId)) store.installed.push(skillId);
   saveSkillStore(store);
@@ -471,6 +490,9 @@ async function uninstallSkill(skillId) {
   store.installed = store.installed.filter((id) => id !== skillId);
   saveSkillStore(store);
   await fsp.rm(path.join(getSkillsRoot(), skill.id), { recursive: true, force: true });
+  if (skillId === "vision") {
+    await fsp.rm(path.join(BIELIK_HOME, "models", "vision"), { recursive: true, force: true });
+  }
   refreshSystemPrompt();
   emit("status", { status: "skills-changed", detail: `Odinstalowano skill: ${skill.name}` });
   return getSkillsForUi();
@@ -920,9 +942,17 @@ async function stopOwnedServer(options = {}) {
     serverOwned = false;
     runningModelId = null;
     for (let i = 0; i < 30; i += 1) {
-      if (!(await isServerReady(DEFAULT_PORT))) return;
-      await sleep(200);
+      if (child.exitCode !== null) break;
+      await sleep(100);
     }
+    if (child.exitCode === null) {
+      try { process.kill(child.pid, "SIGKILL"); } catch {}
+    }
+  }
+
+  if (visionServerProcess) {
+    try { process.kill(visionServerProcess.pid, "SIGKILL"); } catch {}
+    visionServerProcess = null;
   }
   if (force && options.killPort) {
     const pids = getListeningPidsOnPort(DEFAULT_PORT);
@@ -1061,6 +1091,7 @@ async function callModel(messages, abortSignal) {
 
 function isTransientModelError(error) {
   const message = String(error?.message || error);
+  if (/image input is not supported|mmproj/i.test(message)) return false;
   return /fetch failed|ECONNREFUSED|ECONNRESET|socket|terminated|timeout|nie wyslal danych|Model API 5\d\d/i.test(message);
 }
 
@@ -1353,8 +1384,17 @@ function getToolRecoveryHint(error, action) {
   if (/EACCES|EPERM|access denied|odmowa/i.test(message)) {
     return "Brak uprawnien. Zapisz alternatywny plik w workspace, np. output/ lub exports/, i poinformuj uzytkownika o obejściu.";
   }
+  if (/does not support vision|image_url|multimodal/i.test(message)) {
+    return "Model nie obsługuje analizy obrazów (brak modułu Vision). Przerwij próbę analyze_image i w 'final' przeproś użytkownika, informując, że Twój obecny model nie ma zdolności widzenia.";
+  }
+  if (/(403|404)/.test(message) && (tool === "fetch_url" || tool === "download_file")) {
+    return "Błąd 404/403. Przestań zgadywać linki URL w ciemno! Wróć na stronę domową lub artykuł i użyj narzędzia extract_media lub fetch_url, aby odczytać PRAWDZIWE adresy z kodu HTML.";
+  }
   if (tool === "write_file" || tool === "replace_text") {
-    return "Jesli edycja pliku nie jest mozliwa, zapisz poprawiona wersje jako nowy plik obok oryginalu albo w exports/ i wyjasnij roznice.";
+    return "Jesli zapis nie jest mozliwy (np. tekst za dlugi), zacznij od nowa zapisujac partiami przez mode 'append' w konkretnych miejscach. Jesli to nowy skrypt, sprawdz potem przez run_powershell czy sie wykonuje/otwiera poprawnie. W ostatecznosci utworz plik obok w exports/.";
+  }
+  if (/Nieznane narzedzie|undefined/i.test(message)) {
+    return "Uzyto zlego lub nieistniejacego (undefined) narzedzia. Zmien na poprawne narzedzie z listy 'Dostepne narzedzia'.";
   }
   if (tool === "create_pdf") {
     return "Jesli PDF nie powstal, zapisz zrodlo HTML/Markdown w workspace i sprobuj ponownie create_pdf z prostszym HTML.";
@@ -1569,12 +1609,138 @@ async function executeTool(action) {
       before: "",
       after: `Pobrano ${result.bytes} bajtow z ${args.url}`,
     });
+  } else if (tool === "analyze_image") {
+    const store = loadSkillStore();
+    if (!store.installed.includes("vision")) {
+      throw new Error("Narzędzie analyze_image wymaga zainstalowanego skilla 'Vision (VLM Support)'. Zainstaluj go w panelu Skills.");
+    }
+    const target = normalizeInsideRoot(args.path);
+    emit("activity", { detail: `Pomocniczy model VLM analizuje obraz: ${args.path}` });
+    const description = await runVisionSupport(target, "Describe this image in detail.");
+    result = { description, status: `Analiza obrazu zakończona pomyślnie. Tekstowy opis załączono w pole description.` };
   } else {
     throw new Error(`Nieznane narzedzie: ${tool}`);
   }
 
   emit("tool-result", { tool, ok: true, result });
   return result;
+}
+
+async function downloadFileWithProgress(url, targetPath, label) {
+  return new Promise((resolve, reject) => {
+    https.get(url, (res) => {
+      if (res.statusCode === 301 || res.statusCode === 302) {
+        return downloadFileWithProgress(res.headers.location, targetPath, label).then(resolve).catch(reject);
+      }
+      if (res.statusCode !== 200) return reject(new Error(`Błąd HTTP ${res.statusCode} pobierania ${label}`));
+      
+      const totalBytes = parseInt(res.headers["content-length"] || "0", 10);
+      let downloadedBytes = 0;
+      let lastReportTime = 0;
+      const file = fs.createWriteStream(targetPath);
+      
+      res.on("data", (chunk) => {
+        downloadedBytes += chunk.length;
+        const now = Date.now();
+        if (now - lastReportTime > 500 && totalBytes > 0) {
+          const pct = Math.round((downloadedBytes / totalBytes) * 100);
+          emit("status", { status: "downloading", detail: `${label}: ${pct}%` });
+          lastReportTime = now;
+        }
+      });
+      res.pipe(file);
+      file.on("finish", () => {
+        file.close();
+        resolve();
+      });
+    }).on("error", (err) => {
+      fs.unlink(targetPath, () => {});
+      reject(err);
+    });
+  });
+}
+
+async function ensureVisionSupport() {
+  const visionDir = path.join(BIELIK_HOME, "models", "vision");
+  await fsp.mkdir(visionDir, { recursive: true });
+  
+  const textModelUrl = "https://huggingface.co/moondream/moondream2-gguf/resolve/main/moondream2-text-model-f16.gguf";
+  const mmprojUrl = "https://huggingface.co/moondream/moondream2-gguf/resolve/main/moondream2-mmproj-f16.gguf";
+  const textModelPath = path.join(visionDir, "moondream2-text-model-f16.gguf");
+  const mmprojPath = path.join(visionDir, "moondream2-mmproj-f16.gguf");
+  
+  if (!fs.existsSync(textModelPath)) {
+    emit("activity", { detail: `Pobieram Moondream2 Text Model (1GB, to potrwa chwilę)...` });
+    await downloadFileWithProgress(textModelUrl, textModelPath, "Pobieranie Moondream2");
+  }
+  if (!fs.existsSync(mmprojPath)) {
+    emit("activity", { detail: `Pobieram Moondream2 MMProj (800MB, to potrwa chwilę)...` });
+    await downloadFileWithProgress(mmprojUrl, mmprojPath, "Pobieranie projektora wizji");
+  }
+  return { textModelPath, mmprojPath };
+}
+
+async function ensureVisionServer() {
+  if (visionServerProcess) {
+    try {
+      const res = await fetch(`http://127.0.0.1:${VISION_PORT}/health`);
+      if (res.ok) return;
+    } catch {
+      visionServerProcess = null;
+    }
+  }
+
+  const { textModelPath, mmprojPath } = await ensureVisionSupport();
+  const serverExe = getRuntimeServerExe();
+  if (!serverExe) throw new Error("Nie znaleziono llama-server.exe dla wizji.");
+
+  emit("activity", { detail: "Uruchamiam pomocniczy serwer wizji..." });
+  const child = spawn(serverExe, [
+    "-m", textModelPath,
+    "--mmproj", mmprojPath,
+    "--port", String(VISION_PORT),
+    "--threads", "4",
+    "--ctx-size", "2048",
+    "--parallel", "1",
+    "--no-display-prompt",
+    "-ngl", "0" // Na razie CPU, żeby nie gryzło się z głównym modelem
+  ], { windowsHide: true });
+
+  visionServerProcess = child;
+  child.on("exit", () => { if (visionServerProcess === child) visionServerProcess = null; });
+
+  for (let i = 0; i < 60; i++) {
+    try {
+      const res = await fetch(`http://127.0.0.1:${VISION_PORT}/health`);
+      if (res.ok) return;
+    } catch {}
+    await sleep(1000);
+  }
+  throw new Error("Serwer wizji nie wystartował w terminie.");
+}
+
+async function runVisionSupport(imagePath, prompt) {
+  emit("status", { status: "vision-analysis", detail: "Pomocniczy VLM analizuje obraz..." });
+  await ensureVisionServer();
+
+  const imageBase64 = fs.readFileSync(imagePath).toString("base64");
+  const finalPrompt = `Question: ${prompt}\n\nAnswer:`;
+
+  const response = await fetch(`http://127.0.0.1:${VISION_PORT}/completion`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      prompt: finalPrompt,
+      image_data: [{ data: imageBase64, id: 0 }],
+      n_predict: 512,
+      temperature: 0.2,
+      stop: ["Question:", "User:", "<|im_end|>"]
+    })
+  });
+
+  if (!response.ok) throw new Error(`Błąd serwera wizji: ${response.status}`);
+  const data = await response.json();
+  return data.content.trim();
 }
 
 let messages = createInitialMessages();
@@ -1590,7 +1756,13 @@ function compactMessages() {
   let summaryParts = [];
   for (const msg of oldMessages) {
     if (msg.role === "user") {
-      const text = String(msg.content || "").slice(0, 150);
+      let rawText = "";
+      if (Array.isArray(msg.content)) {
+        rawText = msg.content.find(c => c.type === "text")?.text || "[Obraz]";
+      } else {
+        rawText = String(msg.content || "");
+      }
+      const text = rawText.slice(0, 150);
       if (text.startsWith("Wynik narzedzia")) continue; // skip tool results
       summaryParts.push(`Uzytkownik: ${text}`);
     } else if (msg.role === "assistant") {
@@ -1617,8 +1789,28 @@ async function runAgent(userText) {
   try {
     await validateCurrentWorkspaceRoot();
     await ensureServer(DEFAULT_PORT);
-    messages.push({ role: "user", content: userText });
-    emit("run-start", { text: userText });
+    
+    let content;
+    if (typeof userText === "object" && userText !== null && userText.imageBase64) {
+      const promptText = userText.text || "Proszę przeanalizować załączony obraz.";
+      emit("run-start", { text: userText.text || "[Wysłano obraz]" });
+      
+      const tempImgPath = path.join(os.tmpdir(), `endocode_vision_${Date.now()}.jpg`);
+      await fsp.writeFile(tempImgPath, Buffer.from(userText.imageBase64, "base64"));
+      
+      try {
+        const description = await runVisionSupport(tempImgPath, promptText);
+        content = `[Użytkownik załączył obraz. Pomocniczy system wizji (Moondream2) przeanalizował go dla Ciebie z następującym wynikiem]:\n\n"${description}"\n\n[Polecenie użytkownika]:\n${promptText}`;
+      } catch (err) {
+        content = `[Użytkownik załączył obraz, ale system pomocniczy napotkał błąd podczas analizy: ${err.message}]\n\n[Polecenie]: ${promptText}`;
+      } finally {
+        fs.unlink(tempImgPath, () => {});
+      }
+    } else {
+      content = userText;
+      emit("run-start", { text: userText });
+    }
+    messages.push({ role: "user", content });
 
     const reasoning = getReasoningProfile();
     const failedModelIds = new Set();
@@ -1665,13 +1857,16 @@ async function runAgent(userText) {
       emit("final", { text: "Przerwano zadanie." });
       return { ok: false, aborted: true };
     }
-    const message = `Zatrzymalem zadanie kontrolowanie: ${error.message || String(error)}`;
+    let message = `Zatrzymalem zadanie kontrolowanie: ${error.message || String(error)}`;
+    if (/image input is not supported/i.test(message)) {
+      message = "Używany model to klasyczny LLM (brak obsługi obrazów). Użyj modelu z rodziny Vision (VLM) albo przesyłaj wyłącznie komendy tekstowe.";
+    }
     emit("final", { text: message });
     messages.push({
       role: "assistant",
-      content: JSON.stringify({ note: "Zadanie zatrzymane po bledzie runtime.", final: message }),
+      content: JSON.stringify({ note: "Zadanie zatrzymane z powodu bledu.", final: message }),
     });
-    return { ok: false, error: error.message || String(error) };
+    return { ok: false, error: message };
   } finally {
     runInProgress = false;
     runAbortController = null;
@@ -1778,7 +1973,7 @@ ipcMain.handle("app:set-reasoning", (_event, level) => {
   emit("status", { status: "reasoning-selected", detail: `Intensywnosc: ${REASONING_LEVELS[level].label}` });
   return getState();
 });
-ipcMain.handle("agent:send", (_event, text) => runAgent(String(text ?? "")));
+ipcMain.handle("agent:send", (_event, payload) => runAgent(payload));
 ipcMain.handle("agent:abort", () => {
   if (runAbortController) {
     runAbortController.abort();
