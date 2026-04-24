@@ -1,5 +1,5 @@
 {
-  "selectedModelId": "qwen25-coder-14b-q4km",
+  "selectedModelId": "deepseek-coder-v2-lite-q4km",
   "reasoningLevel": "medium",
   "accessLevel": "sandbox",
   "customModelSettings": {

@@ -3,15 +3,51 @@
     "id": "ce5f74ed-cad7-47f4-8d7c-e4035e61fb4a",
     "title": "zmień nazwę strony na energetyk",
     "createdAt": "2026-04-24T18:39:38.208Z",
-    "updatedAt": "2026-04-24T18:39:38.208Z",
-    "messages": [
+    "updatedAt": "2026-04-24T18:56:18.376Z",
+    "entries": [
       {
+        "type": "message",
         "role": "user",
         "text": "zmień nazwę strony na energetyk"
       },
       {
+        "type": "message",
         "role": "assistant",
         "text": "Osiagnieto limit krokow. Napisz, zeby kontynuowac."
+      },
+      {
+        "type": "message",
+        "role": "user",
+        "text": "zrób ładny css do tej strony"
+      },
+      {
+        "type": "event",
+        "kind": "note",
+        "title": "Start",
+        "body": "Rozpoczęto zadanie."
+      },
+      {
+        "type": "event",
+        "kind": "error",
+        "title": "Błąd",
+        "body": "Error invoking remote method 'agent:send': SyntaxError: Expected ',' or '}' after property value in JSON at position 81 (line 1 column 82)"
+      }
+    ],
+    "messages": [
+      {
+        "type": "message",
+        "role": "user",
+        "text": "zmień nazwę strony na energetyk"
+      },
+      {
+        "type": "message",
+        "role": "assistant",
+        "text": "Osiagnieto limit krokow. Napisz, zeby kontynuowac."
+      },
+      {
+        "type": "message",
+        "role": "user",
+        "text": "zrób ładny css do tej strony"
       }
     ]
   }

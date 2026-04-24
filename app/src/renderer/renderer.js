@@ -142,6 +142,9 @@ function addInlineEvent(kind, title, body = "", extraHtml = "") {
 
   const div = document.createElement("div");
   div.className = `inline-event ${kind}`;
+  div.setAttribute("data-kind", kind);
+  div.setAttribute("data-title", title);
+  div.setAttribute("data-body", body);
   div.innerHTML = `
     <span class="inline-event-icon">${iconMap[kind] || iconMap.note}</span>
     <div class="inline-event-body">
@@ -171,12 +174,60 @@ function toolActionLabel(tool, args) {
 }
 
 function renderDiff(diff) {
-  if (!Array.isArray(diff) || diff.length === 0) return "<pre>Brak zmian.</pre>";
-  const rows = diff.map((row) => {
-    const prefix = row.type === "add" ? "+ " : row.type === "remove" ? "- " : "  ";
-    return `<div class="diff-row ${escapeHtml(row.type)}">${escapeHtml(prefix + (row.text ?? ""))}</div>`;
+  if (!Array.isArray(diff) || diff.length === 0) return "";
+  const added = diff.filter(r => r.type === "add").length;
+  const removed = diff.filter(r => r.type === "remove").length;
+  // Build hunks: groups of consecutive changes with 2 lines of surrounding context
+  const hunks = [];
+  let currentHunk = null;
+  for (let i = 0; i < diff.length; i++) {
+    const row = diff[i];
+    if (row.type === "add" || row.type === "remove") {
+      if (!currentHunk) {
+        currentHunk = { startLine: i + 1, lines: [] };
+        // Add up to 2 context lines before
+        for (let c = Math.max(0, i - 2); c < i; c++) {
+          currentHunk.lines.push({ ...diff[c], lineNo: c + 1 });
+          currentHunk.startLine = c + 1;
+        }
+      }
+      currentHunk.lines.push({ ...row, lineNo: i + 1 });
+    } else {
+      if (currentHunk) {
+        // Add up to 2 context lines after
+        currentHunk.lines.push({ ...row, lineNo: i + 1 });
+        // Check if next is also unchanged
+        if (i + 1 < diff.length && (diff[i + 1].type === "add" || diff[i + 1].type === "remove")) {
+          continue; // keep extending the hunk
+        }
+        if (i + 2 < diff.length && diff[i + 1]?.type === "same" && (diff[i + 2]?.type === "add" || diff[i + 2]?.type === "remove")) {
+          continue;
+        }
+        hunks.push(currentHunk);
+        currentHunk = null;
+      }
+    }
+  }
+  if (currentHunk) hunks.push(currentHunk);
+
+  // Build HTML: summary + collapsible hunks
+  const summaryHtml = `<span class="diff-stat-plus">+${added}</span> <span class="diff-stat-minus">−${removed}</span>`;
+  const hunkRows = hunks.map(hunk => {
+    const lines = hunk.lines.map(r => {
+      const prefix = r.type === "add" ? "+" : r.type === "remove" ? "−" : " ";
+      return `<div class="diff-row ${escapeHtml(r.type)}"><span class="diff-lineno">${r.lineNo}</span>${escapeHtml(prefix + " " + (r.text ?? ""))}</div>`;
+    }).join("");
+    return `<div class="diff-hunk"><div class="diff-hunk-header">@@ linia ${hunk.startLine} @@</div>${lines}</div>`;
   }).join("");
-  return `<div class="diff">${rows}</div>`;
+
+  const id = "diff_" + Date.now() + "_" + Math.random().toString(36).slice(2, 6);
+  return `
+    <div class="diff-summary" onclick="document.getElementById('${id}').classList.toggle('hidden')">
+      ${summaryHtml}
+      <span class="diff-toggle-hint">▸ pokaż zmiany</span>
+    </div>
+    <div class="diff hidden" id="${id}">${hunkRows}</div>
+  `;
 }
 
 // ── Thinking Bubble ──
@@ -253,24 +304,29 @@ function renderChatHistory() {
 }
 
 function switchToChat(chatId) {
-  // Save current messages title if exists (lightweight approach)
   activeChatId = chatId;
   conversation.innerHTML = "";
-  if (welcomeScreen) {
-    const ws = document.createElement("div");
-    ws.className = "welcome-screen";
-    ws.id = "welcomeScreen";
-    ws.innerHTML = welcomeScreen.innerHTML;
-  }
   const session = chatSessions.find((s) => s.id === chatId);
   if (session) {
     chatTitle.textContent = session.title || "Czat";
-    // Replay messages from session
-    for (const msg of session.messages || []) {
-      addMessage(msg.role, msg.text);
+    firstUserMessage = session.title || null;
+    // Replay all stored entries
+    for (const entry of session.entries || []) {
+      if (entry.type === "message") {
+        addMessage(entry.role, entry.text);
+      } else if (entry.type === "event") {
+        addInlineEvent(entry.kind, entry.title, entry.body || "", entry.extraHtml || "");
+      }
+    }
+    // Fallback: if no entries but has messages (old format)
+    if ((!session.entries || session.entries.length === 0) && session.messages?.length) {
+      for (const msg of session.messages) {
+        addMessage(msg.role, msg.text);
+      }
     }
   }
   renderChatHistory();
+  updateWelcome();
 }
 
 async function startNewChat() {
@@ -305,12 +361,23 @@ async function saveChatSession(firstMessage = null) {
     ? (firstMessage.length > 50 ? firstMessage.slice(0, 50) + "..." : firstMessage)
     : chatTitle.textContent;
 
-  const msgs = [];
-  conversation.querySelectorAll(".message").forEach((el) => {
-    msgs.push({
-      role: el.classList.contains("user") ? "user" : "assistant",
-      text: el.textContent,
-    });
+  // Capture ALL conversation entries (messages + inline events)
+  const entries = [];
+  conversation.querySelectorAll(".message, .inline-event").forEach((el) => {
+    if (el.classList.contains("message")) {
+      entries.push({
+        type: "message",
+        role: el.classList.contains("user") ? "user" : "assistant",
+        text: el.textContent,
+      });
+    } else if (el.classList.contains("inline-event")) {
+      entries.push({
+        type: "event",
+        kind: el.getAttribute("data-kind") || "note",
+        title: el.getAttribute("data-title") || "",
+        body: el.getAttribute("data-body") || "",
+      });
+    }
   });
 
   const session = {
@@ -318,7 +385,8 @@ async function saveChatSession(firstMessage = null) {
     title,
     createdAt: chatSessions.find((s) => s.id === activeChatId)?.createdAt || new Date().toISOString(),
     updatedAt: new Date().toISOString(),
-    messages: msgs,
+    entries,
+    messages: entries.filter(e => e.type === "message"), // backward compat
   };
 
   try {
@@ -523,7 +591,8 @@ composer.addEventListener("submit", async (event) => {
 });
 
 promptEl.addEventListener("keydown", (event) => {
-  if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+  if (event.key === "Enter" && !event.shiftKey) {
+    event.preventDefault();
     composer.requestSubmit();
   }
 });
@@ -696,6 +765,7 @@ applySettings.addEventListener("click", async () => {
     await window.endocode.setModelSettings(values);
     addInlineEvent("note", "Ustawienia", "Zastosowano nowe ustawienia modelu.");
     settingsModal.classList.add("hidden");
+    await updateContextInfo(); // refresh indicator with new maxMessages
   } catch (e) {
     addInlineEvent("error", "Ustawienia", e.message || String(e));
   }
