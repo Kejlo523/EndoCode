@@ -1,0 +1,22 @@
+{
+  "name": "bielik-codex-like-sandbox",
+  "model": {
+    "sourceModel": "Qwen/Qwen2.5-Coder-14B-Instruct",
+    "runtimeRepo": "Qwen/Qwen2.5-Coder-14B-Instruct-GGUF",
+    "file": "models/qwen2.5-coder-14b-instruct-q4_k_m.gguf",
+    "quantization": "Q4_K_M"
+  },
+  "server": {
+    "engine": "llama.cpp",
+    "llamaCppRelease": "b8886",
+    "host": "127.0.0.1",
+    "port": 8088,
+    "contextTokens": 8192,
+    "gpuLayers": 99
+  },
+  "sandbox": {
+    "defaultRoot": "workspace",
+    "pathPolicy": "All file tool paths are resolved under the sandbox root and rejected if they escape it.",
+    "shellPolicy": "PowerShell commands run in the sandbox cwd, require user approval, and reject absolute paths, parent traversal, process launchers, and download commands."
+  }
+}

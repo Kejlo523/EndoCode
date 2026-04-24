@@ -1,0 +1,61 @@
+{
+  "defaultModelId": "qwen25-coder-14b-q4km",
+  "models": [
+    {
+      "id": "qwen25-coder-14b-q4km",
+      "displayName": "Qwen2.5-Coder 14B Q4_K_M",
+      "kind": "local-gguf",
+      "serverModel": "qwen2.5-coder-14b-instruct-q4_k_m",
+      "file": "models/qwen2.5-coder-14b-instruct-q4_k_m.gguf",
+      "expectedBytes": 8988110272,
+      "contextTokens": 8192,
+      "gpuLayers": 99,
+      "source": "Qwen/Qwen2.5-Coder-14B-Instruct-GGUF",
+      "description": "Najlepszy domyslny balans szybkosci i jakosci na RTX 3060 12 GB."
+    },
+    {
+      "id": "qwen3-coder-30b-a3b-q4km",
+      "displayName": "Qwen3-Coder 30B-A3B Q4_K_M",
+      "kind": "local-gguf",
+      "serverModel": "qwen3-coder-30b-a3b-instruct-q4_k_m",
+      "file": "models/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf",
+      "expectedBytes": 18556689568,
+      "contextTokens": 8192,
+      "gpuLayers": 28,
+      "source": "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
+      "description": "Mocniejszy model agentowy. Bedzie wolniejszy, bo czesc wag siedzi w RAM/CPU."
+    },
+    {
+      "id": "qwen36-35b-a3b-mxfp4",
+      "displayName": "Qwen3.6 35B-A3B MXFP4",
+      "kind": "local-gguf",
+      "serverModel": "qwen3.6-35b-a3b-mxfp4",
+      "file": "models/Qwen3.6-35B-A3B-MXFP4_MOE.gguf",
+      "expectedBytes": 21706144736,
+      "contextTokens": 8192,
+      "gpuLayers": 18,
+
+      "source": "unsloth/Qwen3.6-35B-A3B-GGUF",
+      "description": "Najnowszy mocny Qwen MoE z repo Unsloth. Ciezszy od Qwen3-Coder 30B, ale nadal do sprobowania na 32 GB RAM."
+    },
+    {
+      "id": "deepseek-coder-v2-lite-q4km",
+      "displayName": "DeepSeek-Coder V2 Lite Q4_K_M",
+      "kind": "local-gguf",
+      "serverModel": "deepseek-coder-v2-lite-instruct-q4_k_m",
+      "file": "models/DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf",
+      "expectedBytes": 10364416768,
+      "contextTokens": 8192,
+      "gpuLayers": 28,
+      "source": "bartowski/DeepSeek-Coder-V2-Lite-Instruct-GGUF",
+      "description": "Alternatywny coder MoE. Dobry do kodu, ale mniej nowy niz Qwen3."
+    },
+    {
+      "id": "claude-opus-4-5-api",
+      "displayName": "Claude Opus 4.5 (API only)",
+      "kind": "cloud-api",
+      "enabled": false,
+      "description": "Claude nie ma lokalnych wag GGUF do instalacji. To pozycja informacyjna."
+    }
+  ]
+}

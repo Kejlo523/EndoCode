@@ -1,0 +1,10 @@
+downloads/
+logs/
+runtime/
+models/*.gguf
+workspace/.tmp/
+__pycache__/
+*.pyc
+app/node_modules/
+app/dist/
+app/*.log

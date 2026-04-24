@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="pl">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Local Codex</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand-block">
+          <div class="brand-mark">LC</div>
+          <div>
+            <div class="brand">Local Codex</div>
+            <div class="brand-sub">GGUF agent workspace</div>
+          </div>
+        </div>
+
+        <div class="control-group">
+          <label class="field">
+            <span>Model</span>
+            <select id="modelSelect"></select>
+          </label>
+          <label class="field">
+            <span>Tryb</span>
+            <select id="reasoningSelect"></select>
+          </label>
+        </div>
+
+        <div class="model-card">
+          <div class="card-label">Aktywny model</div>
+          <div class="model-name" id="activeModelName">...</div>
+          <div class="model-meta" id="activeModelMeta">...</div>
+        </div>
+
+        <div class="workspace-card">
+          <div class="card-label">Workspace</div>
+          <div class="workspace-path" id="workspaceLabel">...</div>
+        </div>
+
+        <div class="sidebar-actions">
+          <button id="chooseWorkspace" title="Wybierz sandbox">Folder</button>
+          <button id="resetChat" title="Wyczyść kontekst">Wyczyść</button>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="session-bar">
+          <div>
+            <div class="eyebrow" id="statusKicker">Gotowy</div>
+            <h1>Sesja</h1>
+          </div>
+          <div class="session-stats">
+            <div>
+              <span>Status</span>
+              <strong id="status">Gotowy</strong>
+            </div>
+            <div>
+              <span>Zdarzenia</span>
+              <strong id="eventCount">0</strong>
+            </div>
+          </div>
+        </header>
+
+        <section class="workspace">
+          <section class="chat-pane">
+            <div class="conversation" id="conversation"></div>
+            <div class="live-activity hidden" id="liveActivity">
+              <div class="live-activity-header">
+                <div class="live-pulse"></div>
+                <span class="live-label" id="liveLabel">Myśli...</span>
+              </div>
+              <div class="live-detail" id="liveDetail"></div>
+            </div>
+            <form class="composer" id="composer">
+              <textarea id="prompt" rows="3" placeholder="Zadanie dla lokalnego modelu..."></textarea>
+              <div class="composer-buttons">
+                <button id="send" type="submit">Wyślij</button>
+                <button id="stopBtn" type="button" class="stop-btn hidden" title="Zatrzymaj agenta">Stop</button>
+              </div>
+            </form>
+          </section>
+
+          <aside class="activity-pane">
+            <div class="activity-head">
+              <div>
+                <div class="panel-title">Aktywność</div>
+                <div class="activity-sub" id="activitySub">Ostatnie kroki</div>
+              </div>
+            </div>
+            <div id="timeline" class="timeline"></div>
+          </aside>
+        </section>
+      </main>
+    </div>
+
+    <div class="modal hidden" id="approvalModal">
+      <div class="modal-card">
+        <div class="modal-title">Zatwierdź komendę</div>
+        <div class="modal-small" id="approvalCwd"></div>
+        <pre id="approvalCommand"></pre>
+        <div class="modal-actions">
+          <button id="rejectCommand">Odrzuć</button>
+          <button id="approveCommand">Uruchom</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="./renderer.js"></script>
+  </body>
+</html>

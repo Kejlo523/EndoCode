@@ -1,0 +1,33 @@
+{
+  "name": "local-codex",
+  "version": "0.1.0",
+  "description": "Local Codex-like desktop shell for GGUF coding models",
+  "main": "src/main.js",
+  "author": "Kejlo",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win dir",
+    "pack": "electron-builder --win dir"
+  },
+  "build": {
+    "appId": "local.bielik.codex",
+    "productName": "Local Codex",
+    "asar": false,
+    "files": [
+      "src/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        "dir"
+      ],
+      "signAndEditExecutable": false
+    }
+  },
+  "devDependencies": {
+    "electron": "^39.2.7",
+    "electron-builder": "^26.0.12"
+  }
+}
