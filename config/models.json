@@ -14,6 +14,18 @@
       "description": "Najlepszy domyslny balans szybkosci i jakosci na RTX 3060 12 GB."
     },
     {
+      "id": "bielik-minitron-7b-q5km",
+      "displayName": "Bielik Minitron 7B v3 Q5_K_M",
+      "kind": "local-gguf",
+      "serverModel": "minitron-Bielik-7B-v3.0-Instruct-GGUF.Q5_K_M",
+      "file": "models/minitron-Bielik-7B-v3.0-Instruct-GGUF.Q5_K_M.gguf",
+      "expectedBytes": 5293952032,
+      "contextTokens": 8192,
+      "gpuLayers": 99,
+      "source": "speakleash/Bielik-Minitron-7B-v3.0-Instruct-GGUF",
+      "description": "Lekki lokalny model zapasowy, dobry do szybkich prob i odzysku po awarii ciezszych modeli."
+    },
+    {
       "id": "qwen3-coder-30b-a3b-q4km",
       "displayName": "Qwen3-Coder 30B-A3B Q4_K_M",
       "kind": "local-gguf",

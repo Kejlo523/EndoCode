@@ -1092,6 +1092,20 @@ select:focus { border-color: var(--border-focus); }
   border-color: var(--accent);
   transform: rotate(30deg);
 }
+.kill-server-btn {
+  color: var(--danger);
+  border-color: rgba(248, 81, 73, 0.28);
+}
+.kill-server-btn:hover {
+  color: var(--danger);
+  border-color: var(--danger);
+  background: var(--danger-bg);
+  transform: none;
+}
+.kill-server-btn:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
 
 /* ══════════════ RESPONSIVE ══════════════ */
 @media (max-width: 900px) {

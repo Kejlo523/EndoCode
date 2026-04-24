@@ -31,6 +31,7 @@ const rejectCommand = document.getElementById("rejectCommand");
 const skillsBtn = document.getElementById("skillsBtn");
 const skillsModal = document.getElementById("skillsModal");
 const closeSkills = document.getElementById("closeSkills");
+const killServerBtn = document.getElementById("killServerBtn");
 
 // System monitor refs
 const cpuBar = document.getElementById("cpuBar");
@@ -556,6 +557,25 @@ stopBtn.addEventListener("click", async () => {
   }
 });
 
+killServerBtn.addEventListener("click", async () => {
+  killServerBtn.disabled = true;
+  showLive("Kill switch...", `Zatrzymuję runtime modelu na porcie 8088`);
+  try {
+    const result = await window.endocode.killServer();
+    const detail = result.alive
+      ? `Port ${result.port} nadal odpowiada.`
+      : `Port ${result.port} zwolniony${result.killedPids?.length ? `, PID: ${result.killedPids.join(", ")}` : ""}.`;
+    addInlineEvent("note", "Kill switch", detail);
+    setBusy(false);
+    hideLive();
+    await refreshState();
+  } catch (e) {
+    addInlineEvent("error", "Kill switch", e.message || String(e));
+  } finally {
+    killServerBtn.disabled = false;
+  }
+});
+
 // ── Auto-resize textarea ──
 promptEl.addEventListener("input", () => {
   promptEl.style.height = "auto";
@@ -601,6 +621,24 @@ promptEl.addEventListener("keydown", (event) => {
 window.endocode.onEvent((event) => {
   if (event.type === "status") {
     if (event.status === "model-thinking") showLive("Myśli...", event.detail || "");
+    else if (event.status === "model-json-retry") showLive("Naprawiam JSON...", event.detail || "");
+    else if (event.status === "model-call-retry") {
+      addInlineEvent("note", "Runtime modelu", event.detail || "Ponawiam po błędzie modelu.");
+      showLive("Restart modelu...", event.detail || "");
+    } else if (event.status === "model-fallback") {
+      addInlineEvent("note", "Fallback modelu", event.detail || "Przełączam model.");
+      showLive("Fallback modelu...", event.detail || "");
+      refreshState();
+    } else if (event.status === "model-fallback-failed") {
+      addInlineEvent("error", "Fallback modelu", event.detail || "Model zapasowy nie wystartował.");
+    } else if (event.status === "server-killing") showLive("Kill switch...", event.detail || "");
+    else if (event.status === "server-killed") showLive("Kill switch", event.detail || "");
+    else if (event.status === "server-starting" || event.status === "server-stopping") showLive("Runtime modelu", event.detail || "");
+    return;
+  }
+  if (event.type === "parse-error") {
+    addInlineEvent("error", "Model JSON", `Niepoprawna odpowiedź (${event.attempt}/${event.maxAttempts}): ${event.error || ""}`);
+    showLive("Naprawiam odpowiedź modelu...");
     return;
   }
   if (event.type === "run-start") {

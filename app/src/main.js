@@ -8,6 +8,10 @@ const os = require("node:os");
 
 const DEFAULT_PORT = 8088;
 const MAX_FILE_BYTES = 220000;
+const MODEL_JSON_RETRY_LIMIT = 2;
+const MODEL_CALL_RETRY_LIMIT = 1;
+const MODEL_STREAM_IDLE_TIMEOUT_MS = 6 * 60 * 1000;
+const SERVER_SHUTDOWN_TIMEOUT_MS = 6000;
 let MAX_MESSAGES = 32;
 
 const REASONING_LEVELS = {
@@ -104,6 +108,95 @@ function emit(type, payload = {}) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function waitForChildExit(child, timeoutMs = SERVER_SHUTDOWN_TIMEOUT_MS) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.removeListener("exit", onExit);
+      resolve(false);
+    }, timeoutMs);
+    function onExit() {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(true);
+    }
+    child.once("exit", onExit);
+  });
+}
+
+function forceKillPid(pid) {
+  const safePid = Number(pid);
+  if (!Number.isInteger(safePid) || safePid <= 0 || safePid === process.pid) return false;
+  try {
+    if (process.platform === "win32") {
+      execSync(`taskkill /PID ${safePid} /T /F`, { timeout: 5000, windowsHide: true, stdio: "ignore" });
+    } else {
+      process.kill(safePid, "SIGKILL");
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function getListeningPidsOnPort(port = DEFAULT_PORT) {
+  const safePort = Number(port);
+  if (!Number.isInteger(safePort) || safePort <= 0) return [];
+  try {
+    if (process.platform === "win32") {
+      const out = execSync("netstat -ano -p tcp", { timeout: 5000, windowsHide: true }).toString();
+      const pids = new Set();
+      for (const line of out.split(/\r?\n/)) {
+        const parts = line.trim().split(/\s+/);
+        if (parts.length < 5) continue;
+        const localAddress = parts[1] || "";
+        const state = parts[3] || "";
+        const pid = Number(parts[4]);
+        if (state.toUpperCase() === "LISTENING" && localAddress.includes(`:${safePort}`) && Number.isInteger(pid)) {
+          pids.add(pid);
+        }
+      }
+      return [...pids].filter((pid) => pid !== process.pid);
+    }
+    const out = execSync(`lsof -ti tcp:${safePort} -sTCP:LISTEN`, { timeout: 5000, windowsHide: true }).toString();
+    return out.split(/\s+/).map(Number).filter((pid) => Number.isInteger(pid) && pid > 0 && pid !== process.pid);
+  } catch {
+    return [];
+  }
+}
+
+function createModelAbortGuard(parentSignal) {
+  const controller = new AbortController();
+  let timedOut = false;
+  let timer = null;
+  const reset = () => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, MODEL_STREAM_IDLE_TIMEOUT_MS);
+  };
+  const onParentAbort = () => controller.abort();
+  if (parentSignal) {
+    if (parentSignal.aborted) onParentAbort();
+    else parentSignal.addEventListener("abort", onParentAbort, { once: true });
+  }
+  reset();
+  return {
+    signal: controller.signal,
+    reset,
+    isTimedOut: () => timedOut,
+    cleanup: () => {
+      if (timer) clearTimeout(timer);
+      if (parentSignal) parentSignal.removeEventListener("abort", onParentAbort);
+    },
+  };
 }
 
 function pathExists(p) {
@@ -321,6 +414,47 @@ function getModelFileStatus(model) {
   }
 }
 
+function modelSizeForSort(model) {
+  return Number(model.expectedBytes || model.fileStatus?.size || 0);
+}
+
+function getFallbackModelCandidates(failedModelIds) {
+  const catalog = loadModelCatalog();
+  const candidates = getModelsForUi()
+    .filter((model) => model.kind === "local-gguf" && model.available)
+    .filter((model) => model.id !== selectedModelId && !failedModelIds.has(model.id))
+    .sort((a, b) => modelSizeForSort(a) - modelSizeForSort(b));
+  const defaultCandidate = candidates.find((model) => model.id === catalog.defaultModelId);
+  if (!defaultCandidate) return candidates;
+  return [defaultCandidate, ...candidates.filter((model) => model.id !== defaultCandidate.id)];
+}
+
+async function switchToFallbackModel(reason, failedModelIds) {
+  failedModelIds.add(selectedModelId);
+  const candidates = getFallbackModelCandidates(failedModelIds);
+  for (const fallback of candidates) {
+    try {
+      selectedModelId = fallback.id;
+      saveAppSettings();
+      if (messages.length) messages[0] = { role: "system", content: createSystemPrompt() };
+      emit("status", {
+        status: "model-fallback",
+        detail: `Przelaczam na ${fallback.displayName}: ${String(reason || "blad modelu").slice(0, 140)}`,
+      });
+      await stopOwnedServer({ force: true });
+      await ensureServer(DEFAULT_PORT);
+      return fallback;
+    } catch (error) {
+      failedModelIds.add(fallback.id);
+      emit("status", {
+        status: "model-fallback-failed",
+        detail: `${fallback.displayName}: ${error.message || String(error)}`,
+      });
+    }
+  }
+  return null;
+}
+
 function normalizeInsideRoot(rawPath = ".") {
   const base = path.isAbsolute(String(rawPath)) ? String(rawPath) : path.join(cwd, String(rawPath));
   const resolved = path.resolve(base);
@@ -423,10 +557,12 @@ async function ensureServer(port = DEFAULT_PORT) {
   const errLog = fs.openSync(path.join(BIELIK_HOME, "logs", "local-codex-server.err.log"), "a");
 
   emit("status", { status: "server-starting", detail: `Uruchamiam: ${config.displayName}.` });
+  const contextTokens = customModelSettings.contextTokens ?? config.contextTokens ?? 8192;
+  const gpuLayers = customModelSettings.gpuLayers ?? config.gpuLayers ?? 99;
   const serverArgs = [
     "-m", modelPath,
-    "-c", String(config.contextTokens || 8192),
-    "-ngl", String(config.gpuLayers ?? 99),
+    "-c", String(contextTokens),
+    "-ngl", String(gpuLayers),
     "--host", "127.0.0.1",
     "--port", String(port),
     "--jinja",
@@ -438,11 +574,17 @@ async function ensureServer(port = DEFAULT_PORT) {
     serverArgs.push("--reasoning-budget", String(config.reasoningBudget));
   }
 
-  const child = spawn(serverExe, serverArgs, {
-    cwd: path.dirname(serverExe),
-    stdio: ["ignore", outLog, errLog],
-    windowsHide: true,
-  });
+  let child;
+  try {
+    child = spawn(serverExe, serverArgs, {
+      cwd: path.dirname(serverExe),
+      stdio: ["ignore", outLog, errLog],
+      windowsHide: true,
+    });
+  } finally {
+    try { fs.closeSync(outLog); } catch { /* ignore */ }
+    try { fs.closeSync(errLog); } catch { /* ignore */ }
+  }
   serverProcess = child;
   serverOwned = true;
   runningModelId = selectedModelId;
@@ -467,10 +609,19 @@ async function ensureServer(port = DEFAULT_PORT) {
   throw new Error("Serwer nie odpowiedzial w ciagu 180 sekund.");
 }
 
-async function stopOwnedServer() {
+async function stopOwnedServer(options = {}) {
+  const force = Boolean(options.force);
   if (serverProcess && serverOwned) {
+    const child = serverProcess;
+    const pid = child.pid;
     emit("status", { status: "server-stopping", detail: "Zatrzymuje lokalny serwer." });
-    serverProcess.kill();
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+    const exited = await waitForChildExit(child);
+    if (!exited && force && pid) {
+      emit("status", { status: "server-killing", detail: `Wymuszam zamkniecie procesu modelu PID ${pid}.` });
+      forceKillPid(pid);
+      await waitForChildExit(child, 3000);
+    }
     serverProcess = null;
     serverOwned = false;
     runningModelId = null;
@@ -479,9 +630,46 @@ async function stopOwnedServer() {
       await sleep(200);
     }
   }
+  if (force && options.killPort) {
+    const pids = getListeningPidsOnPort(DEFAULT_PORT);
+    for (const pid of pids) forceKillPid(pid);
+    for (let i = 0; i < 30; i += 1) {
+      if (!(await isServerReady(DEFAULT_PORT))) return;
+      await sleep(200);
+    }
+  }
+}
+
+async function killModelServerResources() {
+  const hadRun = Boolean(runAbortController);
+  if (runAbortController) runAbortController.abort();
+  const ownedPid = serverProcess?.pid || null;
+  await stopOwnedServer({ force: true });
+
+  const pids = getListeningPidsOnPort(DEFAULT_PORT);
+  const killedPids = [];
+  for (const pid of pids) {
+    if (forceKillPid(pid)) killedPids.push(pid);
+  }
+  for (let i = 0; i < 30; i += 1) {
+    if (!(await isServerReady(DEFAULT_PORT))) break;
+    await sleep(200);
+  }
+
+  const alive = await isServerReady(DEFAULT_PORT);
+  serverProcess = null;
+  serverOwned = false;
+  runningModelId = null;
+  const detail = alive
+    ? `Kill switch wykonany, ale port ${DEFAULT_PORT} nadal odpowiada.`
+    : `Kill switch zakonczony. Zwolniono port ${DEFAULT_PORT}.`;
+  emit("status", { status: "server-killed", detail });
+  return { aborted: hadRun, ownedPid, killedPids, port: DEFAULT_PORT, alive };
 }
 
 async function callModel(messages, abortSignal) {
+  if (abortSignal?.aborted) throw new Error("Przerwano przez uzytkownika.");
+  const abortGuard = createModelAbortGuard(abortSignal);
   const reasoning = getReasoningProfile();
   const temp = customModelSettings.temperature ?? reasoning.temperature;
   const maxTok = customModelSettings.maxTokens ?? reasoning.maxTokens;
@@ -496,73 +684,114 @@ async function callModel(messages, abortSignal) {
   if (customModelSettings.topK != null) body.top_k = customModelSettings.topK;
   if (customModelSettings.repeatPenalty != null) body.repeat_penalty = customModelSettings.repeatPenalty;
 
-  const res = await fetch(`http://127.0.0.1:${DEFAULT_PORT}/v1/chat/completions`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-    signal: abortSignal,
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Model API ${res.status}: ${text.slice(0, 600)}`);
-  }
+  try {
+    const res = await fetch(`http://127.0.0.1:${DEFAULT_PORT}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: abortGuard.signal,
+    });
+    abortGuard.reset();
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`Model API ${res.status}: ${text.slice(0, 600)}`);
+    }
 
-  // Stream response for live display
-  let fullContent = "";
-  let thinkingContent = "";
-  let inThinking = false;
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
+    // Stream response for live display
+    let fullContent = "";
+    let thinkingContent = "";
+    let inThinking = false;
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
 
-  while (true) {
-    if (abortSignal?.aborted) throw new Error("Przerwano przez uzytkownika.");
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
+    while (true) {
+      if (abortSignal?.aborted) throw new Error("Przerwano przez uzytkownika.");
+      const { done, value } = await reader.read();
+      abortGuard.reset();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
 
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
 
-    for (const line of lines) {
-      const stripped = line.trim();
-      if (!stripped || stripped === "data: [DONE]") continue;
-      if (!stripped.startsWith("data: ")) continue;
-      try {
-        const chunk = JSON.parse(stripped.slice(6));
-        const delta = chunk.choices?.[0]?.delta;
-        if (!delta) continue;
+      for (const line of lines) {
+        const stripped = line.trim();
+        if (!stripped || stripped === "data: [DONE]") continue;
+        if (!stripped.startsWith("data: ")) continue;
+        try {
+          const chunk = JSON.parse(stripped.slice(6));
+          const delta = chunk.choices?.[0]?.delta;
+          if (!delta) continue;
 
-        // Handle reasoning_content (thinking tokens)
-        if (delta.reasoning_content) {
-          thinkingContent += delta.reasoning_content;
-          if (!inThinking) {
-            inThinking = true;
-            emit("thinking-start", {});
+          // Handle reasoning_content (thinking tokens)
+          if (delta.reasoning_content) {
+            thinkingContent += delta.reasoning_content;
+            if (!inThinking) {
+              inThinking = true;
+              emit("thinking-start", {});
+            }
+            emit("thinking-delta", { text: delta.reasoning_content, full: thinkingContent });
           }
-          emit("thinking-delta", { text: delta.reasoning_content, full: thinkingContent });
-        }
 
-        // Handle regular content
-        if (delta.content) {
-          if (inThinking) {
-            inThinking = false;
-            emit("thinking-end", { full: thinkingContent });
+          // Handle regular content
+          if (delta.content) {
+            if (inThinking) {
+              inThinking = false;
+              emit("thinking-end", { full: thinkingContent });
+            }
+            fullContent += delta.content;
+            emit("content-delta", { text: delta.content, full: fullContent });
           }
-          fullContent += delta.content;
-          emit("content-delta", { text: delta.content, full: fullContent });
+        } catch {
+          // malformed SSE chunk, skip
         }
-      } catch {
-        // malformed SSE chunk, skip
       }
     }
-  }
 
-  if (inThinking) {
-    emit("thinking-end", { full: thinkingContent });
-  }
+    if (inThinking) {
+      emit("thinking-end", { full: thinkingContent });
+    }
 
-  return fullContent;
+    return fullContent;
+  } catch (error) {
+    if (abortSignal?.aborted) throw new Error("Przerwano przez uzytkownika.");
+    if (abortGuard.isTimedOut()) {
+      throw new Error(`Model nie wyslal danych przez ${Math.round(MODEL_STREAM_IDLE_TIMEOUT_MS / 1000)} sekund.`);
+    }
+    throw error;
+  } finally {
+    abortGuard.cleanup();
+  }
+}
+
+function isTransientModelError(error) {
+  const message = String(error?.message || error);
+  return /fetch failed|ECONNREFUSED|ECONNRESET|socket|terminated|timeout|nie wyslal danych|Model API 5\d\d/i.test(message);
+}
+
+async function callModelWithRecovery(messages, abortSignal, failedModelIds) {
+  let lastError = null;
+  for (let attempt = 0; attempt <= MODEL_CALL_RETRY_LIMIT; attempt += 1) {
+    try {
+      return await callModel(messages, abortSignal);
+    } catch (error) {
+      if (abortSignal?.aborted) throw error;
+      lastError = error;
+      if (attempt >= MODEL_CALL_RETRY_LIMIT || !isTransientModelError(error)) break;
+      emit("status", {
+        status: "model-call-retry",
+        detail: `Problem z runtime modelu. Restart i ponowna proba (${attempt + 1}/${MODEL_CALL_RETRY_LIMIT}).`,
+      });
+      await stopOwnedServer({ force: true });
+      await ensureServer(DEFAULT_PORT);
+    }
+  }
+  if (lastError && isTransientModelError(lastError) && failedModelIds) {
+    const fallback = await switchToFallbackModel(lastError.message || String(lastError), failedModelIds);
+    if (fallback) return callModelWithRecovery(messages, abortSignal, failedModelIds);
+  }
+  throw lastError;
 }
 
 function parseJsonAction(raw) {
@@ -607,6 +836,63 @@ function extractFirstJsonObject(text) {
     }
   }
   return null;
+}
+
+function makeJsonRepairPrompt(error, raw) {
+  return `Poprzednia odpowiedz nie byla poprawnym pojedynczym JSON-em i zostala odrzucona.
+Blad parsera: ${String(error?.message || error).slice(0, 500)}
+
+Odpowiedz teraz wylacznie jednym poprawnym JSON-em zgodnym z kontraktem systemowym.
+Nie uzywaj Markdown, komentarzy ani tekstu przed/po JSON.
+Jesli nie wiesz co zrobic dalej, zwroc final:
+{"note":"odzysk po bledzie JSON","final":"Nie udalo sie bezpiecznie kontynuowac."}
+
+Odrzucona odpowiedz:
+${String(raw || "").slice(0, 1600)}`;
+}
+
+async function getNextActionWithRepair(abortSignal, failedModelIds) {
+  let lastError = null;
+  while (true) {
+    for (let attempt = 0; attempt <= MODEL_JSON_RETRY_LIMIT; attempt += 1) {
+      if (attempt > 0) {
+        emit("status", {
+          status: "model-json-retry",
+          detail: `Naprawiam odpowiedz JSON (${attempt}/${MODEL_JSON_RETRY_LIMIT}).`,
+        });
+      }
+      const raw = await callModelWithRecovery(messages, abortSignal, failedModelIds);
+      emit("model-raw", { raw });
+      try {
+        return parseJsonAction(raw);
+      } catch (error) {
+        lastError = error;
+        emit("parse-error", {
+          error: error.message || String(error),
+          attempt: attempt + 1,
+          maxAttempts: MODEL_JSON_RETRY_LIMIT + 1,
+          raw: textPreview(raw, 1200),
+        });
+        if (attempt >= MODEL_JSON_RETRY_LIMIT) break;
+        messages.push({
+          role: "assistant",
+          content: JSON.stringify({
+            note: "Poprzednia odpowiedz modelu byla niepoprawnym JSON-em i zostala odrzucona.",
+          }),
+        });
+        messages.push({ role: "user", content: makeJsonRepairPrompt(error, raw) });
+      }
+    }
+    const fallback = failedModelIds
+      ? await switchToFallbackModel(`niepoprawny JSON: ${lastError?.message || "blad parsera"}`, failedModelIds)
+      : null;
+    if (!fallback) break;
+    messages.push({
+      role: "user",
+      content: `Aktualny model zostal przelaczony na ${fallback.displayName}. Kontynuuj od ostatniego bezpiecznego kroku i zwroc poprawny JSON.`,
+    });
+  }
+  throw new Error(`Model zwrocil niepoprawny JSON po kilku probach: ${lastError?.message || "nieznany blad"}`);
 }
 
 function textPreview(value, limit = 26000) {
@@ -856,6 +1142,7 @@ async function runAgent(userText) {
     emit("run-start", { text: userText });
 
     const reasoning = getReasoningProfile();
+    const failedModelIds = new Set();
     const effectiveMaxSteps = customModelSettings.maxSteps === 0
       ? 999999
       : (customModelSettings.maxSteps ?? reasoning.maxSteps);
@@ -864,9 +1151,7 @@ async function runAgent(userText) {
       compactMessages();
       const stepLabel = effectiveMaxSteps >= 999999 ? `krok ${step} (∞)` : `krok ${step}/${effectiveMaxSteps}`;
       emit("status", { status: "model-thinking", detail: `${getModelConfig().displayName} — ${stepLabel}` });
-      const raw = await callModel(messages, signal);
-      emit("model-raw", { raw });
-      const action = parseJsonAction(raw);
+      const action = await getNextActionWithRepair(signal, failedModelIds);
       if (action.note) emit("note", { note: action.note });
 
       if (action.final) {
@@ -900,7 +1185,13 @@ async function runAgent(userText) {
       emit("final", { text: "Przerwano zadanie." });
       return { ok: false, aborted: true };
     }
-    throw error;
+    const message = `Zatrzymalem zadanie kontrolowanie: ${error.message || String(error)}`;
+    emit("final", { text: message });
+    messages.push({
+      role: "assistant",
+      content: JSON.stringify({ note: "Zadanie zatrzymane po bledzie runtime.", final: message }),
+    });
+    return { ok: false, error: error.message || String(error) };
   } finally {
     runInProgress = false;
     runAbortController = null;
@@ -957,12 +1248,12 @@ app.whenReady().then(async () => {
 });
 
 app.on("window-all-closed", async () => {
-  await stopOwnedServer();
+  await stopOwnedServer({ force: true });
   if (process.platform !== "darwin") app.quit();
 });
 
 app.on("before-quit", async () => {
-  await stopOwnedServer();
+  await stopOwnedServer({ force: true });
 });
 
 ipcMain.handle("app:state", () => ({ ...getState(), accessLevel }));
@@ -1009,6 +1300,7 @@ ipcMain.handle("agent:abort", () => {
   }
   return { aborted: false };
 });
+ipcMain.handle("agent:kill-server", () => killModelServerResources());
 ipcMain.handle("approval:reply", (_event, approvalId, approved) => {
   ipcMain.emit(`approval:${approvalId}`, _event, approved);
 });

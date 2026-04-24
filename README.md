@@ -73,6 +73,7 @@ Gotowy plik:
 ## Zainstalowane modele
 
 - `Qwen2.5-Coder 14B Q4_K_M` - domyslny, najlepszy balans na RTX 3060 12 GB.
+- `Bielik Minitron 7B v3 Q5_K_M` - lekki lokalny model zapasowy.
 - `Qwen3-Coder 30B-A3B Q4_K_M` - mocniejszy, wolniejszy, czesciowo CPU/RAM.
 - `Qwen3.6 35B-A3B MXFP4` - najnowszy ciezszy Qwen MoE, dziala z reasoning wylaczonym po stronie `llama-server`.
 - `DeepSeek-Coder V2 Lite Q4_K_M` - alternatywny lokalny coder.
