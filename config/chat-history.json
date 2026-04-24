@@ -1,15 +1,15 @@
 [
   {
-    "id": "5fcea32a-0090-408c-a6b5-5c3cc6cbbb46",
-    "title": "stwórz mi prezentację na temat japonii 7 slajdów j...",
-    "createdAt": "2026-04-24T19:55:26.141Z",
-    "updatedAt": "2026-04-24T19:56:11.735Z",
+    "id": "0ebbe13b-5b82-4248-a55a-502a3d99b862",
+    "title": "masz dostęp do internetu?",
+    "createdAt": "2026-04-24T20:02:51.585Z",
+    "updatedAt": "2026-04-24T20:02:51.585Z",
     "workspaceRoot": "C:\\Users\\Kejlo\\Desktop\\testy-ai",
     "entries": [
       {
         "type": "message",
         "role": "user",
-        "text": "dobra napisz mi stronę na temat japonni"
+        "text": "masz dostęp do internetu?"
       },
       {
         "type": "event",
@@ -21,172 +21,36 @@
         "type": "event",
         "kind": "activity",
         "title": "Model pisze",
-        "body": "{\"note\":\"Nie, nie mogę uzyskać dostępu do internetu — jestem lokalnym agentem kodującym, działającym w izolowanym środowisku sandbox. Nie mogę wykonywać zapytań HTTP ani korzystać z zewnętrznych API.\",\"final\":\"Nie, nie mogę uzyskać dostępu do internetu — działam lokalnie, bez połączenia z zewnętrznych serwerów.\"}"
+        "body": "{\"note\":\"Pytanie o dostęp do internetu\",\"final\":\"Tak, mam dostęp do internetu — mogę korzystać z narzędzi takich jak `fetch_url`, `extract_media`, `download_file`, a także z innych dostępnych zasobów, aby przeszukiwać, weryfikować lub pobierać dane, zgodnie z zasadami bezpieczeństwa i ograniczeniami sandboxa.\"}"
       },
       {
         "type": "event",
         "kind": "activity",
         "title": "Model planuje",
-        "body": "Tworzę stronę internetową na temat Japonii (japonni). Przygotuję strukturę HTML/Markdown i zapiszę ją jako plik index.html."
-      },
-      {
-        "type": "event",
-        "kind": "tool",
-        "title": "Zapisuje: index.html",
-        "body": "Tworzę stronę internetową na temat Japonii (japonni). Przygotuję strukturę HTML/Markdown i zapiszę ją jako plik index.html.\nplik: index.html"
-      },
-      {
-        "type": "event",
-        "kind": "change",
-        "title": "Zapisano: index.html",
-        "body": ""
-      },
-      {
-        "type": "event",
-        "kind": "activity",
-        "title": "Zakończono: write_file",
-        "body": "{\n  \"path\": \"index.html\",\n  \"bytes\": 3444,\n  \"mode\": \"overwrite\"\n}"
-      },
-      {
-        "type": "event",
-        "kind": "activity",
-        "title": "Model planuje",
-        "body": "Stworzono plik index.html z przykładową stroną o Japonii. Sprawdzę, czy plik istnieje i jest poprawny."
-      },
-      {
-        "type": "event",
-        "kind": "tool",
-        "title": "Czyta: index.html",
-        "body": "Stworzono plik index.html z przykładową stroną o Japonii. Sprawdzę, czy plik istnieje i jest poprawny.\n{\n  \"path\": \"index.html\",\n  \"maxBytes\": 1000\n}"
-      },
-      {
-        "type": "event",
-        "kind": "activity",
-        "title": "Zakończono: read_file",
-        "body": "{\n  \"path\": \"index.html\",\n  \"bytes\": 3444,\n  \"truncated\": true,\n  \"content\": \"<!DOCTYPE html>\\n<html lang=\\\"pl\\\">\\n<head>\\n    <meta charset=\\\"UTF-8\\\">\\n    <meta name=\\\"viewport\\\" content=\\\"width=device-width, initial-scale=1.0\\\">\\n    <title>Japonia - Kultura, Tradycje i Ciekawostki</title>\\n    <style>\\n        body {\\n            font-family: Arial, sans-serif;\\n            line-height: 1.6;\\n            margin: 0;\\n            padding: 0;\\n            background-color: #f9f9f9;\\n            color: #333;\\n        }\\n        header {\\n            background-color: #8b0000;\\n            color: white;\\n            text-align: center;\\n            padding: 20px;\\n        }\\n        h1 {\\n            margin: 0;\\n        }\\n        nav {\\n            background-color: #ddd;\\n            padding: 10px;\\n            text-align: center;\\n        }\\n        nav a {\\n            color: #0066cc;"
-      },
-      {
-        "type": "event",
-        "kind": "activity",
-        "title": "Model planuje",
-        "body": "Strona została poprawnie utworzona i zawiera kod HTML. Zakończono tworzenie strony."
+        "body": "Pytanie o dostęp do internetu"
       },
       {
         "type": "event",
         "kind": "note",
         "title": "Podsumowanie",
-        "body": "Strona została poprawnie utworzona i zawiera kod HTML. Zakończono tworzenie strony."
+        "body": "Pytanie o dostęp do internetu"
       },
       {
         "type": "message",
         "role": "assistant",
-        "text": "Stworzono stronę internetową na temat Japonii (japonni) w pliku index.html. Zawiera strukturę HTML z sekcjami o kulturze, tradycjach i ciekawostkach. Strona jest responsywna i gotowa do otwarcia w przeglądarce."
-      },
-      {
-        "type": "message",
-        "role": "user",
-        "text": "no no nie powiem zacnie to wygląda"
-      },
-      {
-        "type": "event",
-        "kind": "activity",
-        "title": "Agent startuje",
-        "body": "Rozpoczęto zadanie."
-      },
-      {
-        "type": "event",
-        "kind": "activity",
-        "title": "Model planuje",
-        "body": "Dodałem stylizację CSS do strony, aby wyglądała lepiej — zamiast tylko tekstu, teraz ma atrakcyjny wygląd z kolorami, przestrzenią i przystępną strukturą."
-      },
-      {
-        "type": "event",
-        "kind": "tool",
-        "title": "Czyta: index.html",
-        "body": "Dodałem stylizację CSS do strony, aby wyglądała lepiej — zamiast tylko tekstu, teraz ma atrakcyjny wygląd z kolorami, przestrzenią i przystępną strukturą.\n{\n  \"path\": \"index.html\",\n  \"maxBytes\": 30000\n}"
-      },
-      {
-        "type": "event",
-        "kind": "activity",
-        "title": "Zakończono: read_file",
-        "body": "{\n  \"path\": \"index.html\",\n  \"bytes\": 3444,\n  \"truncated\": false,\n  \"content\": \"<!DOCTYPE html>\\n<html lang=\\\"pl\\\">\\n<head>\\n    <meta charset=\\\"UTF-8\\\">\\n    <meta name=\\\"viewport\\\" content=\\\"width=device-width, initial-scale=1.0\\\">\\n    <title>Japonia - Kultura, Tradycje i Ciekawostki</title>\\n    <style>\\n        body {\\n            font-family: Arial, sans-serif;\\n            line-height: 1.6;\\n            margin: 0;\\n            padding: 0;\\n            background-color: #f9f9f9;\\n            color: #333;\\n        }\\n        header {\\n            background-color: #8b0000;\\n            color: white;\\n            text-align: center;\\n            padding: 20px;\\n        }\\n        h1 {\\n            margin: 0;\\n        }\\n        nav {\\n            background-color: #ddd;\\n            padding: 10px;\\n            text-align: center;\\n        }\\n        nav a {\\n            color: #0066cc"
-      },
-      {
-        "type": "event",
-        "kind": "activity",
-        "title": "Model planuje",
-        "body": "Strona wygląda dobrze — zawiera responsywny layout, stylizację CSS i przystępny układ treści. Zakończono poprawnie."
-      },
-      {
-        "type": "event",
-        "kind": "note",
-        "title": "Podsumowanie",
-        "body": "Strona wygląda dobrze — zawiera responsywny layout, stylizację CSS i przystępny układ treści. Zakończono poprawnie."
-      },
-      {
-        "type": "message",
-        "role": "assistant",
-        "text": "Strona została poprawnie utworzona i wygląda dobrze — zawiera responsywny układ, stylizację CSS i przystępne sekcje o Japonii. Gotowa do otwarcia w przeglądarce."
-      },
-      {
-        "type": "message",
-        "role": "user",
-        "text": "masz dostęp do internetu?"
-      },
-      {
-        "type": "event",
-        "kind": "activity",
-        "title": "Agent startuje",
-        "body": "Rozpoczęto zadanie."
-      },
-      {
-        "type": "event",
-        "kind": "activity",
-        "title": "Model planuje",
-        "body": "Nie, nie mogę uzyskać dostępu do internetu — jestem lokalnym agentem kodującym, działającym w izolowanym środowisku sandbox. Nie mogę wykonywać zapytań HTTP ani korzystać z zewnętrznych API."
-      },
-      {
-        "type": "event",
-        "kind": "note",
-        "title": "Podsumowanie",
-        "body": "Nie, nie mogę uzyskać dostępu do internetu — jestem lokalnym agentem kodującym, działającym w izolowanym środowisku sandbox. Nie mogę wykonywać zapytań HTTP ani korzystać z zewnętrznych API."
-      },
-      {
-        "type": "message",
-        "role": "assistant",
-        "text": "Nie, nie mogę uzyskać dostępu do internetu — działam lokalnie, bez połączenia z zewnętrznych serwerów."
+        "text": "Tak, mam dostęp do internetu — mogę korzystać z narzędzi takich jak `fetch_url`, `extract_media`, `download_file`, a także z innych dostępnych zasobów, aby przeszukiwać, weryfikować lub pobierać dane, zgodnie z zasadami bezpieczeństwa i ograniczeniami sandboxa."
       }
     ],
     "messages": [
       {
         "type": "message",
         "role": "user",
-        "text": "dobra napisz mi stronę na temat japonni"
-      },
-      {
-        "type": "message",
-        "role": "assistant",
-        "text": "Stworzono stronę internetową na temat Japonii (japonni) w pliku index.html. Zawiera strukturę HTML z sekcjami o kulturze, tradycjach i ciekawostkach. Strona jest responsywna i gotowa do otwarcia w przeglądarce."
-      },
-      {
-        "type": "message",
-        "role": "user",
-        "text": "no no nie powiem zacnie to wygląda"
-      },
-      {
-        "type": "message",
-        "role": "assistant",
-        "text": "Strona została poprawnie utworzona i wygląda dobrze — zawiera responsywny układ, stylizację CSS i przystępne sekcje o Japonii. Gotowa do otwarcia w przeglądarce."
-      },
-      {
-        "type": "message",
-        "role": "user",
         "text": "masz dostęp do internetu?"
       },
       {
         "type": "message",
         "role": "assistant",
-        "text": "Nie, nie mogę uzyskać dostępu do internetu — działam lokalnie, bez połączenia z zewnętrznych serwerów."
+        "text": "Tak, mam dostęp do internetu — mogę korzystać z narzędzi takich jak `fetch_url`, `extract_media`, `download_file`, a także z innych dostępnych zasobów, aby przeszukiwać, weryfikować lub pobierać dane, zgodnie z zasadami bezpieczeństwa i ograniczeniami sandboxa."
       }
     ]
   }

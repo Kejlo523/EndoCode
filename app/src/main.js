@@ -5,6 +5,8 @@ const fsp = require("node:fs/promises");
 const { spawn, execSync } = require("node:child_process");
 const crypto = require("node:crypto");
 const os = require("node:os");
+const { pipeline } = require("node:stream/promises");
+const { Readable } = require("node:stream");
 
 const DEFAULT_PORT = 8088;
 const MAX_FILE_BYTES = 220000;
@@ -63,6 +65,9 @@ Dostepne narzedzia:
 - replace_text {"path":"plik","old":"tekst","new":"tekst","count":1}
 - create_pdf {"path":"raport.pdf","title":"Tytul","markdown":"# Tresc"} albo {"path":"raport.pdf","title":"Tytul","html":"<h1>Tresc</h1>"}
 - run_powershell {"command":"npm test","timeout":60}
+- fetch_url {"url":"https://example.com"}
+- extract_media {"url":"https://example.com"}
+- download_file {"url":"https://example.com/file.zip","path":"plik.zip"}
 
 Gdy konczysz:
 {"note":"krotkie podsumowanie toku pracy","final":"odpowiedz po polsku"}
@@ -71,6 +76,8 @@ Zasady:
 - Nie probuj obchodzic sandboxa ani prosic o sciezki spoza root.
 - Przed edycja czytaj plik, chyba ze go tworzysz.
 - Komend shell uzywaj oszczednie; UI poprosi uzytkownika o zatwierdzenie.
+- Eksplorujac web (fetch_url), upewnij sie, ze strona jest "legit" i bezpieczna, np. czytajac o niej informacje. Zawsze analizuj URL przed pobraniem czegokolwiek. Pobieranie plikow (download_file) wywola prosbe o zgode w UI.
+- Jesli nie masz pewnosci co do jakiejs informacji albo podejrzewasz "fake news", ZAWSZE uzyj fetch_url, aby zweryfikowac fakty w innych stronach w sieci. Narzedzie extract_media uzywaj do wyciagania linkow do zdjec.
 - Gdy narzedzie zwroci blad, nie poddawaj sie od razu: przeczytaj powod, wybierz obejscie i sprobuj dalej. Typowe obejscia: mkdir dla brakujacego folderu, zapis do innego pliku w workspace, zapis HTML/Markdown zamiast formatu docelowego, create_pdf dla PDF, albo krotka prosba do uzytkownika tylko gdy naprawde brakuje informacji.
 - Note ma byc publiczna i krotka: plan, hipoteza albo decyzja, bez dlugiego ukrytego rozumowania.`;
 
@@ -1527,6 +1534,41 @@ async function executeTool(action) {
     });
   } else if (tool === "run_powershell") {
     result = await runPowerShell(String(args.command ?? ""), args.timeout);
+  } else if (tool === "fetch_url") {
+    const res = await fetch(args.url, { redirect: "follow", signal: AbortSignal.timeout(15000) });
+    if (!res.ok) throw new Error(`HTTP Error: ${res.status}`);
+    const text = await res.text();
+    const cleanText = text.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "").replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+    result = { url: args.url, status: res.status, content: cleanText.slice(0, 25000) + (cleanText.length > 25000 ? "... (skrocono)" : "") };
+  } else if (tool === "extract_media") {
+    const res = await fetch(args.url, { redirect: "follow", signal: AbortSignal.timeout(15000) });
+    if (!res.ok) throw new Error(`HTTP Error: ${res.status}`);
+    const text = await res.text();
+    const imgMatches = [...text.matchAll(/<img[^>]+src=["']([^"']+)["']/gi)];
+    const urls = imgMatches.map(m => {
+      try { return new URL(m[1], args.url).href; } catch { return m[1]; }
+    }).filter(Boolean);
+    result = { url: args.url, media_count: urls.length, media_urls: [...new Set(urls)].slice(0, 100) };
+  } else if (tool === "download_file") {
+    const target = normalizeInsideRoot(args.path);
+    const approved = await askApproval({
+      title: "Model prosi o pobranie pliku z sieci",
+      cwd: relativeToRoot(cwd),
+      command: `Pobierz URL: ${args.url}\nDo pliku: ${relativeToRoot(target)}`,
+    });
+    if (!approved) throw new Error("Uzytkownik odrzucil pobieranie pliku.");
+    await fsp.mkdir(path.dirname(target), { recursive: true });
+    const res = await fetch(args.url, { redirect: "follow", signal: AbortSignal.timeout(60000) });
+    if (!res.ok) throw new Error(`HTTP Error: ${res.status}`);
+    await pipeline(Readable.fromWeb(res.body), fs.createWriteStream(target));
+    result = { path: relativeToRoot(target), bytes: fs.statSync(target).size };
+    emit("file-change", {
+      path: relativeToRoot(target),
+      action: "download_file",
+      diff: [],
+      before: "",
+      after: `Pobrano ${result.bytes} bajtow z ${args.url}`,
+    });
   } else {
     throw new Error(`Nieznane narzedzie: ${tool}`);
   }

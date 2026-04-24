@@ -3,14 +3,14 @@
   "reasoningLevel": "max",
   "accessLevel": "sandbox",
   "customModelSettings": {
-    "temperature": 0.12,
-    "maxTokens": 2048,
-    "maxSteps": 48,
+    "temperature": 0.35,
+    "maxTokens": 8192,
+    "maxSteps": 0,
     "topP": 1,
     "topK": 0,
     "repeatPenalty": 1,
-    "contextTokens": null,
-    "gpuLayers": null
+    "contextTokens": 24576,
+    "gpuLayers": 24
   },
   "maxMessages": 100,
   "workspaceRoot": "C:\\Users\\Kejlo\\Desktop\\testy-ai"
