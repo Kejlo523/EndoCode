@@ -218,6 +218,13 @@ function addInlineEvent(kind, title, body = "", extraHtml = "") {
   return div;
 }
 
+function removeInlineEventByActivityId(activityId) {
+  const el = conversation.querySelector(`.inline-event[data-activity-id="${activityId}"]`);
+  if (el) el.remove();
+}
+
+const MODEL_WRITING_ACTIVITY_ID = "model-writing";
+
 function upsertInlineEvent(activityId, kind, title, body = "") {
   const safeBody = String(body ?? "").slice(0, 50000);
   let el = conversation.querySelector(`.inline-event[data-activity-id="${activityId}"]`);
@@ -264,6 +271,9 @@ function toolActionDetail(tool, args, note = "") {
 }
 
 function toolActionLabel(tool, args) {
+  if (tool == null) {
+    return "Blad: brak pola tool w odpowiedzi modelu";
+  }
   switch (tool) {
     case "read_file": return `Czyta: ${args?.path || ""}`;
     case "write_file": return `Zapisuje: ${args?.path || ""}`;
@@ -903,6 +913,7 @@ window.endocode.onEvent((event) => {
     return;
   }
   if (event.type === "run-start") {
+    removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
     addInlineEvent("activity", "Agent startuje", "Rozpoczęto zadanie.");
     showLive("Przygotowuje...");
     return;
@@ -914,6 +925,7 @@ window.endocode.onEvent((event) => {
     return;
   }
   if (event.type === "note") {
+    removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
     addInlineEvent("activity", "Model planuje", event.note);
     showLive("Notatka", event.note);
     return;
@@ -942,11 +954,12 @@ window.endocode.onEvent((event) => {
   }
   if (event.type === "content-delta") {
     const preview = (event.full || event.text || "").trim().slice(0, 50000);
-    if (preview) upsertInlineEvent("model-writing", "activity", "Model pisze", preview);
+    if (preview) upsertInlineEvent(MODEL_WRITING_ACTIVITY_ID, "activity", "Model pisze", preview);
     showLive("Model pisze...", preview.slice(-500));
     return;
   }
   if (event.type === "tool-start") {
+    removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
     const label = toolActionLabel(event.tool, event.args);
     addInlineEvent("tool", label, toolActionDetail(event.tool, event.args, event.note || ""));
     showLive(label);
@@ -974,6 +987,7 @@ window.endocode.onEvent((event) => {
     return;
   }
   if (event.type === "final") {
+    removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
     if (event.note) addInlineEvent("note", "Podsumowanie", event.note);
     addMessage("assistant", event.text);
     hideLive();

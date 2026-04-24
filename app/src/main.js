@@ -17,6 +17,27 @@ const MODEL_STREAM_IDLE_TIMEOUT_MS = 6 * 60 * 1000;
 const SERVER_SHUTDOWN_TIMEOUT_MS = 6000;
 let MAX_MESSAGES = 32;
 
+/** Zgodne z gałęziami w executeTool — nie zmieniaj nazw bez aktualizacji obu miejsc. */
+const ALLOWED_TOOLS = new Set([
+  "pwd",
+  "cd",
+  "ls",
+  "read_file",
+  "write_file",
+  "mkdir",
+  "replace_text",
+  "create_pdf",
+  "run_powershell",
+  "fetch_url",
+  "extract_media",
+  "download_file",
+  "analyze_image",
+]);
+
+function allowedToolNamesList() {
+  return [...ALLOWED_TOOLS].sort().join(", ");
+}
+
 const REASONING_LEVELS = {
   low: {
     label: "Szybko",
@@ -52,6 +73,8 @@ const BASE_SYSTEM_PROMPT = `Jestes lokalnym agentem kodujacym w stylu Codex.
 Masz sandbox plikowy i mozesz pracowac tylko przez jawne narzedzia. UI pokazuje uzytkownikowi kazdy krok.
 
 Odpowiadaj wylacznie pojedynczym JSON-em.
+
+Kazda odpowiedz MUSI zawierac albo pole "final" (niepusty string — koniec pracy) albo pole "tool" (dokladna nazwa z listy) z obiektem "args". Samo "note" bez "final" i bez "tool" jest niedozwolone. Klucz to zawsze "tool", nie "name", nie "function".
 
 Gdy chcesz wykonac akcje:
 {"note":"krotka jawna notatka co robisz i dlaczego","tool":"ls","args":{"path":".","maxEntries":100}}
@@ -1176,6 +1199,60 @@ Odrzucona odpowiedz:
 ${String(raw || "").slice(0, 1600)}`;
 }
 
+/**
+ * Po skladni JSON: kontrakt albo { final } albo { tool, args }.
+ * @returns {{ ok: true, action: object } | { ok: false, error: string }}
+ */
+function validateModelAction(parsed) {
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { ok: false, error: "Odpowiedz musi byc pojedynczym obiektem JSON (nie tablica)." };
+  }
+  const hasFinal = typeof parsed.final === "string" && parsed.final.trim() !== "";
+  const toolName = typeof parsed.tool === "string" ? parsed.tool.trim() : null;
+  if (hasFinal && toolName) {
+    return {
+      ok: false,
+      error: "Nie lacz 'final' z 'tool' w jednej odpowiedzi: albo konczysz (final), albo wywolujesz narzedzie (tool + args).",
+    };
+  }
+  if (hasFinal) {
+    return { ok: true, action: { ...parsed, final: parsed.final } };
+  }
+  if (!toolName) {
+    return {
+      ok: false,
+      error:
+        "Brak niepustego pola 'final' i brak pola 'tool' (albo pusty). Dodaj 'final' albo poprawne 'tool' z listy dozwolonych.",
+    };
+  }
+  if (!ALLOWED_TOOLS.has(toolName)) {
+    return { ok: false, error: `Niedozwolone lub nieistniejace narzedzie: ${toolName}. Uzyj jednej z nazw: ${allowedToolNamesList()}.` };
+  }
+  if (parsed.args !== undefined && (typeof parsed.args !== "object" || parsed.args === null || Array.isArray(parsed.args))) {
+    return { ok: false, error: "Pole 'args' musi byc obiektem JSON (albo pomin, wtedy traktujemy jako {}). " };
+  }
+  return { ok: true, action: { ...parsed, tool: toolName, args: parsed.args !== undefined ? parsed.args : {} } };
+}
+
+function makeActionSchemaRepairPrompt(schemaError, raw) {
+  return `Poprzednia odpowiedz miala poprawna skladnie JSON, ale narusza KONTRAKT akcji.
+Blad: ${String(schemaError).slice(0, 500)}
+
+Musisz zwrocic WYLACZNIE jeden obiekt JSON:
+- albo koniec pracy: {"note":"...","final":"odpowiedz po polsku"}
+- albo narzedzie: {"note":"...","tool":"NAZWA","args":{}}
+
+Dozwolone wartosci "tool" (dokladnie te stringi): ${allowedToolNamesList()}
+
+Nie uzywaj kluczy "name", "function" zamiast "tool". Nie zwracaj samego {"note":"..."} bez "final" ani bez "tool".
+
+Jesli nie wiesz co dalej:
+{"note":"odzysk","final":"Nie udalo sie zwrocic poprawnej akcji — sprobuj ponownie lub zmien zadanie."}
+
+Odrzucona odpowiedz (fragment):
+${String(raw || "").slice(0, 1600)}`;
+}
+
 async function getNextActionWithRepair(abortSignal, failedModelIds) {
   let lastError = null;
   while (true) {
@@ -1183,13 +1260,14 @@ async function getNextActionWithRepair(abortSignal, failedModelIds) {
       if (attempt > 0) {
         emit("status", {
           status: "model-json-retry",
-          detail: `Naprawiam odpowiedz JSON (${attempt}/${MODEL_JSON_RETRY_LIMIT}).`,
+          detail: `Naprawiam odpowiedz JSON / kontrakt (${attempt}/${MODEL_JSON_RETRY_LIMIT}).`,
         });
       }
       const raw = await callModelWithRecovery(messages, abortSignal, failedModelIds);
       emit("model-raw", { raw });
+      let parsed;
       try {
-        return parseJsonAction(raw);
+        parsed = parseJsonAction(raw);
       } catch (error) {
         lastError = error;
         emit("parse-error", {
@@ -1206,10 +1284,38 @@ async function getNextActionWithRepair(abortSignal, failedModelIds) {
           }),
         });
         messages.push({ role: "user", content: makeJsonRepairPrompt(error, raw) });
+        continue;
       }
+
+      const validated = validateModelAction(parsed);
+      if (!validated.ok) {
+        lastError = new Error(validated.error);
+        emit("parse-error", {
+          error: validated.error,
+          attempt: attempt + 1,
+          maxAttempts: MODEL_JSON_RETRY_LIMIT + 1,
+          kind: "action-schema",
+          raw: textPreview(raw, 1200),
+        });
+        emit("status", {
+          status: "action-schema-retry",
+          detail: `Kontrakt akcji: ${textPreview(validated.error, 120)}`,
+        });
+        if (attempt >= MODEL_JSON_RETRY_LIMIT) break;
+        messages.push({
+          role: "assistant",
+          content: JSON.stringify({
+            note: "Odpowiedz miala poprawny JSON, ale brakowalo 'final' albo dozwolonego 'tool' z prawidlowym 'args'.",
+          }),
+        });
+        messages.push({ role: "user", content: makeActionSchemaRepairPrompt(validated.error, raw) });
+        continue;
+      }
+
+      return validated.action;
     }
     const fallback = failedModelIds
-      ? await switchToFallbackModel(`niepoprawny JSON: ${lastError?.message || "blad parsera"}`, failedModelIds)
+      ? await switchToFallbackModel(`niepoprawny JSON lub kontrakt: ${lastError?.message || "blad"}`, failedModelIds)
       : null;
     if (!fallback) break;
     messages.push({
@@ -1217,7 +1323,7 @@ async function getNextActionWithRepair(abortSignal, failedModelIds) {
       content: `Aktualny model zostal przelaczony na ${fallback.displayName}. Kontynuuj od ostatniego bezpiecznego kroku i zwroc poprawny JSON.`,
     });
   }
-  throw new Error(`Model zwrocil niepoprawny JSON po kilku probach: ${lastError?.message || "nieznany blad"}`);
+  throw new Error(`Model zwrocil niepoprawny JSON lub kontrakt akcji po kilku probach: ${lastError?.message || "nieznany blad"}`);
 }
 
 function textPreview(value, limit = 26000) {
@@ -1468,6 +1574,13 @@ async function runPowerShell(command, timeoutSeconds) {
 
 async function executeTool(action) {
   const tool = action.tool;
+  if (typeof tool !== "string" || !tool.trim() || !ALLOWED_TOOLS.has(tool)) {
+    throw new Error(
+      typeof tool !== "string" || !String(tool).trim()
+        ? "Brak dozwolonego pola 'tool' w akcji (lub puste). Uzyj dokladnej nazwy narzedzia z listy w promptcie systemowym."
+        : `Nieznane narzedzie: ${tool}`,
+    );
+  }
   const args = action.args || {};
   emit("tool-start", { note: action.note || "", tool, args });
 
@@ -1619,7 +1732,7 @@ async function executeTool(action) {
     const description = await runVisionSupport(target, "Describe this image in detail.");
     result = { description, status: `Analiza obrazu zakończona pomyślnie. Tekstowy opis załączono w pole description.` };
   } else {
-    throw new Error(`Nieznane narzedzie: ${tool}`);
+    throw new Error(`Wewnetrzny blad: brak implementacji narzedzia ${tool}.`);
   }
 
   emit("tool-result", { tool, ok: true, result });
@@ -1817,6 +1930,7 @@ async function runAgent(userText) {
     const effectiveMaxSteps = customModelSettings.maxSteps === 0
       ? 999999
       : (customModelSettings.maxSteps ?? reasoning.maxSteps);
+    let consecutiveToolFailures = 0;
     for (let step = 1; step <= effectiveMaxSteps; step += 1) {
       if (signal.aborted) throw new Error("Przerwano przez uzytkownika.");
       compactMessages();
@@ -1844,10 +1958,23 @@ async function runAgent(userText) {
         emit("tool-result", { tool: action.tool, ok: false, error: error.message, recoveryHint });
       }
 
+      if (toolPayload.ok) {
+        consecutiveToolFailures = 0;
+      } else {
+        consecutiveToolFailures += 1;
+      }
+
       messages.push({
         role: "user",
         content: `Wynik narzedzia. Kontynuuj albo zakoncz finalem. Jesli ok=false, masz obowiazek sprobowac obejscia z recoveryHint przed finalem:\n${JSON.stringify(toolPayload, null, 2)}`,
       });
+
+      if (consecutiveToolFailures >= 3) {
+        const exitMsg = `Zatrzymano zadanie: narzedzie zwrocilo blad 3 razy z rzedu. Ostatni: ${toolPayload.error || "nieznany"}. Mozesz zmienic model, uproscic zadanie albo wykonac krok recznie w workspace.`;
+        emit("final", { text: exitMsg });
+        messages.push({ role: "assistant", content: JSON.stringify({ note: "Zbyt wiele kolejnych bledow narzedzia (circuit break).", final: exitMsg }) });
+        return { ok: true, final: exitMsg };
+      }
     }
     const msg = "Osiagnieto limit krokow. Napisz, zeby kontynuowac.";
     emit("final", { text: msg });
