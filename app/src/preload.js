@@ -8,6 +8,7 @@ contextBridge.exposeInMainWorld("endocode", {
   setModel: (modelId) => ipcRenderer.invoke("app:set-model", modelId),
   setReasoning: (level) => ipcRenderer.invoke("app:set-reasoning", level),
   send: (text) => ipcRenderer.invoke("agent:send", text),
+  sendChat: (text) => ipcRenderer.invoke("agent:chat", text),
   abort: () => ipcRenderer.invoke("agent:abort"),
   killServer: () => ipcRenderer.invoke("agent:kill-server"),
   approve: (approvalId, approved) => ipcRenderer.invoke("approval:reply", approvalId, approved),

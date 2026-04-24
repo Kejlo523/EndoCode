@@ -2,15 +2,18 @@ const { app, BrowserWindow, dialog, ipcMain } = require("electron");
 const path = require("node:path");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
-const { spawn, execSync } = require("node:child_process");
+const { spawn, execSync, spawnSync } = require("node:child_process");
 const crypto = require("node:crypto");
 const os = require("node:os");
 const { pipeline } = require("node:stream/promises");
 const { Readable } = require("node:stream");
 const https = require("node:https");
+const { jsonrepair } = require("jsonrepair");
 
 const DEFAULT_PORT = 8088;
 const MAX_FILE_BYTES = 220000;
+/** Modele czasem generuja absurdalnie dlugie "url" (padding zer) — odcinamy przed fetch. */
+const MAX_TOOL_URL_LENGTH = 2048;
 const MODEL_JSON_RETRY_LIMIT = 2;
 const MODEL_CALL_RETRY_LIMIT = 1;
 const MODEL_STREAM_IDLE_TIMEOUT_MS = 6 * 60 * 1000;
@@ -27,6 +30,8 @@ const ALLOWED_TOOLS = new Set([
   "mkdir",
   "replace_text",
   "create_pdf",
+  "create_pptx",
+  "create_docx",
   "run_powershell",
   "fetch_url",
   "extract_media",
@@ -42,28 +47,28 @@ const REASONING_LEVELS = {
   low: {
     label: "Szybko",
     maxSteps: 8,
-    maxTokens: 900,
+    maxTokens: 1400,
     temperature: 0.1,
     instruction: "Dzialaj szybko. Rob minimalny plan i wykonuj najprostszy bezpieczny krok.",
   },
   medium: {
     label: "Normalnie",
     maxSteps: 14,
-    maxTokens: 1300,
+    maxTokens: 1900,
     temperature: 0.2,
     instruction: "Zrob krotki plan, sprawdz istotne pliki i pracuj krok po kroku.",
   },
   high: {
     label: "Dokladnie",
     maxSteps: 24,
-    maxTokens: 1900,
+    maxTokens: 2800,
     temperature: 0.2,
     instruction: "Poswiec wiecej krokow na rozpoznanie, weryfikacje i testy. Note ma streszczac decyzje, nie ukryty tok myslenia.",
   },
   max: {
     label: "Maksymalnie",
     maxSteps: 36,
-    maxTokens: 2600,
+    maxTokens: 3800,
     temperature: 0.25,
     instruction: "Pracuj bardzo dokladnie: plan, eksploracja, male edycje, testy i korekty. Note ma byc jawna i zwiezla.",
   },
@@ -72,7 +77,7 @@ const REASONING_LEVELS = {
 const BASE_SYSTEM_PROMPT = `Jestes lokalnym agentem kodujacym w stylu Codex.
 Masz sandbox plikowy i mozesz pracowac tylko przez jawne narzedzia. UI pokazuje uzytkownikowi kazdy krok.
 
-Odpowiadaj wylacznie pojedynczym JSON-em.
+Odpowiadaj wylacznie pojedynczym JSON-em: jeden obiekt {...}. NIGDY tablicy [...] ani wielu akcji w jednej wiadomosci (jak Cursor/Codex: jedno "tool" albo "final" na odpowiedz).
 
 Kazda odpowiedz MUSI zawierac albo pole "final" (niepusty string — koniec pracy) albo pole "tool" (dokladna nazwa z listy) z obiektem "args". Samo "note" bez "final" i bez "tool" jest niedozwolone. Klucz to zawsze "tool", nie "name", nie "function".
 
@@ -88,14 +93,21 @@ Dostepne narzedzia:
 - write_file {"path":"plik","content":"...","mode":"overwrite albo append"}
 - mkdir {"path":"folder"}
 - replace_text {"path":"plik","old":"tekst","new":"tekst","count":1}
-- create_pdf {"path":"raport.pdf","title":"Tytul","markdown":"# Tresc"} albo {"path":"raport.pdf","title":"Tytul","html":"<h1>Tresc</h1>"}
+- create_pdf {"path":"raport.pdf","title":"Tytul","markdown":"# Tresc"} albo {"path":"raport.pdf","title":"Tytul","html":"<h1>Tresc</h1>"} — PDF przez silnik przegladarki (bez Pythona)
+- create_pptx {"path":"prez.pptx","title":"Tytul","markdown":"## Slajd 1\\n- punkt\\n## Slajd 2"} — PowerPoint przez Python (pip install python-pptx); slajdy z naglowkow ## i punktorow -
+- create_docx {"path":"dok.docx","title":"Tytul","markdown":"# Naglowek\\nAkapit"} — Word przez Python (pip install python-docx)
 - run_powershell {"command":"npm test","timeout":60}
-- fetch_url {"url":"https://example.com"}
-- extract_media {"url":"https://example.com"}
+- fetch_url {"url":"https://example.com","timeout":15,"raw":false} — timeout w sekundach (5-60, domyslnie 15). Dla JSON/CSV/XML (naglowek Content-Type albo rozszerzenie .json/.csv/.xml w URL) zwracana jest surowa tresc (bez usuwania znacznikow jak przy HTML); raw:true wymusza surowy tekst nawet przy text/html. Odpowiedzi dluzsze niz ~25k znakow sa obcinane — wtedy uzyj download_file.
+- extract_media {"url":"https://example.com","timeout":15}
 - download_file {"url":"https://example.com/file.zip","path":"plik.zip"}
+- Dane z sieci (arkusze, kursy, statystyki): preferuj udokumentowane API HTTPS (JSON/CSV/XML) zamiast statycznych stron HTML, ktore laduja dane w JS. W dokumentacji szukaj stabilnych endpointow (/last/, /latest/, archiwum po dacie) — sciezki typu /today/ lub „aktualny dzien” bywaja 404 do czasu publikacji. Wiele serwisow obsluguje ?format=json / ?format=csv lub naglowek Accept. Calych duzych odpowiedzi nie wklejaj do write_file ani do JSON narzedzia: download_file do workspace, potem read_file (fragment) albo krotka strona HTML z probka wierszy w <pre>.
 
-Gdy konczysz:
+W fetch_url, extract_media i download_file pole "url" musi byc krotkim prawdziwym adresem (max ok. 2048 znakow). Nie wymyslaj URL ani nie dopisuj powtorzen/zer — jesli nie znasz sciezki, fetch_url na strone glowna domeny, potem extract_media aby wyciagnac prawdziwe linki z HTML.
+
+Gdy konczysz (odpowiedz tekstowa dla uzytkownika — cala tresc w polu "final", nie w samym "note"):
 {"note":"krotkie podsumowanie toku pracy","final":"odpowiedz po polsku"}
+
+Pytania informacyjne bez uzycia narzedzi (np. „co potrafisz”, „jakie masz narzedzia”, „kim jestes”): od razu jeden JSON z NIEPUSTYM polem "final" — w "final" wypisz po polsku liste mozliwosci (narzedzia z listy: pliki, PDF/PPTX/DOCX, shell, web, itd.). Nie zwracaj samego "note" bez "final". Nie twierdz w "note" ze JSON jest poprawny — uzytkownik widzi tylko sensowna tresc z "final".
 
 Zasady:
 - Nie probuj obchodzic sandboxa ani prosic o sciezki spoza root.
@@ -109,7 +121,13 @@ Zasady:
 - ZAWSZE generuj i zapisuj pliki pojedynczo. Jeśli masz 5 plików do utworzenia, użyj narzędzia 'write_file' 5 razy w osobnych krokach. NIGDY nie wyrzucaj zawartości wielu plików naraz w czacie jako gigantyczny tekst – to bez sensu i zapycha czat. Każdy plik to oddzielne zadanie i oddzielne wywołanie 'write_file'.
 - Gdy narzedzie zwroci blad (np. brak narzedzia/undefined), wybierz inne z listy. Jesli write_file zwroci blad np. za dlugiego ciagu, zapisz plik od nowa partiami w trybie 'append'. Po zapisie kodu/skryptu zrob check (np. run_powershell), zeby zweryfikowac poprawnosc i dzialanie pliku.
 - Gdy narzedzie zwroci inny blad, nie poddawaj sie od razu: przeczytaj powod, wybierz obejscie i sprobuj dalej. Typowe obejscia: mkdir dla brakujacego folderu, podzial na czesci (append), zapis do innego pliku w workspace.
-- Note ma byc publiczna i krotka: plan, hipoteza albo decyzja, bez dlugiego ukrytego rozumowania.`;
+- Note ma byc publiczna i krotka: plan, hipoteza albo decyzja, bez dlugiego ukrytego rozumowania.
+- JSON technicznie: w polach "path" i "args" uzywaj sciezek z forward slash (np. exports/plik.html), nigdy surowego backslasha Windows w stringu JSON. W "note" jedna linia tekstu albo jawne sekwencje \\n — bez surowych znakow nowej linii wewnatrz stringa JSON.
+- Jesli zapisujesz dlugi HTML/Markdown kod lub duzy "content", jedna odpowiedz moze zostac obcieta przez limit tokenow i JSON stanie sie nieparsowalny. Zapisuj partiami: write_file overwrite z krotkim poczatkiem, potem write_file append z kolejnymi fragmentami.
+- Python / pip na Windows: NIE szukaj interpretera przez ls — ls pokazuje tylko pliki w workspace, nie PATH systemowy. Zanim uruchomisz python -c "...": jednym run_powershell zbadaj co jest w PATH, np. Get-Command python,py,python3 -ErrorAction SilentlyContinue | Format-Table Name,Source -AutoSize albo where.exe python py python3. Z stdout wybierz dzialajaca nazwe (czesto py -3 albo python3 zamiast python) i dopiero wtedy test importu (np. py -3 -c "import pptx"). Brak pip przy dzialajacym py: py -3 -m pip --version albo py -3 -m pip install .... Jesli zaden interpreter nie istnieje — final z instalacja (np. winget install Python.Python.3.12) i prosba o "kontynuuj".
+- Inne CLI (pandoc itd.): sprawdz przez run_powershell (Get-Command ...) — UI poprosi o zatwierdzenie. Jesli brakuje pakietu, zwroc "final" z instalacja i prosba o "kontynuuj".
+- Gdy konczysz prace ("final"), WYPISZ w tekscie final wszystkie utworzone lub zmienione pliki jako sciezki wzgledem workspace (np. output/japan.html), zeby uzytkownik wiedzial co otworzyc.
+- Prezentacje Word/PowerPoint: preferuj create_docx / create_pptx (wymagaja Pythona z python-docx / python-pptx w PATH). Alternatywa bez Office: create_pdf lub HTML w workspace.`;
 
 const SKILL_CATALOG = [
   {
@@ -124,7 +142,7 @@ const SKILL_CATALOG = [
     name: "DOCX",
     category: "Dokumenty",
     summary: "Tworzenie, edycja i ekstrakcja tresci z plikow Word.",
-    instructions: "Dla DOCX tworz lub modyfikuj pliki lokalnie. Jesli potrzebne biblioteki sa dostepne, uzyj lokalnego skryptu przez run_powershell po zgodzie; w przeciwnym razie przygotuj zrodlo HTML/Markdown i jasne kroki eksportu.",
+    instructions: "Dla DOCX preferuj narzedzie create_docx (markdown) po pip install python-docx; alternatywnie skrypt przez run_powershell lub zrodlo HTML/Markdown.",
   },
   {
     id: "pdf",
@@ -138,7 +156,7 @@ const SKILL_CATALOG = [
     name: "Slides",
     category: "Prezentacje",
     summary: "Konspekty, slajdy, speaker notes i eksport deckow.",
-    instructions: "Dla prezentacji buduj strukture slajdow, notatki prelegenta i lokalne zrodla HTML/Markdown/PPTX. Preferuj pliki edytowalne i zachowuj zasoby obok decka.",
+    instructions: "Dla prezentacji PPTX uzyj narzedzia create_pptx (markdown z ## na slajd) po pip install python-pptx; alternatywnie HTML lub create_pdf. Zachowaj zasoby obok decka.",
   },
   {
     id: "sheets",
@@ -1014,7 +1032,8 @@ async function killModelServerResources() {
   return { aborted: hadRun, ownedPid, killedPids, port: DEFAULT_PORT, alive };
 }
 
-async function callModel(messages, abortSignal) {
+async function callModel(messages, abortSignal, streamOptions = {}) {
+  const plainChat = Boolean(streamOptions.plainChat);
   if (abortSignal?.aborted) throw new Error("Przerwano przez uzytkownika.");
   const abortGuard = createModelAbortGuard(abortSignal);
   const reasoning = getReasoningProfile();
@@ -1088,7 +1107,7 @@ async function callModel(messages, abortSignal) {
               emit("thinking-end", { full: thinkingContent });
             }
             fullContent += delta.content;
-            emit("content-delta", { text: delta.content, full: fullContent });
+            emit("content-delta", { text: delta.content, full: fullContent, plainChat });
           }
         } catch {
           // malformed SSE chunk, skip
@@ -1118,11 +1137,11 @@ function isTransientModelError(error) {
   return /fetch failed|ECONNREFUSED|ECONNRESET|socket|terminated|timeout|nie wyslal danych|Model API 5\d\d/i.test(message);
 }
 
-async function callModelWithRecovery(messages, abortSignal, failedModelIds) {
+async function callModelWithRecovery(messages, abortSignal, failedModelIds, streamOptions = {}) {
   let lastError = null;
   for (let attempt = 0; attempt <= MODEL_CALL_RETRY_LIMIT; attempt += 1) {
     try {
-      return await callModel(messages, abortSignal);
+      return await callModel(messages, abortSignal, streamOptions);
     } catch (error) {
       if (abortSignal?.aborted) throw error;
       lastError = error;
@@ -1137,9 +1156,22 @@ async function callModelWithRecovery(messages, abortSignal, failedModelIds) {
   }
   if (lastError && isTransientModelError(lastError) && failedModelIds) {
     const fallback = await switchToFallbackModel(lastError.message || String(lastError), failedModelIds);
-    if (fallback) return callModelWithRecovery(messages, abortSignal, failedModelIds);
+    if (fallback) return callModelWithRecovery(messages, abortSignal, failedModelIds, streamOptions);
   }
   throw lastError;
+}
+
+function parseJsonCandidate(candidate) {
+  try {
+    return JSON.parse(candidate);
+  } catch (e1) {
+    try {
+      return JSON.parse(jsonrepair(candidate));
+    } catch {
+      const msg = String(e1?.message || e1);
+      throw new Error(`Model nie zwrocil JSON: ${msg.slice(0, 400)}`);
+    }
+  }
 }
 
 function parseJsonAction(raw) {
@@ -1147,13 +1179,21 @@ function parseJsonAction(raw) {
   if (text.startsWith("```")) {
     text = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
   }
+  let lastError = null;
   try {
-    return JSON.parse(text);
-  } catch {
-    const firstObject = extractFirstJsonObject(text);
-    if (firstObject) return JSON.parse(firstObject);
-    throw new Error(`Model nie zwrocil JSON: ${text.slice(0, 300)}`);
+    return parseJsonCandidate(text);
+  } catch (e) {
+    lastError = e;
   }
+  const firstObject = extractFirstJsonObject(text);
+  if (firstObject) {
+    try {
+      return parseJsonCandidate(firstObject);
+    } catch (e) {
+      lastError = e;
+    }
+  }
+  throw lastError || new Error(`Model nie zwrocil JSON: ${text.slice(0, 300)}`);
 }
 
 function extractFirstJsonObject(text) {
@@ -1186,17 +1226,71 @@ function extractFirstJsonObject(text) {
   return null;
 }
 
-function makeJsonRepairPrompt(error, raw) {
-  return `Poprzednia odpowiedz nie byla poprawnym pojedynczym JSON-em i zostala odrzucona.
-Blad parsera: ${String(error?.message || error).slice(0, 500)}
+function jsonRepairHintFromError(message) {
+  const m = String(message || "").toLowerCase();
+  if (/nie tablica|jako tablica|json.*array|^\s*\[/i.test(m) || /^\s*\[/.test(String(message || "").trim())) {
+    return "Zwroc jeden obiekt {...}, nie tablice [...]. Jedna odpowiedz = jedno narzedzie lub final.";
+  }
+  if (/bad escaped|escape|invalid.*escape/i.test(message)) {
+    return "Prawdopodobnie niepoprawne sekwencje \\ w stringu (np. Windows path, HTML). Uzyj / w sciezkach; w tresci zamien problematyczne znaki na \\n lub skroc pole content i kontynuuj write_file w trybie append w nastepnym kroku.";
+  }
+  if (/unexpected end|unterminated|end of json/i.test(message)) {
+    return "Prawdopodobnie obciety JSON (limit tokenow). Zwroc TEN SAM krok z krotszymi polami: krotszy URL, albo krotszy fragment write_file + nastepny krok append.";
+  }
+  return "Sprawdz czy masz jeden obiekt JSON, zamkniete cudzyslowy i nawiasy, poprawne przecinki.";
+}
 
-Odpowiedz teraz wylacznie jednym poprawnym JSON-em zgodnym z kontraktem systemowym.
-Nie uzywaj Markdown, komentarzy ani tekstu przed/po JSON.
-Jesli nie wiesz co zrobic dalej, zwroc final:
+function makeJsonRepairPrompt(error, raw) {
+  const errMsg = String(error?.message || error).slice(0, 500);
+  return `Poprzednia odpowiedz nie byla poprawnym pojedynczym JSON-em (parser ja odrzucil).
+Blad parsera: ${errMsg}
+Wskazowka: ${jsonRepairHintFromError(errMsg)}
+
+Twoje zadanie: NAPRAW MINIMALNIE skladnie — zachow ten sam "tool" i intencje "args" co w szkicu, jesli to mozliwe. Nie zmieniaj planu na inne narzedzie, chyba ze naprawa jest niemozliwa.
+Jesli naprawa wymaga skrocenia: zwroc poprawny JSON z krotszym args (np. krotszy url albo mniejszy fragment content + dalsza praca w kolejnym kroku przez append).
+
+Odpowiedz WYLACZNIE jednym poprawnym JSON-em zgodnym z kontraktem systemowym — bez Markdown, bez tekstu przed/po, bez tablicy [...] (tylko obiekt {...}).
+Jesli odzysk jest niemozliwy:
 {"note":"odzysk po bledzie JSON","final":"Nie udalo sie bezpiecznie kontynuowac."}
 
-Odrzucona odpowiedz:
+Odrzucona odpowiedz (fragment):
 ${String(raw || "").slice(0, 1600)}`;
+}
+
+function isPlainAgentJsonObject(x) {
+  return x !== null && typeof x === "object" && !Array.isArray(x);
+}
+
+/** Modele czesto zwracaja [{...}] zamiast {...} — normalizujemy do jednej akcji na krok. */
+function normalizeRootJsonToActionObject(parsed) {
+  if (!Array.isArray(parsed)) return parsed;
+  if (parsed.length === 1 && isPlainAgentJsonObject(parsed[0])) return parsed[0];
+  const first = parsed.find(
+    (x) =>
+      isPlainAgentJsonObject(x) &&
+      ((typeof x.tool === "string" && x.tool.trim() !== "") || (typeof x.final === "string" && x.final.trim() !== "")),
+  );
+  return first ?? null;
+}
+
+function assertReasonableToolUrl(url) {
+  const s = String(url ?? "").trim();
+  if (!s) throw new Error("URL jest pusty.");
+  if (s.length > MAX_TOOL_URL_LENGTH) {
+    throw new Error(
+      `URL za dlugi (${s.length} znakow, limit ${MAX_TOOL_URL_LENGTH}). Uzyj krotkiego adresu z paska przegladarki; nie generuj paddingu ani powtorzen w URL.`,
+    );
+  }
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(s);
+  } catch {
+    throw new Error("Nieprawidlowy format URL — podaj pelny adres zaczynajacy sie od http:// lub https://.");
+  }
+  if (!/^https?:$/i.test(parsedUrl.protocol)) {
+    throw new Error("Dozwolone sa tylko URL http lub https.");
+  }
+  return s;
 }
 
 /**
@@ -1204,8 +1298,27 @@ ${String(raw || "").slice(0, 1600)}`;
  * @returns {{ ok: true, action: object } | { ok: false, error: string }}
  */
 function validateModelAction(parsed) {
+  const normalized = normalizeRootJsonToActionObject(parsed);
+  if (normalized === null) {
+    if (Array.isArray(parsed)) {
+      return {
+        ok: false,
+        error:
+          "Odpowiedz musi byc jednym obiektem JSON {...}, a nie tablica [...]. Jedna wiadomosc = jedna akcja (albo final, albo tool+args).",
+      };
+    }
+  } else {
+    parsed = normalized;
+  }
+
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
     return { ok: false, error: "Odpowiedz musi byc pojedynczym obiektem JSON (nie tablica)." };
+  }
+  if ("final" in parsed && parsed.final != null && typeof parsed.final !== "string") {
+    parsed = {
+      ...parsed,
+      final: typeof parsed.final === "object" ? JSON.stringify(parsed.final) : String(parsed.final),
+    };
   }
   const hasFinal = typeof parsed.final === "string" && parsed.final.trim() !== "";
   const toolName = typeof parsed.tool === "string" ? parsed.tool.trim() : null;
@@ -1238,6 +1351,8 @@ function makeActionSchemaRepairPrompt(schemaError, raw) {
   return `Poprzednia odpowiedz miala poprawna skladnie JSON, ale narusza KONTRAKT akcji.
 Blad: ${String(schemaError).slice(0, 500)}
 
+Napraw KONTRAKT przy zachowaniu intencji: ten sam "tool" (jesli byl blisko poprawny) albo popraw nazwe na jedna z listy; uzupelnij "final" albo "tool"+"args".
+
 Musisz zwrocic WYLACZNIE jeden obiekt JSON:
 - albo koniec pracy: {"note":"...","final":"odpowiedz po polsku"}
 - albo narzedzie: {"note":"...","tool":"NAZWA","args":{}}
@@ -1245,6 +1360,11 @@ Musisz zwrocic WYLACZNIE jeden obiekt JSON:
 Dozwolone wartosci "tool" (dokladnie te stringi): ${allowedToolNamesList()}
 
 Nie uzywaj kluczy "name", "function" zamiast "tool". Nie zwracaj samego {"note":"..."} bez "final" ani bez "tool".
+Nigdy nie zwracaj JSON jako tablicy [...] — tylko jeden obiekt {...}.
+Jesli blad dotyczy zbyt dlugiego write_file w jednym kroku: zwroc krotszy poprawny write_file (overwrite lub append), reszte w nastepnych krokach.
+
+Jesli blad mowi o braku "final" / pustym "final", a uzytkownik pytal o mozliwosci („co potrafisz” itd.): zwroc np.
+{"note":"Mozliwosci agenta","final":"Pracuje w sandboxie plikow. Narzedzia: pwd, cd, ls, read_file, write_file, mkdir, replace_text, create_pdf, create_pptx, create_docx, run_powershell, fetch_url, extract_media, download_file, analyze_image. Odpowiadam po polsku; do PPTX/DOCX potrzebny Python z python-pptx / python-docx."}
 
 Jesli nie wiesz co dalej:
 {"note":"odzysk","final":"Nie udalo sie zwrocic poprawnej akcji — sprobuj ponownie lub zmien zadanie."}
@@ -1447,6 +1567,103 @@ async function createPdfFile(args) {
   return { path: relativeToRoot(pdfPath), bytes: fs.statSync(pdfPath).size, title };
 }
 
+const OFFICE_MARKDOWN_MAX = 500000;
+
+function getPythonLauncherCandidates() {
+  if (process.platform === "win32") {
+    return [
+      { cmd: "py", pre: ["-3"] },
+      { cmd: "py", pre: [] },
+      { cmd: "python", pre: [] },
+      { cmd: "python3", pre: [] },
+    ];
+  }
+  return [
+    { cmd: "python3", pre: [] },
+    { cmd: "python", pre: [] },
+    { cmd: "py", pre: ["-3"] },
+  ];
+}
+
+function resolvePythonLauncher() {
+  for (const { cmd, pre } of getPythonLauncherCandidates()) {
+    const r = spawnSync(cmd, [...pre, "-c", "import sys; sys.exit(0)"], {
+      encoding: "utf8",
+      timeout: 15000,
+      windowsHide: true,
+      env: process.env,
+    });
+    if (r.status === 0 && !r.error) return { cmd, pre };
+  }
+  return null;
+}
+
+async function runPythonOfficeHelper(scriptName, payload) {
+  const launcher = resolvePythonLauncher();
+  if (!launcher) {
+    throw new Error(
+      "Nie znaleziono Pythona w PATH (probowano py -3, py, python, python3). Zainstaluj Python lub uzyj run_powershell z diagnostyka PATH.",
+    );
+  }
+  const scriptPath = path.join(__dirname, "office", scriptName);
+  if (!fs.existsSync(scriptPath)) {
+    throw new Error(`Brak skryptu pomocniczego EndoCode: ${scriptName}`);
+  }
+  await fsp.mkdir(path.join(workspaceRoot, ".tmp"), { recursive: true });
+  const jsonPath = path.join(workspaceRoot, ".tmp", `office-${crypto.randomUUID()}.json`);
+  await fsp.writeFile(jsonPath, JSON.stringify(payload), "utf8");
+  const args = [...launcher.pre, scriptPath, jsonPath];
+  const r = spawnSync(launcher.cmd, args, {
+    encoding: "utf8",
+    timeout: 120000,
+    windowsHide: true,
+    env: { ...process.env, PYTHONUTF8: "1" },
+    cwd: workspaceRoot,
+    maxBuffer: 20 * 1024 * 1024,
+  });
+  try {
+    await fsp.rm(jsonPath, { force: true });
+  } catch {
+    /* ignore */
+  }
+  if (r.error) throw r.error;
+  const errBlob = `${r.stderr || ""}\n${r.stdout || ""}`;
+  if (r.status === 2 && /pip install python-(pptx|docx)|Brak biblioteki/i.test(errBlob)) {
+    throw new Error(errBlob.trim().slice(0, 2000));
+  }
+  if (r.status !== 0) {
+    throw new Error(textPreview(errBlob.trim(), 2000));
+  }
+}
+
+async function createPptxFile(args) {
+  const target = normalizeInsideRoot(args.path || "slides.pptx");
+  const outPath = target.toLowerCase().endsWith(".pptx") ? target : `${target}.pptx`;
+  await fsp.mkdir(path.dirname(outPath), { recursive: true });
+  const title = String(args.title || path.basename(outPath, ".pptx"));
+  const markdown = String(args.markdown ?? args.content ?? "");
+  if (!markdown.trim()) throw new Error("create_pptx wymaga niepustego pola markdown (lub content).");
+  if (markdown.length > OFFICE_MARKDOWN_MAX) {
+    throw new Error(`Markdown za dlugi (max ${OFFICE_MARKDOWN_MAX} znakow). Zapisz tresc przez write_file i skroc.`);
+  }
+  await runPythonOfficeHelper("gen_pptx.py", { out: outPath, title, markdown });
+  return { path: relativeToRoot(outPath), bytes: fs.statSync(outPath).size, title };
+}
+
+async function createDocxFile(args) {
+  const target = normalizeInsideRoot(args.path || "document.docx");
+  const outPath = target.toLowerCase().endsWith(".docx") ? target : `${target}.docx`;
+  await fsp.mkdir(path.dirname(outPath), { recursive: true });
+  const title = String(args.title || path.basename(outPath, ".docx"));
+  const markdown = String(args.markdown ?? args.content ?? "");
+  if (!markdown.trim()) throw new Error("create_docx wymaga niepustego pola markdown (lub content).");
+  if (markdown.length > OFFICE_MARKDOWN_MAX) {
+    throw new Error(`Markdown za dlugi (max ${OFFICE_MARKDOWN_MAX} znakow). Zapisz tresc przez write_file i skroc.`);
+  }
+  await runPythonOfficeHelper("gen_docx.py", { out: outPath, title, markdown });
+  return { path: relativeToRoot(outPath), bytes: fs.statSync(outPath).size, title };
+}
+
 async function readTextIfExists(file) {
   try {
     const stat = await fsp.stat(file);
@@ -1493,6 +1710,15 @@ function getToolRecoveryHint(error, action) {
   if (/does not support vision|image_url|multimodal/i.test(message)) {
     return "Model nie obsługuje analizy obrazów (brak modułu Vision). Przerwij próbę analyze_image i w 'final' przeproś użytkownika, informując, że Twój obecny model nie ma zdolności widzenia.";
   }
+  if (/URL za dlugi|Nieprawidlowy format URL|Dozwolone sa tylko URL http/i.test(message)) {
+    return "Skroc URL do prawdziwego linku (max ok. 2048 znakow). Wejdz na strone glowna domeny przez fetch_url, potem extract_media aby wyciagnac konkretne href z HTML — nie wklejaj sztucznego dlugiego ciagu.";
+  }
+  if (tool === "fetch_url" && /HTTP Error: 404/.test(message)) {
+    return "404: sprawdz dokumentacje uslugi — czesto sa trwalsze sciezki (/last/, /latest/, zasoby archiwalne po dacie) zamiast /today/ lub wygaslych linkow. Wiele API: ?format=json, ?format=csv albo naglowek Accept. Duza odpowiedz: download_file, nie calosc w write_file/JSON.";
+  }
+  if (tool === "fetch_url" && /timeout|TimeoutError|AbortError|aborted|signal has been aborted|This operation was aborted/i.test(message)) {
+    return "Pobranie przekroczylo czas lub zostalo przerwane. W fetch_url/extract_media ustaw timeout (sekundy, 5-60) albo sprawdz URL i polaczenie.";
+  }
   if (/(403|404)/.test(message) && (tool === "fetch_url" || tool === "download_file")) {
     return "Błąd 404/403. Przestań zgadywać linki URL w ciemno! Wróć na stronę domową lub artykuł i użyj narzędzia extract_media lub fetch_url, aby odczytać PRAWDZIWE adresy z kodu HTML.";
   }
@@ -1505,8 +1731,37 @@ function getToolRecoveryHint(error, action) {
   if (tool === "create_pdf") {
     return "Jesli PDF nie powstal, zapisz zrodlo HTML/Markdown w workspace i sprobuj ponownie create_pdf z prostszym HTML.";
   }
+  if (tool === "create_pptx" || tool === "create_docx") {
+    if (/pip install python-pptx|pip install python-docx|Brak biblioteki|No module named|ModuleNotFoundError/i.test(message)) {
+      const pkg = tool === "create_pptx" ? "python-pptx" : "python-docx";
+      return `Brak biblioteki Python. Uruchom (po znalezieniu interpretera): py -3 -m pip install ${pkg} albo python -m pip install ${pkg}. Potem ponow ${tool}.`;
+    }
+    if (/Nie znaleziono Pythona|Brak skryptu pomocniczego/i.test(message)) {
+      return "Najpierw run_powershell: Get-Command python,py,python3 lub where.exe — wybierz dzialajacy interpreter. Zainstaluj Python w PATH, potem pip install.";
+    }
+  }
+  if (tool === "run_powershell") {
+    if (/ModuleNotFoundError|No module named|ImportError|DLL load failed/i.test(message)) {
+      return "Brak modulu Python lub DLL. Najpierw upewnij sie ktory interpreter dziala (Get-Command python,py,python3). Instalacja: czesto py -3 -m pip install NAZWA albo python -m pip install NAZWA. W 'final' podaj dokladna komende i pros o 'kontynuuj' po instalacji.";
+    }
+    if (
+      /is not recognized as an internal or external command|CommandNotFoundException|nie jest rozpoznawany|nie rozpoznano|The term .* is not recognized/i.test(message) &&
+      /\bpython\b|\bpy\b|\bpip\b|\bpython3\b/i.test(message)
+    ) {
+      return "NIE uzywaj ls workspace — to nie skanuje PATH. Nastepny krok: run_powershell z diagnostyka: Get-Command python,py,python3 -ErrorAction SilentlyContinue | Format-Table Name,Source -AutoSize LUB where.exe python py python3. Potem powtorz polecenie ta nazwa co w stdout (czesto py -3 -c \"import ...\"). Dopiero gdy diagnostyka pokaze brak interpretera — final z instalacja (np. winget install Python.Python.3.12) i prosba o kontynuuj.";
+    }
+    if (/is not recognized as an internal or external command|CommandNotFoundException|nie jest rozpoznawany|nie rozpoznano|The term .* is not recognized/i.test(message)) {
+      return "Brak programu w PATH (np. pandoc). W 'final' opisz instalacje (winget/choco) i pros o 'kontynuuj'; nie powtarzaj tej samej komendy w kolko.";
+    }
+    if (/pip.*not found|No pip|Python was not found|Could not find platform/i.test(message)) {
+      return "Python lub pip niedostepny. Jesli dziala launcher: py -3 -m pip --version; instalacja modulu: py -3 -m pip install NAZWA. W 'final' opisz instalacje Pythona w PATH i pros o 'kontynuuj'; tymczasem mozesz przygotowac zrodla w workspace.";
+    }
+  }
   if (/zablokowane|odrzucil|blocked/i.test(message)) {
     return "Komenda lub akcja zostala zablokowana. Uzyj bezpieczniejszego lokalnego narzedzia, plikow w workspace albo popros o zgode tylko na minimalna potrzebna komende.";
+  }
+  if (tool === "fetch_url") {
+    return "Dla API: ?format=json/csv (jesli dokumentacja to podaje), args.raw:true, albo download_file na pelny plik. Pusta tresc przy HTML: dane moga byc tylko w JS — znajdz oficjalny endpoint JSON/CSV albo extract_media.";
   }
   return "Przeanalizuj blad, wybierz najbezpieczniejsze obejscie i kontynuuj. Nie koncz zadania, jesli istnieje lokalna alternatywa.";
 }
@@ -1571,6 +1826,70 @@ async function runPowerShell(command, timeoutSeconds) {
     });
   });
 }
+
+const FETCH_BODY_MAX_CHARS = 25000;
+const FETCH_TIMEOUT_MIN_SEC = 5;
+const FETCH_TIMEOUT_MAX_SEC = 60;
+const FETCH_TIMEOUT_DEFAULT_SEC = 15;
+
+function resolveHttpFetchTimeoutMs(args, defaultSec = FETCH_TIMEOUT_DEFAULT_SEC) {
+  let sec = Number(args?.timeout);
+  if (!Number.isFinite(sec) || sec <= 0) sec = defaultSec;
+  sec = Math.min(FETCH_TIMEOUT_MAX_SEC, Math.max(FETCH_TIMEOUT_MIN_SEC, sec));
+  return Math.round(sec * 1000);
+}
+
+function shortenContentTypeHeader(ct) {
+  if (!ct || typeof ct !== "string") return "";
+  return ct.split(";")[0].trim().toLowerCase() || "";
+}
+
+function inferDataMimeFromUrl(urlStr) {
+  try {
+    const pathname = new URL(urlStr).pathname.toLowerCase();
+    if (pathname.endsWith(".json")) return "application/json";
+    if (pathname.endsWith(".csv")) return "text/csv";
+    if (pathname.endsWith(".xml")) return "application/xml";
+  } catch {
+    return "";
+  }
+  return "";
+}
+
+function shouldUseRawFetchBody(contentTypeLower, urlStr, rawFlag) {
+  if (rawFlag === true) return true;
+  const pathHint = inferDataMimeFromUrl(urlStr);
+  if (pathHint === "text/csv" || pathHint === "application/xml" || pathHint === "application/json") return true;
+  const ct = contentTypeLower || "";
+  if (/json\b|\+json/.test(ct)) return true;
+  if (/csv|tab-separated/.test(ct)) return true;
+  if (/xml|\+xml/.test(ct)) return true;
+  if (ct === "text/plain" && /\.(csv|xml|json)(\?|#|$)/i.test(urlStr)) return true;
+  if ((!ct || ct === "application/octet-stream") && pathHint) return true;
+  return false;
+}
+
+function stripHtmlToVisibleText(html) {
+  return String(html ?? "")
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function truncateFetchBody(text) {
+  const s = String(text ?? "");
+  if (s.length <= FETCH_BODY_MAX_CHARS) return { text: s, truncated: false };
+  return {
+    text: `${s.slice(0, FETCH_BODY_MAX_CHARS)}... (skrocono; pelny plik zapisz przez download_file)`,
+    truncated: true,
+  };
+}
+
+const CHAT_SYSTEM_PROMPT = `Jestes pomocnym asystentem w trybie CZATU (bez narzedzi, bez plikow w workspace, bez formatu JSON).
+Odpowiadaj zwyklym ciaglym tekstem po polsku — zwiezle i rzeczowo.
+Nie wymyslaj wynikow narzedzi ani struktur {"tool":...}. Jesli uzytkownik potrzebuje edycji plikow, skryptow lub sandboxa, napisz krotko zeby wylaczyl tryb „Czat” i uzyl zwyklego agenta.`;
 
 async function executeTool(action) {
   const tool = action.tool;
@@ -1685,34 +2004,73 @@ async function executeTool(action) {
       before: "",
       after: `PDF: ${result.title} (${result.bytes} bytes)`,
     });
+  } else if (tool === "create_pptx") {
+    result = await createPptxFile(args);
+    emit("file-change", {
+      path: result.path,
+      action: "create_pptx",
+      diff: [],
+      before: "",
+      after: `PPTX: ${result.title} (${result.bytes} bytes)`,
+    });
+  } else if (tool === "create_docx") {
+    result = await createDocxFile(args);
+    emit("file-change", {
+      path: result.path,
+      action: "create_docx",
+      diff: [],
+      before: "",
+      after: `DOCX: ${result.title} (${result.bytes} bytes)`,
+    });
   } else if (tool === "run_powershell") {
     result = await runPowerShell(String(args.command ?? ""), args.timeout);
+    const blob = `${result.stderr || ""}\n${result.stdout || ""}`;
+    if (
+      result.exitCode !== 0 &&
+      /not recognized as an internal or external command|CommandNotFoundException|nie jest rozpoznawany|nie rozpoznano|The term '[^']+' is not recognized/i.test(blob) &&
+      /\bpython\b|\bpy\b|\bpip\b|\bpython3\b/i.test(blob)
+    ) {
+      throw new Error(textPreview(blob.trim(), 1500));
+    }
   } else if (tool === "fetch_url") {
-    const res = await fetch(args.url, { redirect: "follow", signal: AbortSignal.timeout(15000) });
-    if (!res.ok) throw new Error(`HTTP Error: ${res.status}`);
+    const url = assertReasonableToolUrl(args.url);
+    const timeoutMs = resolveHttpFetchTimeoutMs(args);
+    const res = await fetch(url, { redirect: "follow", signal: AbortSignal.timeout(timeoutMs) });
+    if (!res.ok) throw new Error(`HTTP Error: ${res.status} (${url.slice(0, 400)})`);
     const text = await res.text();
-    const cleanText = text.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "").replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-    result = { url: args.url, status: res.status, content: cleanText.slice(0, 25000) + (cleanText.length > 25000 ? "... (skrocono)" : "") };
+    const contentTypeHdr = res.headers.get("content-type") || "";
+    const contentTypeShort = shortenContentTypeHeader(contentTypeHdr) || inferDataMimeFromUrl(url) || "unknown";
+    const useRaw = shouldUseRawFetchBody(contentTypeShort, url, args.raw === true);
+    const processed = useRaw ? text : stripHtmlToVisibleText(text);
+    const { text: outText, truncated } = truncateFetchBody(processed);
+    result = { url, status: res.status, contentType: contentTypeShort, content: outText, truncated };
+    if (!String(outText || "").trim()) {
+      result.contentHint =
+        "Pusta tresc po pobraniu. Jesli to API: sprawdz dokumentacje (?format=json/csv, inne parametry, naglowek Accept) i ewentualnie args.raw:true. Pelny lub bardzo duzy plik: download_file do workspace. Jesli to HTML: tresc moze byc tylko w JS — znajdz oficjalny endpoint z danymi albo extract_media.";
+    }
   } else if (tool === "extract_media") {
-    const res = await fetch(args.url, { redirect: "follow", signal: AbortSignal.timeout(15000) });
-    if (!res.ok) throw new Error(`HTTP Error: ${res.status}`);
+    const url = assertReasonableToolUrl(args.url);
+    const timeoutMs = resolveHttpFetchTimeoutMs(args);
+    const res = await fetch(url, { redirect: "follow", signal: AbortSignal.timeout(timeoutMs) });
+    if (!res.ok) throw new Error(`HTTP Error: ${res.status} (${url.slice(0, 400)})`);
     const text = await res.text();
     const imgMatches = [...text.matchAll(/<img[^>]+src=["']([^"']+)["']/gi)];
     const urls = imgMatches.map(m => {
-      try { return new URL(m[1], args.url).href; } catch { return m[1]; }
+      try { return new URL(m[1], url).href; } catch { return m[1]; }
     }).filter(Boolean);
-    result = { url: args.url, media_count: urls.length, media_urls: [...new Set(urls)].slice(0, 100) };
+    result = { url, media_count: urls.length, media_urls: [...new Set(urls)].slice(0, 100) };
   } else if (tool === "download_file") {
+    const dlUrl = assertReasonableToolUrl(args.url);
     const target = normalizeInsideRoot(args.path);
     const approved = await askApproval({
       title: "Model prosi o pobranie pliku z sieci",
       cwd: relativeToRoot(cwd),
-      command: `Pobierz URL: ${args.url}\nDo pliku: ${relativeToRoot(target)}`,
+      command: `Pobierz URL: ${dlUrl}\nDo pliku: ${relativeToRoot(target)}`,
     });
     if (!approved) throw new Error("Uzytkownik odrzucil pobieranie pliku.");
     await fsp.mkdir(path.dirname(target), { recursive: true });
-    const res = await fetch(args.url, { redirect: "follow", signal: AbortSignal.timeout(60000) });
-    if (!res.ok) throw new Error(`HTTP Error: ${res.status}`);
+    const res = await fetch(dlUrl, { redirect: "follow", signal: AbortSignal.timeout(60000) });
+    if (!res.ok) throw new Error(`HTTP Error: ${res.status} (${dlUrl.slice(0, 400)})`);
     await pipeline(Readable.fromWeb(res.body), fs.createWriteStream(target));
     result = { path: relativeToRoot(target), bytes: fs.statSync(target).size };
     emit("file-change", {
@@ -1720,7 +2078,7 @@ async function executeTool(action) {
       action: "download_file",
       diff: [],
       before: "",
-      after: `Pobrano ${result.bytes} bajtow z ${args.url}`,
+      after: `Pobrano ${result.bytes} bajtow z ${dlUrl}`,
     });
   } else if (tool === "analyze_image") {
     const store = loadSkillStore();
@@ -1930,7 +2288,6 @@ async function runAgent(userText) {
     const effectiveMaxSteps = customModelSettings.maxSteps === 0
       ? 999999
       : (customModelSettings.maxSteps ?? reasoning.maxSteps);
-    let consecutiveToolFailures = 0;
     for (let step = 1; step <= effectiveMaxSteps; step += 1) {
       if (signal.aborted) throw new Error("Przerwano przez uzytkownika.");
       compactMessages();
@@ -1958,23 +2315,10 @@ async function runAgent(userText) {
         emit("tool-result", { tool: action.tool, ok: false, error: error.message, recoveryHint });
       }
 
-      if (toolPayload.ok) {
-        consecutiveToolFailures = 0;
-      } else {
-        consecutiveToolFailures += 1;
-      }
-
       messages.push({
         role: "user",
-        content: `Wynik narzedzia. Kontynuuj albo zakoncz finalem. Jesli ok=false, masz obowiazek sprobowac obejscia z recoveryHint przed finalem:\n${JSON.stringify(toolPayload, null, 2)}`,
+        content: `Wynik narzedzia. Kontynuuj albo zakoncz finalem. Jesli ok=false, uwzglednij recoveryHint (jesli jest) i sprobuj innej sciezki — mozesz ponownie uzyc narzedzi, dopoki nie osiagniesz celu lub limitu krokow:\n${JSON.stringify(toolPayload, null, 2)}`,
       });
-
-      if (consecutiveToolFailures >= 3) {
-        const exitMsg = `Zatrzymano zadanie: narzedzie zwrocilo blad 3 razy z rzedu. Ostatni: ${toolPayload.error || "nieznany"}. Mozesz zmienic model, uproscic zadanie albo wykonac krok recznie w workspace.`;
-        emit("final", { text: exitMsg });
-        messages.push({ role: "assistant", content: JSON.stringify({ note: "Zbyt wiele kolejnych bledow narzedzia (circuit break).", final: exitMsg }) });
-        return { ok: true, final: exitMsg };
-      }
     }
     const msg = "Osiagnieto limit krokow. Napisz, zeby kontynuowac.";
     emit("final", { text: msg });
@@ -1998,6 +2342,41 @@ async function runAgent(userText) {
     runInProgress = false;
     runAbortController = null;
     emit("run-end", {});
+  }
+}
+
+async function runSimpleChat(userText) {
+  if (runInProgress) throw new Error("Agent juz pracuje.");
+  runInProgress = true;
+  runAbortController = new AbortController();
+  const signal = runAbortController.signal;
+  try {
+    await validateCurrentWorkspaceRoot();
+    await ensureServer(DEFAULT_PORT);
+    const text = String(userText ?? "").trim();
+    if (!text) throw new Error("Pusta wiadomosc.");
+    emit("run-start", { text, chatMode: true });
+    emit("status", { status: "model-thinking", detail: `${getModelConfig().displayName} — tryb czatu` });
+    const chatMessages = [
+      { role: "system", content: CHAT_SYSTEM_PROMPT },
+      { role: "user", content: text },
+    ];
+    const failedModelIds = new Set();
+    const reply = (await callModelWithRecovery(chatMessages, signal, failedModelIds, { plainChat: true })).trim();
+    emit("final", { text: reply, chatMode: true });
+    return { ok: true, final: reply };
+  } catch (error) {
+    if (signal.aborted) {
+      emit("final", { text: "Przerwano.", chatMode: true });
+      return { ok: false, aborted: true };
+    }
+    const message = error?.message || String(error);
+    emit("final", { text: message, chatMode: true });
+    return { ok: false, error: message };
+  } finally {
+    runInProgress = false;
+    runAbortController = null;
+    emit("run-end", { chatMode: true });
   }
 }
 
@@ -2101,6 +2480,7 @@ ipcMain.handle("app:set-reasoning", (_event, level) => {
   return getState();
 });
 ipcMain.handle("agent:send", (_event, payload) => runAgent(payload));
+ipcMain.handle("agent:chat", (_event, text) => runSimpleChat(text));
 ipcMain.handle("agent:abort", () => {
   if (runAbortController) {
     runAbortController.abort();

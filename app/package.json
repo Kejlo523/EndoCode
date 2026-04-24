@@ -6,6 +6,9 @@
   "author": "Kejlo",
   "license": "MIT",
   "private": true,
+  "dependencies": {
+    "jsonrepair": "^3.13.1"
+  },
   "scripts": {
     "start": "electron .",
     "dist": "electron-builder --win dir",

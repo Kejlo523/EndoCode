@@ -23,6 +23,7 @@ const composerAccess = document.getElementById("composerAccess");
 const liveActivity = document.getElementById("liveActivity");
 const liveLabel = document.getElementById("liveLabel");
 const liveDetail = document.getElementById("liveDetail");
+const chatModeToggle = document.getElementById("chatModeToggle");
 
 const attachBtn = document.getElementById("attachBtn");
 const fileInput = document.getElementById("fileInput");
@@ -266,6 +267,8 @@ function toolActionDetail(tool, args, note = "") {
   else if (tool === "write_file" && args?.path) parts.push(`plik: ${args.path}`);
   else if (tool === "replace_text" && args?.path) parts.push(`plik: ${args.path}`);
   else if (tool === "create_pdf" && args?.path) parts.push(`PDF: ${args.path}`);
+  else if (tool === "create_pptx" && args?.path) parts.push(`PPTX: ${args.path}`);
+  else if (tool === "create_docx" && args?.path) parts.push(`DOCX: ${args.path}`);
   else if (args && Object.keys(args).length) parts.push(compactJsonPreview(args));
   return parts.join("\n");
 }
@@ -283,6 +286,8 @@ function toolActionLabel(tool, args) {
     case "pwd": return "Sprawdza ścieżkę";
     case "mkdir": return `mkdir ${args?.path || ""}`;
     case "create_pdf": return `Tworzy PDF: ${args?.path || ""}`;
+    case "create_pptx": return `Tworzy PPTX: ${args?.path || ""}`;
+    case "create_docx": return `Tworzy DOCX: ${args?.path || ""}`;
     case "run_powershell": return `Komenda PowerShell`;
     default: return `Narzędzie: ${tool}`;
   }
@@ -861,8 +866,13 @@ composer.addEventListener("submit", async (event) => {
   setBusy(true);
 
   try {
-    const payload = attachedBase64 ? { text, imageBase64: attachedBase64.split(",")[1] } : text;
-    await window.endocode.send(payload);
+    const useChatMode = Boolean(chatModeToggle?.checked) && !attachedBase64;
+    if (useChatMode) {
+      await window.endocode.sendChat(text);
+    } else {
+      const payload = attachedBase64 ? { text, imageBase64: attachedBase64.split(",")[1] } : text;
+      await window.endocode.send(payload);
+    }
   } catch (e) {
     addInlineEvent("error", "Błąd", e.message || String(e));
   } finally {
@@ -914,8 +924,13 @@ window.endocode.onEvent((event) => {
   }
   if (event.type === "run-start") {
     removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
-    addInlineEvent("activity", "Agent startuje", "Rozpoczęto zadanie.");
-    showLive("Przygotowuje...");
+    if (event.chatMode) {
+      addInlineEvent("activity", "Czat", "Jedna odpowiedź tekstowa (bez narzędzi).");
+      showLive("Czat…", event.text || "");
+    } else {
+      addInlineEvent("activity", "Agent startuje", "Rozpoczęto zadanie.");
+      showLive("Przygotowuje...");
+    }
     return;
   }
   if (event.type === "run-end") {
@@ -954,8 +969,10 @@ window.endocode.onEvent((event) => {
   }
   if (event.type === "content-delta") {
     const preview = (event.full || event.text || "").trim().slice(0, 50000);
-    if (preview) upsertInlineEvent(MODEL_WRITING_ACTIVITY_ID, "activity", "Model pisze", preview);
-    showLive("Model pisze...", preview.slice(-500));
+    const writingLabel = event.plainChat ? "Odpowiedź" : "Model pisze";
+    const livePhrase = event.plainChat ? "Pisze…" : "Model pisze...";
+    if (preview) upsertInlineEvent(MODEL_WRITING_ACTIVITY_ID, "activity", writingLabel, preview);
+    showLive(livePhrase, preview.slice(-500));
     return;
   }
   if (event.type === "tool-start") {
@@ -974,8 +991,20 @@ window.endocode.onEvent((event) => {
     return;
   }
   if (event.type === "file-change") {
-    const actionLabel = event.action === "write_file" ? "Zapisano" : event.action === "create_pdf" ? "Utworzono PDF" : "Edycja";
-    const body = event.action === "create_pdf" ? (event.after || "") : "";
+    const actionLabel =
+      event.action === "write_file"
+        ? "Zapisano"
+        : event.action === "create_pdf"
+          ? "Utworzono PDF"
+          : event.action === "create_pptx"
+            ? "Utworzono PPTX"
+            : event.action === "create_docx"
+              ? "Utworzono DOCX"
+              : "Edycja";
+    const body =
+      event.action === "create_pdf" || event.action === "create_pptx" || event.action === "create_docx"
+        ? (event.after || "")
+        : "";
     addInlineEvent("change", `${actionLabel}: ${event.path}`, body, renderDiff(event.diff));
     showLive(`Zapisano: ${event.path}`);
     return;

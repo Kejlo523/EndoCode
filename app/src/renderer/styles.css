@@ -888,6 +888,18 @@ select:focus { border-color: var(--border-focus); }
   gap: 4px;
 }
 
+.chat-mode-label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.chat-mode-label input {
+  accent-color: var(--accent);
+}
+
 .composer-buttons {
   display: flex;
   align-items: center;
