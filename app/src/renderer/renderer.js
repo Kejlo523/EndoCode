@@ -32,6 +32,9 @@ const skillsBtn = document.getElementById("skillsBtn");
 const skillsModal = document.getElementById("skillsModal");
 const closeSkills = document.getElementById("closeSkills");
 const killServerBtn = document.getElementById("killServerBtn");
+const skillsList = document.getElementById("skillsList");
+const skillsCount = document.getElementById("skillsCount");
+const installRecommendedSkillsBtn = document.getElementById("installRecommendedSkills");
 
 // System monitor refs
 const cpuBar = document.getElementById("cpuBar");
@@ -55,6 +58,7 @@ let pendingApprovalId = null;
 let appBusy = false;
 let currentThinkingBubble = null;
 let currentAccessLevel = "sandbox";
+let currentWorkspaceRoot = "";
 let chatSessions = [];
 let activeChatId = null;
 
@@ -299,16 +303,32 @@ function renderChatHistory() {
       await window.endocode.deleteChat(session.id);
       await loadChatHistory();
     });
-    btn.addEventListener("click", () => switchToChat(session.id));
+    btn.addEventListener("click", () => {
+      switchToChat(session.id).catch((e) => addInlineEvent("error", "Czat", e.message || String(e)));
+    });
     chatHistoryList.appendChild(btn);
   }
 }
 
-function switchToChat(chatId) {
+async function switchToChat(chatId) {
   activeChatId = chatId;
   conversation.innerHTML = "";
   const session = chatSessions.find((s) => s.id === chatId);
   if (session) {
+    let workspaceWarning = "";
+    if (session.workspaceRoot) {
+      try {
+        const state = await window.endocode.restoreWorkspace(session.workspaceRoot);
+        applyStateToUi(state);
+        if (state.workspaceFallback?.used) {
+          workspaceWarning = state.workspaceFallback.message || "wybierz folder na którym pracujemy";
+        }
+      } catch (e) {
+        workspaceWarning = e.message || String(e);
+      }
+    } else {
+      await refreshState();
+    }
     chatTitle.textContent = session.title || "Czat";
     firstUserMessage = session.title || null;
     // Replay all stored entries
@@ -324,6 +344,10 @@ function switchToChat(chatId) {
       for (const msg of session.messages) {
         addMessage(msg.role, msg.text);
       }
+    }
+    if (workspaceWarning) {
+      addInlineEvent("error", "Workspace", workspaceWarning);
+      await saveChatSession(firstUserMessage);
     }
   }
   renderChatHistory();
@@ -358,6 +382,8 @@ async function startNewChat() {
 
 async function saveChatSession(firstMessage = null) {
   if (!activeChatId) activeChatId = generateId();
+  let state = null;
+  try { state = await window.endocode.getState(); } catch { /* ignore */ }
   const title = firstMessage
     ? (firstMessage.length > 50 ? firstMessage.slice(0, 50) + "..." : firstMessage)
     : chatTitle.textContent;
@@ -386,6 +412,7 @@ async function saveChatSession(firstMessage = null) {
     title,
     createdAt: chatSessions.find((s) => s.id === activeChatId)?.createdAt || new Date().toISOString(),
     updatedAt: new Date().toISOString(),
+    workspaceRoot: state?.workspaceRoot || currentWorkspaceRoot,
     entries,
     messages: entries.filter(e => e.type === "message"), // backward compat
   };
@@ -453,13 +480,19 @@ function updateAccessUI(level) {
 }
 
 // ══════════════ STATE REFRESH ══════════════
-async function refreshState() {
-  const state = await window.endocode.getState();
+function applyStateToUi(state) {
+  currentWorkspaceRoot = state.workspaceRoot || "";
   workspaceLabel.textContent = shortPath(state.workspaceRoot);
   composerWsName.textContent = shortPath(state.workspaceRoot);
   renderModelSelect(state);
   renderReasoningSelect(state);
   updateAccessUI(state.accessLevel || "sandbox");
+}
+
+async function refreshState() {
+  const state = await window.endocode.getState();
+  applyStateToUi(state);
+  return state;
 }
 
 function renderModelSelect(state) {
@@ -486,6 +519,42 @@ function renderReasoningSelect(state) {
   }
 }
 
+// ══════════════ SKILLS ══════════════
+function renderSkills(skills = []) {
+  if (!skillsList) return;
+  const installedCount = skills.filter((skill) => skill.installed).length;
+  if (skillsCount) skillsCount.textContent = `${installedCount} / ${skills.length} aktywnych`;
+  if (!skills.length) {
+    skillsList.innerHTML = `<div class="skills-empty">Brak lokalnych skilli.</div>`;
+    return;
+  }
+  skillsList.innerHTML = skills.map((skill) => `
+    <article class="skill-card ${skill.installed ? "installed" : ""}">
+      <div class="skill-card-main">
+        <div class="skill-card-top">
+          <span class="skill-name">${escapeHtml(skill.name)}</span>
+          <span class="skill-category">${escapeHtml(skill.category)}</span>
+        </div>
+        <p class="skill-summary">${escapeHtml(skill.summary)}</p>
+        <div class="skill-local">local-only</div>
+      </div>
+      <button class="skill-install-btn ${skill.installed ? "installed" : ""}" data-skill-id="${escapeHtml(skill.id)}" data-action="${skill.installed ? "uninstall" : "install"}">
+        ${skill.installed ? "Usuń" : "Instaluj"}
+      </button>
+    </article>
+  `).join("");
+}
+
+async function loadSkills() {
+  if (!skillsList) return;
+  skillsList.innerHTML = `<div class="skills-empty">Ładowanie...</div>`;
+  try {
+    renderSkills(await window.endocode.listSkills());
+  } catch (e) {
+    skillsList.innerHTML = `<div class="skills-empty error">${escapeHtml(e.message || String(e))}</div>`;
+  }
+}
+
 // ══════════════ APPROVAL MODAL ══════════════
 function openApproval(request, approvalId) {
   pendingApprovalId = approvalId;
@@ -505,14 +574,51 @@ approveCommand.addEventListener("click", () => closeApproval(true));
 rejectCommand.addEventListener("click", () => closeApproval(false));
 
 chooseWorkspaceBtn.addEventListener("click", async () => {
-  await window.endocode.selectWorkspace();
-  await refreshState();
+  const state = await window.endocode.selectWorkspace();
+  applyStateToUi(state);
+  await saveChatSession(firstUserMessage);
 });
 
 newChatBtn.addEventListener("click", () => startNewChat());
 
-skillsBtn.addEventListener("click", () => skillsModal.classList.remove("hidden"));
+skillsBtn.addEventListener("click", async () => {
+  skillsModal.classList.remove("hidden");
+  await loadSkills();
+});
 closeSkills.addEventListener("click", () => skillsModal.classList.add("hidden"));
+
+if (skillsList) {
+  skillsList.addEventListener("click", async (event) => {
+    const btn = event.target.closest(".skill-install-btn");
+    if (!btn) return;
+    btn.disabled = true;
+    const skillId = btn.getAttribute("data-skill-id");
+    const action = btn.getAttribute("data-action");
+    try {
+      const skills = action === "uninstall"
+        ? await window.endocode.uninstallSkill(skillId)
+        : await window.endocode.installSkill(skillId);
+      renderSkills(skills);
+    } catch (e) {
+      addInlineEvent("error", "Skills", e.message || String(e));
+      await loadSkills();
+    }
+  });
+}
+
+if (installRecommendedSkillsBtn) {
+  installRecommendedSkillsBtn.addEventListener("click", async () => {
+    installRecommendedSkillsBtn.disabled = true;
+    try {
+      renderSkills(await window.endocode.installRecommendedSkills());
+      addInlineEvent("note", "Skills", "Zainstalowano 10 lokalnych skilli.");
+    } catch (e) {
+      addInlineEvent("error", "Skills", e.message || String(e));
+    } finally {
+      installRecommendedSkillsBtn.disabled = false;
+    }
+  });
+}
 
 accessToggle.addEventListener("click", async () => {
   const newLevel = currentAccessLevel === "sandbox" ? "full" : "sandbox";
@@ -631,6 +737,8 @@ window.endocode.onEvent((event) => {
       refreshState();
     } else if (event.status === "model-fallback-failed") {
       addInlineEvent("error", "Fallback modelu", event.detail || "Model zapasowy nie wystartował.");
+    } else if (event.status === "skills-changed") {
+      showLive("Skills", event.detail || "");
     } else if (event.status === "server-killing") showLive("Kill switch...", event.detail || "");
     else if (event.status === "server-killed") showLive("Kill switch", event.detail || "");
     else if (event.status === "server-starting" || event.status === "server-stopping") showLive("Runtime modelu", event.detail || "");
@@ -639,6 +747,11 @@ window.endocode.onEvent((event) => {
   if (event.type === "parse-error") {
     addInlineEvent("error", "Model JSON", `Niepoprawna odpowiedź (${event.attempt}/${event.maxAttempts}): ${event.error || ""}`);
     showLive("Naprawiam odpowiedź modelu...");
+    return;
+  }
+  if (event.type === "workspace-missing") {
+    addInlineEvent("error", "Workspace", event.message || "wybierz folder na którym pracujemy");
+    refreshState();
     return;
   }
   if (event.type === "run-start") {

@@ -72,6 +72,79 @@ Zasady:
 - Komend shell uzywaj oszczednie; UI poprosi uzytkownika o zatwierdzenie.
 - Note ma byc publiczna i krotka: plan, hipoteza albo decyzja, bez dlugiego ukrytego rozumowania.`;
 
+const SKILL_CATALOG = [
+  {
+    id: "documents",
+    name: "Documents",
+    category: "Dokumenty",
+    summary: "Raporty, notatki, briefy i dokumenty z lokalnych plikow.",
+    instructions: "Do ogolnej pracy z dokumentami preferuj Markdown lub HTML jako zrodlo, zapisuj artefakty w workspace i opisz uzytkownikowi finalne pliki. Nie uzywaj uslug chmurowych.",
+  },
+  {
+    id: "docx",
+    name: "DOCX",
+    category: "Dokumenty",
+    summary: "Tworzenie, edycja i ekstrakcja tresci z plikow Word.",
+    instructions: "Dla DOCX tworz lub modyfikuj pliki lokalnie. Jesli potrzebne biblioteki sa dostepne, uzyj lokalnego skryptu przez run_powershell po zgodzie; w przeciwnym razie przygotuj zrodlo HTML/Markdown i jasne kroki eksportu.",
+  },
+  {
+    id: "pdf",
+    name: "PDF",
+    category: "Dokumenty",
+    summary: "Czytanie, skladanie i eksport PDF bez zewnetrznych API.",
+    instructions: "Dla PDF pracuj lokalnie: ekstrakcja tekstu, tworzenie HTML jako zrodla, scalanie lub eksport przez dostepne lokalne narzedzia. Nie wysylaj dokumentow poza maszyne.",
+  },
+  {
+    id: "slides",
+    name: "Slides",
+    category: "Prezentacje",
+    summary: "Konspekty, slajdy, speaker notes i eksport deckow.",
+    instructions: "Dla prezentacji buduj strukture slajdow, notatki prelegenta i lokalne zrodla HTML/Markdown/PPTX. Preferuj pliki edytowalne i zachowuj zasoby obok decka.",
+  },
+  {
+    id: "sheets",
+    name: "Sheets / CSV",
+    category: "Dane",
+    summary: "Arkusze, CSV, tabele, kalkulacje i proste wykresy.",
+    instructions: "Dla danych tabelarycznych uzywaj CSV/TSV/XLSX w workspace, zachowuj typy danych i podsumowuj transformacje. Formuly i wykresy opisuj tak, zeby byly odtwarzalne lokalnie.",
+  },
+  {
+    id: "image-gen",
+    name: "Image Gen",
+    category: "Media",
+    summary: "Prompty, assety i lokalne pipeline'y obrazow.",
+    instructions: "Dla obrazow przygotowuj prompty, specyfikacje assetow, SVG/HTML/CSS albo uruchamiaj wylacznie lokalne generatory, jesli istnieja w workspace. Nie zakladaj dostepu do chmurowego image API.",
+  },
+  {
+    id: "figma-local",
+    name: "Figma Local",
+    category: "Design",
+    summary: "Praca na lokalnych eksportach z Figmy: SVG, PNG, JSON, CSS.",
+    instructions: "Dla Figmy pracuj na wyeksportowanych lokalnie plikach. Nie lacz sie z Figma API. Mapuj style, warstwy i komponenty na kod lub dokumentacje w workspace.",
+  },
+  {
+    id: "svg",
+    name: "SVG / Icons",
+    category: "Design",
+    summary: "Czyste SVG, ikony, diagramy i optymalizacja wektorow.",
+    instructions: "Dla SVG dbaj o viewBox, dostepnosc, skale i minimalny kod. Preferuj edytowalne pliki SVG zamiast bitmap, gdy obiekt jest ikoną, diagramem albo prostym assetem.",
+  },
+  {
+    id: "file-export",
+    name: "File Export",
+    category: "Eksport",
+    summary: "Eksport HTML, Markdown, ZIP, PDF-ready i paczek artefaktow.",
+    instructions: "Dla eksportow tworz przewidywalne foldery wyjsciowe, manifest plikow i formaty latwe do sprawdzenia lokalnie. Nie nadpisuj niepowiazanych plikow.",
+  },
+  {
+    id: "data-extract",
+    name: "Data Extract",
+    category: "Dane",
+    summary: "Ekstrakcja tekstu, tabel, metadanych i porzadkowanie plikow.",
+    instructions: "Dla ekstrakcji danych czytaj pliki lokalnie, zapisuj surowe i oczyszczone wyniki osobno, a transformacje opisuj w sposob audytowalny. Nie wysylaj danych do zewnetrznych serwisow.",
+  },
+];
+
 let mainWindow;
 let serverProcess = null;
 let serverOwned = false;
@@ -233,7 +306,8 @@ function findBielikHome() {
 }
 
 const BIELIK_HOME = findBielikHome();
-let workspaceRoot = path.join(BIELIK_HOME, "workspace");
+const bootSettings = readJsonFile(path.join(BIELIK_HOME, "config", "endocode-state.json"), {});
+let workspaceRoot = path.resolve(bootSettings.workspaceRoot || path.join(BIELIK_HOME, "workspace"));
 let cwd = workspaceRoot;
 
 function readJsonFile(filePath, fallback) {
@@ -278,6 +352,7 @@ function saveAppSettings() {
     accessLevel,
     customModelSettings,
     maxMessages: MAX_MESSAGES,
+    workspaceRoot,
   });
 }
 
@@ -297,6 +372,113 @@ function loadChatHistory() {
 
 function saveChatHistory() {
   writeJsonFile(getChatHistoryPath(), chatHistory);
+}
+
+function getSkillStorePath() {
+  return path.join(BIELIK_HOME, "config", "skills.json");
+}
+
+function getSkillsRoot() {
+  return path.join(BIELIK_HOME, "config", "skills");
+}
+
+function loadSkillStore() {
+  const store = readJsonFile(getSkillStorePath(), { installed: [] });
+  return { installed: Array.isArray(store.installed) ? store.installed : [] };
+}
+
+function saveSkillStore(store) {
+  writeJsonFile(getSkillStorePath(), { installed: [...new Set(store.installed || [])] });
+}
+
+function getSkillById(skillId) {
+  return SKILL_CATALOG.find((skill) => skill.id === skillId);
+}
+
+function getSkillsForUi() {
+  const installed = new Set(loadSkillStore().installed);
+  return SKILL_CATALOG.map((skill) => ({
+    id: skill.id,
+    name: skill.name,
+    category: skill.category,
+    summary: skill.summary,
+    installed: installed.has(skill.id),
+    localOnly: true,
+    path: path.join(getSkillsRoot(), skill.id, "SKILL.md"),
+  }));
+}
+
+function getActiveSkillsPrompt() {
+  const installed = new Set(loadSkillStore().installed);
+  const active = SKILL_CATALOG.filter((skill) => installed.has(skill.id));
+  if (!active.length) return "";
+  return active
+    .map((skill) => `- ${skill.name}: ${skill.instructions}`)
+    .join("\n");
+}
+
+function createSkillMarkdown(skill) {
+  return `# ${skill.name}
+
+Category: ${skill.category}
+Local only: yes
+
+## Summary
+${skill.summary}
+
+## Agent Instructions
+${skill.instructions}
+
+## Local Runtime Rule
+Use only local files, local model reasoning and approved local commands. Do not call cloud APIs unless the user explicitly adds such integration later.
+`;
+}
+
+function refreshSystemPrompt() {
+  if (Array.isArray(messages) && messages[0]?.role === "system") {
+    messages[0] = { role: "system", content: createSystemPrompt() };
+  }
+}
+
+async function installSkill(skillId) {
+  const skill = getSkillById(skillId);
+  if (!skill) throw new Error(`Nieznany skill: ${skillId}`);
+  const store = loadSkillStore();
+  if (!store.installed.includes(skillId)) store.installed.push(skillId);
+  saveSkillStore(store);
+  const dir = path.join(getSkillsRoot(), skill.id);
+  await fsp.mkdir(dir, { recursive: true });
+  await fsp.writeFile(path.join(dir, "SKILL.md"), createSkillMarkdown(skill), "utf8");
+  refreshSystemPrompt();
+  emit("status", { status: "skills-changed", detail: `Zainstalowano skill: ${skill.name}` });
+  return getSkillsForUi();
+}
+
+async function uninstallSkill(skillId) {
+  const skill = getSkillById(skillId);
+  if (!skill) throw new Error(`Nieznany skill: ${skillId}`);
+  const store = loadSkillStore();
+  store.installed = store.installed.filter((id) => id !== skillId);
+  saveSkillStore(store);
+  await fsp.rm(path.join(getSkillsRoot(), skill.id), { recursive: true, force: true });
+  refreshSystemPrompt();
+  emit("status", { status: "skills-changed", detail: `Odinstalowano skill: ${skill.name}` });
+  return getSkillsForUi();
+}
+
+async function installRecommendedSkills() {
+  const store = loadSkillStore();
+  store.installed = [...new Set([...store.installed, ...SKILL_CATALOG.map((skill) => skill.id)])];
+  saveSkillStore(store);
+  await fsp.mkdir(getSkillsRoot(), { recursive: true });
+  for (const skill of SKILL_CATALOG) {
+    const dir = path.join(getSkillsRoot(), skill.id);
+    await fsp.mkdir(dir, { recursive: true });
+    await fsp.writeFile(path.join(dir, "SKILL.md"), createSkillMarkdown(skill), "utf8");
+  }
+  refreshSystemPrompt();
+  emit("status", { status: "skills-changed", detail: "Zainstalowano rekomendowany zestaw 10 lokalnych skilli." });
+  return getSkillsForUi();
 }
 
 function getSystemInfo() {
@@ -353,7 +535,7 @@ function getContextInfo() {
   };
 }
 
-const initialSettings = loadAppSettings();
+const initialSettings = bootSettings;
 let selectedModelId = initialSettings.selectedModelId || loadModelCatalog().defaultModelId || "qwen25-coder-14b-q4km";
 let selectedReasoning = REASONING_LEVELS[initialSettings.reasoningLevel] ? initialSettings.reasoningLevel : "medium";
 
@@ -371,11 +553,15 @@ function getReasoningProfile() {
 function createSystemPrompt() {
   const model = getModelConfig();
   const reasoning = getReasoningProfile();
+  const skillsPrompt = getActiveSkillsPrompt();
   return `${BASE_SYSTEM_PROMPT}
 
 Aktualny model: ${model.displayName || model.id}.
 Intensywnosc pracy: ${reasoning.label}.
-Instrukcja intensywnosci: ${reasoning.instruction}`;
+Instrukcja intensywnosci: ${reasoning.instruction}${skillsPrompt ? `
+
+Aktywne lokalne skills:
+${skillsPrompt}` : ""}`;
 }
 
 function createInitialMessages() {
@@ -471,11 +657,62 @@ function relativeToRoot(p) {
   return rel.length ? rel : ".";
 }
 
-async function ensureWorkspaceRoot(root) {
-  workspaceRoot = path.resolve(root);
-  await fsp.mkdir(workspaceRoot, { recursive: true });
+function getFallbackWorkspaceRoot() {
+  return os.homedir() || path.join(BIELIK_HOME, "workspace");
+}
+
+async function applyWorkspaceRoot(root, options = {}) {
+  const create = Boolean(options.create);
+  const requestedRoot = root ? path.resolve(String(root)) : "";
+  let target = requestedRoot || getFallbackWorkspaceRoot();
+  let fallbackUsed = false;
+  let message = "";
+
+  try {
+    if (create) {
+      await fsp.mkdir(target, { recursive: true });
+    }
+    const stat = await fsp.stat(target);
+    if (!stat.isDirectory()) throw new Error("To nie jest folder.");
+  } catch {
+    fallbackUsed = true;
+    target = path.resolve(getFallbackWorkspaceRoot());
+    await fsp.mkdir(target, { recursive: true });
+    message = "wybierz folder na którym pracujemy";
+  }
+
+  workspaceRoot = target;
   cwd = workspaceRoot;
-  return getState();
+  if (!options.skipSave) saveAppSettings();
+  return {
+    ...getState(),
+    workspaceFallback: {
+      used: fallbackUsed,
+      requestedRoot,
+      fallbackRoot: target,
+      message,
+    },
+  };
+}
+
+async function ensureWorkspaceRoot(root) {
+  return applyWorkspaceRoot(root, { create: true });
+}
+
+async function restoreWorkspaceRoot(root) {
+  return applyWorkspaceRoot(root, { create: false });
+}
+
+async function validateCurrentWorkspaceRoot() {
+  try {
+    const stat = await fsp.stat(workspaceRoot);
+    if (stat.isDirectory()) return null;
+  } catch {
+    // fallback below
+  }
+  const state = await restoreWorkspaceRoot(workspaceRoot);
+  if (state.workspaceFallback?.used) emit("workspace-missing", state.workspaceFallback);
+  return state;
 }
 
 function getRuntimeServerExe() {
@@ -1137,6 +1374,7 @@ async function runAgent(userText) {
   runAbortController = new AbortController();
   const signal = runAbortController.signal;
   try {
+    await validateCurrentWorkspaceRoot();
     await ensureServer(DEFAULT_PORT);
     messages.push({ role: "user", content: userText });
     emit("run-start", { text: userText });
@@ -1215,6 +1453,7 @@ function getState() {
     port: DEFAULT_PORT,
     customModelSettings,
     maxMessages: MAX_MESSAGES,
+    accessLevel,
   };
 }
 
@@ -1236,7 +1475,7 @@ function createWindow() {
 }
 
 app.whenReady().then(async () => {
-  await fsp.mkdir(workspaceRoot, { recursive: true });
+  const workspaceResult = await applyWorkspaceRoot(workspaceRoot, { create: false, skipSave: true });
   loadChatHistory();
   const settings = loadAppSettings();
   if (settings.accessLevel) accessLevel = settings.accessLevel;
@@ -1244,7 +1483,11 @@ app.whenReady().then(async () => {
     Object.assign(customModelSettings, settings.customModelSettings);
   }
   if (settings.maxMessages) MAX_MESSAGES = Math.max(8, settings.maxMessages);
+  if (workspaceResult.workspaceFallback?.used) saveAppSettings();
   createWindow();
+  if (workspaceResult.workspaceFallback?.used) {
+    emit("workspace-missing", workspaceResult.workspaceFallback);
+  }
 });
 
 app.on("window-all-closed", async () => {
@@ -1268,6 +1511,7 @@ ipcMain.handle("app:select-workspace", async () => {
   }
   return getState();
 });
+ipcMain.handle("app:restore-workspace", async (_event, root) => restoreWorkspaceRoot(root));
 ipcMain.handle("app:reset-chat", () => {
   messages = createInitialMessages();
   currentChatId = null;
@@ -1327,6 +1571,10 @@ ipcMain.handle("app:delete-chat", (_event, chatId) => {
   saveChatHistory();
   return chatHistory;
 });
+ipcMain.handle("app:list-skills", () => getSkillsForUi());
+ipcMain.handle("app:install-skill", (_event, skillId) => installSkill(String(skillId ?? "")));
+ipcMain.handle("app:uninstall-skill", (_event, skillId) => uninstallSkill(String(skillId ?? "")));
+ipcMain.handle("app:install-recommended-skills", () => installRecommendedSkills());
 ipcMain.handle("app:get-model-settings", () => ({
   ...customModelSettings,
   maxMessages: MAX_MESSAGES,

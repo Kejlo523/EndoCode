@@ -12,5 +12,6 @@
     "contextTokens": 8192,
     "gpuLayers": 99
   },
-  "maxMessages": 100
+  "maxMessages": 100,
+  "workspaceRoot": "C:\\Users\\Kejlo\\Desktop\\testy-ai"
 }

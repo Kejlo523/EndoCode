@@ -192,7 +192,7 @@
       </div>
     </div>
 
-    <!-- ── SKILLS PANEL (placeholder) ── -->
+    <!-- ── SKILLS PANEL ── -->
     <div class="modal-overlay hidden" id="skillsModal">
       <div class="modal-card skills-card">
         <div class="modal-header">
@@ -200,9 +200,12 @@
           <span class="modal-title">Skills</span>
           <button class="modal-close" id="closeSkills">&times;</button>
         </div>
-        <div class="skills-placeholder">
-          <p>Moduł Skills będzie wkrótce dostępny.</p>
-          <p class="muted-text">Tutaj pojawią się automatyzacje, szablony i rozszerzenia.</p>
+        <div class="skills-toolbar">
+          <span class="skills-count" id="skillsCount">0 / 10 aktywnych</span>
+          <button class="modal-btn approve" id="installRecommendedSkills">Zainstaluj 10</button>
+        </div>
+        <div class="skills-list" id="skillsList">
+          <div class="skills-empty">Ładowanie...</div>
         </div>
       </div>
     </div>

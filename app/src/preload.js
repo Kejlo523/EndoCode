@@ -3,6 +3,7 @@ const { contextBridge, ipcRenderer } = require("electron");
 contextBridge.exposeInMainWorld("endocode", {
   getState: () => ipcRenderer.invoke("app:state"),
   selectWorkspace: () => ipcRenderer.invoke("app:select-workspace"),
+  restoreWorkspace: (root) => ipcRenderer.invoke("app:restore-workspace", root),
   resetChat: () => ipcRenderer.invoke("app:reset-chat"),
   setModel: (modelId) => ipcRenderer.invoke("app:set-model", modelId),
   setReasoning: (level) => ipcRenderer.invoke("app:set-reasoning", level),
@@ -16,6 +17,10 @@ contextBridge.exposeInMainWorld("endocode", {
   saveChat: (session) => ipcRenderer.invoke("app:save-chat", session),
   loadChats: () => ipcRenderer.invoke("app:load-chats"),
   deleteChat: (chatId) => ipcRenderer.invoke("app:delete-chat", chatId),
+  listSkills: () => ipcRenderer.invoke("app:list-skills"),
+  installSkill: (skillId) => ipcRenderer.invoke("app:install-skill", skillId),
+  uninstallSkill: (skillId) => ipcRenderer.invoke("app:uninstall-skill", skillId),
+  installRecommendedSkills: () => ipcRenderer.invoke("app:install-recommended-skills"),
   getModelSettings: () => ipcRenderer.invoke("app:get-model-settings"),
   setModelSettings: (settings) => ipcRenderer.invoke("app:set-model-settings", settings),
   resetModelSettings: () => ipcRenderer.invoke("app:reset-model-settings"),
