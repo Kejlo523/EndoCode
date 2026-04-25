@@ -1283,33 +1283,40 @@ function getRuntimeServerExe() {
   return null;
 }
 
-function pickRuntimeAsset(assets, preferCuda) {
-  if (!Array.isArray(assets) || assets.length === 0) return null;
+function rankRuntimeAssets(assets, preferCuda) {
+  if (!Array.isArray(assets) || assets.length === 0) return [];
   const candidates = assets.filter((asset) => {
     const name = String(asset?.name || "").toLowerCase();
-    return name.endsWith(".zip") && name.includes("win") && name.includes("x64") && !name.includes("arm");
+    // must be full Windows x64 runtime package, not cudart-only bundle
+    return (
+      name.endsWith(".zip") &&
+      name.startsWith("llama-") &&
+      name.includes("-bin-win-") &&
+      name.includes("x64") &&
+      !name.includes("arm") &&
+      !name.startsWith("cudart-")
+    );
   });
-  if (!candidates.length) return null;
+  if (!candidates.length) return [];
 
   const scoreAsset = (asset) => {
     const name = String(asset?.name || "").toLowerCase();
     let score = 0;
-    if (name.includes("llama")) score += 5;
-    if (name.includes("bin")) score += 4;
-    if (name.includes("server")) score += 3;
+    if (name.includes("llama-")) score += 20;
+    if (name.includes("-bin-win-")) score += 20;
     if (preferCuda) {
-      if (name.includes("cuda") || name.includes("cu12") || name.includes("cu11")) score += 30;
-      if (name.includes("vulkan")) score += 15;
-      if (name.includes("cpu")) score += 5;
+      if (name.includes("cuda")) score += 50;
+      if (name.includes("vulkan")) score += 25;
+      if (name.includes("cpu")) score += 10;
     } else {
-      if (name.includes("cpu")) score += 30;
-      if (name.includes("vulkan")) score += 18;
-      if (name.includes("cuda") || name.includes("cu12") || name.includes("cu11")) score += 10;
+      if (name.includes("cpu")) score += 50;
+      if (name.includes("vulkan")) score += 30;
+      if (name.includes("cuda")) score += 15;
     }
     return score;
   };
 
-  return candidates.sort((a, b) => scoreAsset(b) - scoreAsset(a))[0] || null;
+  return candidates.sort((a, b) => scoreAsset(b) - scoreAsset(a));
 }
 
 async function installLlamaRuntime() {
@@ -1323,14 +1330,13 @@ async function installLlamaRuntime() {
   const release = await fetchJsonViaHttpsWithRetry("https://api.github.com/repos/ggml-org/llama.cpp/releases/latest", 3);
 
   const hw = getHardwareModelProfile();
-  const asset = pickRuntimeAsset(release?.assets || [], Boolean(hw?.hasNvidiaGpu));
-  if (!asset?.browser_download_url || !asset?.name) {
+  const runtimeAssets = rankRuntimeAssets(release?.assets || [], Boolean(hw?.hasNvidiaGpu));
+  if (!runtimeAssets.length) {
     throw new Error("Nie znalazlem binarki llama.cpp dla Windows x64 w najnowszym wydaniu.");
   }
 
   const runtimeDir = path.join(BIELIK_HOME, "runtime");
   const tempDir = path.join(runtimeDir, "_install_tmp");
-  const zipPath = path.join(tempDir, String(asset.name).replace(/[<>:\"\\|?*]/g, "_"));
   const extractDir = path.join(tempDir, "extract");
   const releaseTag = String(release?.tag_name || "latest").replace(/[^a-z0-9._-]/gi, "_");
   const finalDir = path.join(runtimeDir, `llama.cpp-${releaseTag}`);
@@ -1339,47 +1345,65 @@ async function installLlamaRuntime() {
   await fsp.mkdir(extractDir, { recursive: true });
 
   try {
-    emit("status", { status: "runtime-install", detail: `Pobieram runtime: ${asset.name}` });
-    emit("runtime-install-progress", { phase: "download", progress: 8, detail: `Pobieranie ${asset.name}` });
-    await downloadFileWithProgress(asset.browser_download_url, zipPath, "Pobieranie runtime llama.cpp", (downloadPct) => {
-      const bounded = Math.max(0, Math.min(100, Number(downloadPct) || 0));
-      const uiPct = 8 + Math.round((bounded / 100) * 72);
-      emit("runtime-install-progress", { phase: "download", progress: uiPct, detail: `Pobieranie runtime: ${bounded}%` });
-    });
+    let lastError = null;
+    for (let i = 0; i < runtimeAssets.length; i += 1) {
+      const asset = runtimeAssets[i];
+      const zipPath = path.join(tempDir, String(asset.name).replace(/[<>:\"\\|?*]/g, "_"));
+      try {
+        emit("status", { status: "runtime-install", detail: `Wybrany asset: ${asset.name}` });
+        emit("status", { status: "runtime-install", detail: `Pobieram runtime: ${asset.name}` });
+        emit("runtime-install-progress", { phase: "download", progress: 8, detail: `Pobieranie ${asset.name}` });
+        await downloadFileWithProgress(asset.browser_download_url, zipPath, "Pobieranie runtime llama.cpp", (downloadPct) => {
+          const bounded = Math.max(0, Math.min(100, Number(downloadPct) || 0));
+          const uiPct = 8 + Math.round((bounded / 100) * 72);
+          emit("runtime-install-progress", { phase: "download", progress: uiPct, detail: `Pobieranie runtime: ${bounded}%` });
+        });
 
-    emit("status", { status: "runtime-install", detail: "Rozpakowuje runtime llama.cpp..." });
-    emit("runtime-install-progress", { phase: "extract", progress: 84, detail: "Rozpakowywanie archiwum..." });
-    await new Promise((resolve, reject) => {
-      const child = spawn("powershell", [
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-Command",
-        `Expand-Archive -LiteralPath '${zipPath.replace(/'/g, "''")}' -DestinationPath '${extractDir.replace(/'/g, "''")}' -Force`,
-      ], { windowsHide: true });
-      let stderr = "";
-      let stdout = "";
-      child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
-      child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
-      child.on("error", reject);
-      child.on("close", (code) => {
-        if (code === 0) resolve();
-        else reject(new Error(`Rozpakowanie nie powiodlo sie: ${(stderr || stdout || "").trim()}`));
-      });
-    });
+        emit("status", { status: "runtime-install", detail: "Rozpakowuje runtime llama.cpp..." });
+        emit("runtime-install-progress", { phase: "extract", progress: 84, detail: "Rozpakowywanie archiwum..." });
+        await fsp.rm(extractDir, { recursive: true, force: true });
+        await fsp.mkdir(extractDir, { recursive: true });
+        await new Promise((resolve, reject) => {
+          const child = spawn("powershell", [
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            `Expand-Archive -LiteralPath '${zipPath.replace(/'/g, "''")}' -DestinationPath '${extractDir.replace(/'/g, "''")}' -Force`,
+          ], { windowsHide: true });
+          let stderr = "";
+          let stdout = "";
+          child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+          child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+          child.on("error", reject);
+          child.on("close", (code) => {
+            if (code === 0) resolve();
+            else reject(new Error(`Rozpakowanie nie powiodlo sie: ${(stderr || stdout || "").trim()}`));
+          });
+        });
 
-    emit("runtime-install-progress", { phase: "install", progress: 92, detail: "Kopiowanie runtime..." });
-    await fsp.rm(finalDir, { recursive: true, force: true });
-    await fsp.mkdir(finalDir, { recursive: true });
-    await fsp.cp(extractDir, finalDir, { recursive: true, force: true });
+        emit("runtime-install-progress", { phase: "install", progress: 92, detail: "Kopiowanie runtime..." });
+        await fsp.rm(finalDir, { recursive: true, force: true });
+        await fsp.mkdir(finalDir, { recursive: true });
+        await fsp.cp(extractDir, finalDir, { recursive: true, force: true });
 
-    const serverExe = getRuntimeServerExe();
-    if (!serverExe) {
-      throw new Error("Instalacja zakonczona, ale nie znaleziono pliku llama-server.exe.");
+        const serverExe = getRuntimeServerExe();
+        if (!serverExe) {
+          throw new Error(`Paczka ${asset.name} nie zawiera llama-server.exe`);
+        }
+        emit("runtime-install-progress", { phase: "done", progress: 100, detail: "Runtime llama.cpp zainstalowany." });
+        emit("status", { status: "runtime-install-complete", detail: "Runtime llama.cpp zainstalowany." });
+        return { ok: true, serverExe, asset: asset.name, tag: release?.tag_name || "latest" };
+      } catch (error) {
+        lastError = error;
+        await fsp.rm(zipPath, { force: true }).catch(() => {});
+        if (i < runtimeAssets.length - 1) {
+          emit("status", { status: "runtime-install", detail: `Wybrany asset nieudany (${asset.name}). Probuje kolejny...` });
+          continue;
+        }
+      }
     }
-    emit("runtime-install-progress", { phase: "done", progress: 100, detail: "Runtime llama.cpp zainstalowany." });
-    emit("status", { status: "runtime-install-complete", detail: "Runtime llama.cpp zainstalowany." });
-    return { ok: true, serverExe, asset: asset.name, tag: release?.tag_name || "latest" };
+    throw lastError || new Error("Nie udalo sie zainstalowac runtime llama.cpp.");
   } finally {
     await fsp.rm(tempDir, { recursive: true, force: true }).catch(() => {});
   }
@@ -2841,35 +2865,61 @@ async function executeTool(action) {
   return result;
 }
 
-async function downloadFileWithProgress(url, targetPath, label, onProgress = null) {
+async function downloadFileWithProgress(url, targetPath, label, onProgress = null, redirectCount = 0) {
+  if (redirectCount > 8) throw new Error(`Za duzo przekierowan podczas pobierania ${label}.`);
   return new Promise((resolve, reject) => {
-    https.get(url, (res) => {
-      if (res.statusCode === 301 || res.statusCode === 302) {
-        return downloadFileWithProgress(res.headers.location, targetPath, label, onProgress).then(resolve).catch(reject);
+    const request = https.get(url, { headers: { "User-Agent": "EndoCode-Desktop-App" } }, (res) => {
+      if ([301, 302, 303, 307, 308].includes(res.statusCode)) {
+        const location = res.headers.location;
+        if (!location) {
+          reject(new Error(`Przekierowanie bez Location podczas pobierania ${label}.`));
+          return;
+        }
+        const nextUrl = new URL(location, url).toString();
+        downloadFileWithProgress(nextUrl, targetPath, label, onProgress, redirectCount + 1).then(resolve).catch(reject);
+        return;
       }
-      if (res.statusCode !== 200) return reject(new Error(`Błąd HTTP ${res.statusCode} pobierania ${label}`));
-      
+      if (res.statusCode !== 200) {
+        reject(new Error(`Blad HTTP ${res.statusCode} pobierania ${label}`));
+        return;
+      }
+
       const totalBytes = parseInt(res.headers["content-length"] || "0", 10);
       let downloadedBytes = 0;
       let lastReportTime = 0;
       const file = fs.createWriteStream(targetPath);
-      
+
+      const abortWith = (error) => {
+        try { file.destroy(); } catch { /* ignore */ }
+        fs.unlink(targetPath, () => {});
+        reject(error);
+      };
+
       res.on("data", (chunk) => {
         downloadedBytes += chunk.length;
         const now = Date.now();
-        if (now - lastReportTime > 500 && totalBytes > 0) {
-          const pct = Math.round((downloadedBytes / totalBytes) * 100);
+        if (now - lastReportTime > 500) {
+          const pct = totalBytes > 0 ? Math.round((downloadedBytes / totalBytes) * 100) : 0;
           if (typeof onProgress === "function") onProgress(pct, downloadedBytes, totalBytes);
-          emit("status", { status: "downloading", detail: `${label}: ${pct}%` });
+          if (totalBytes > 0) emit("status", { status: "downloading", detail: `${label}: ${pct}%` });
+          else emit("status", { status: "downloading", detail: `${label}: ${(downloadedBytes / 1024 / 1024).toFixed(1)} MB` });
           lastReportTime = now;
         }
       });
+
+      res.on("error", (err) => abortWith(err));
+      file.on("error", (err) => abortWith(err));
+
       res.pipe(file);
       file.on("finish", () => {
-        file.close();
-        resolve();
+        file.close(() => resolve());
       });
-    }).on("error", (err) => {
+    });
+
+    request.setTimeout(60000, () => {
+      request.destroy(new Error(`Timeout pobierania ${label}.`));
+    });
+    request.on("error", (err) => {
       fs.unlink(targetPath, () => {});
       reject(err);
     });
