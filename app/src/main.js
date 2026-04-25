@@ -618,12 +618,27 @@ function getSystemInfo() {
   };
 }
 
+function estimateTokens(msgs) {
+  let chars = 0;
+  for (const m of msgs) {
+    chars += String(m.role || "").length;
+    if (typeof m.content === "string") chars += m.content.length;
+    else chars += JSON.stringify(m.content || "").length;
+  }
+  return Math.ceil(chars / 3.5) + msgs.length * 4;
+}
+
 function getContextInfo() {
+  const tokens = estimateTokens(messages);
+  const contextTokensLimit = clampContextTokens(customModelSettings.contextTokens ?? getModelConfig().contextTokens ?? 8192);
+  const isNearCompaction = messages.length > MAX_MESSAGES - 4 || tokens > contextTokensLimit * 0.8;
   return {
     messageCount: messages.length,
     maxMessages: MAX_MESSAGES,
+    estimatedTokens: tokens,
+    maxTokens: contextTokensLimit,
     willCompactAt: MAX_MESSAGES,
-    isNearCompaction: messages.length > MAX_MESSAGES - 4,
+    isNearCompaction,
   };
 }
 
@@ -1031,8 +1046,9 @@ async function killModelServerResources() {
   await stopOwnedServer({ force: true });
 
   const pids = getListeningPidsOnPort(DEFAULT_PORT);
+  const visionPids = getListeningPidsOnPort(VISION_PORT);
   const killedPids = [];
-  for (const pid of pids) {
+  for (const pid of [...pids, ...visionPids]) {
     if (forceKillPid(pid)) killedPids.push(pid);
   }
   for (let i = 0; i < 30; i += 1) {
@@ -1041,14 +1057,22 @@ async function killModelServerResources() {
   }
 
   const alive = await isServerReady(DEFAULT_PORT);
+  let visionAlive = false;
+  try {
+    const res = await fetch(`http://127.0.0.1:${VISION_PORT}/health`, { signal: AbortSignal.timeout(1000) });
+    visionAlive = res.ok;
+  } catch {
+    visionAlive = false;
+  }
   serverProcess = null;
   serverOwned = false;
   runningModelId = null;
-  const detail = alive
-    ? `Kill switch wykonany, ale port ${DEFAULT_PORT} nadal odpowiada.`
-    : `Kill switch zakonczony. Zwolniono port ${DEFAULT_PORT}.`;
+  const stillAlive = [alive ? DEFAULT_PORT : null, visionAlive ? VISION_PORT : null].filter(Boolean);
+  const detail = stillAlive.length
+    ? `Kill switch wykonany, ale nadal odpowiadaja porty: ${stillAlive.join(", ")}.`
+    : `Kill switch zakonczony. Zwolniono porty ${DEFAULT_PORT} i ${VISION_PORT}.`;
   emit("status", { status: "server-killed", detail });
-  return { aborted: hadRun, ownedPid, killedPids, port: DEFAULT_PORT, alive };
+  return { aborted: hadRun, ownedPid, killedPids, port: DEFAULT_PORT, visionPort: VISION_PORT, alive, visionAlive };
 }
 
 async function callModel(messages, abortSignal, streamOptions = {}) {
@@ -1516,6 +1540,15 @@ async function getNextActionWithRepair(abortSignal, failedModelIds) {
 function textPreview(value, limit = 26000) {
   const text = String(value ?? "");
   return text.length > limit ? `${text.slice(0, limit)}\n...[truncated]` : text;
+}
+
+function readLogTail(filePath, limit = 5000) {
+  try {
+    const text = fs.readFileSync(filePath, "utf8");
+    return text.length > limit ? text.slice(-limit) : text;
+  } catch {
+    return "";
+  }
 }
 
 function htmlEscape(value) {
@@ -2227,9 +2260,10 @@ async function ensureVisionSupport() {
 async function ensureVisionServer() {
   if (visionServerProcess) {
     try {
-      const res = await fetch(`http://127.0.0.1:${VISION_PORT}/health`);
+      const res = await fetch(`http://127.0.0.1:${VISION_PORT}/health`, { signal: AbortSignal.timeout(1500) });
       if (res.ok) return;
     } catch {
+      try { forceKillPid(visionServerProcess.pid); } catch {}
       visionServerProcess = null;
     }
   }
@@ -2238,29 +2272,62 @@ async function ensureVisionServer() {
   const serverExe = getRuntimeServerExe();
   if (!serverExe) throw new Error("Nie znaleziono llama-server.exe dla wizji.");
 
-  emit("activity", { detail: "Uruchamiam pomocniczy serwer wizji..." });
-  const child = spawn(serverExe, [
+  try {
+    const res = await fetch(`http://127.0.0.1:${VISION_PORT}/health`, { signal: AbortSignal.timeout(1500) });
+    if (res.ok) return;
+  } catch {
+    for (const pid of getListeningPidsOnPort(VISION_PORT)) forceKillPid(pid);
+  }
+
+  const logDir = path.join(BIELIK_HOME, "logs");
+  await fsp.mkdir(logDir, { recursive: true });
+  const outLogPath = path.join(logDir, "vision-server.out.log");
+  const errLogPath = path.join(logDir, "vision-server.err.log");
+  const outLog = fs.openSync(outLogPath, "a");
+  const errLog = fs.openSync(errLogPath, "a");
+
+  emit("status", { status: "vision-analysis", detail: "Uruchamiam pomocniczy serwer wizji..." });
+  const args = [
     "-m", textModelPath,
     "--mmproj", mmprojPath,
+    "--host", "127.0.0.1",
     "--port", String(VISION_PORT),
     "--threads", "4",
     "--ctx-size", "2048",
     "--parallel", "1",
-    "--no-display-prompt",
-    "-ngl", "0" // Na razie CPU, żeby nie gryzło się z głównym modelem
-  ], { windowsHide: true });
+    "--no-jinja",
+    "--chat-template", "vicuna",
+    "-ngl", "0", // Na razie CPU, żeby nie gryzło się z głównym modelem
+  ];
+
+  let child;
+  try {
+    child = spawn(serverExe, args, {
+      cwd: path.dirname(serverExe),
+      stdio: ["ignore", outLog, errLog],
+      windowsHide: true,
+    });
+  } finally {
+    try { fs.closeSync(outLog); } catch { /* ignore */ }
+    try { fs.closeSync(errLog); } catch { /* ignore */ }
+  }
 
   visionServerProcess = child;
   child.on("exit", () => { if (visionServerProcess === child) visionServerProcess = null; });
 
-  for (let i = 0; i < 60; i++) {
+  for (let i = 0; i < 90; i++) {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      const logTail = readLogTail(errLogPath) || readLogTail(outLogPath);
+      throw new Error(`Serwer wizji zakonczyl prace przed startem API (kod ${child.exitCode ?? child.signalCode}).${logTail ? `\n${textPreview(logTail, 1600)}` : ""}`);
+    }
     try {
-      const res = await fetch(`http://127.0.0.1:${VISION_PORT}/health`);
+      const res = await fetch(`http://127.0.0.1:${VISION_PORT}/health`, { signal: AbortSignal.timeout(1500) });
       if (res.ok) return;
     } catch {}
     await sleep(1000);
   }
-  throw new Error("Serwer wizji nie wystartował w terminie.");
+  const logTail = readLogTail(errLogPath) || readLogTail(outLogPath);
+  throw new Error(`Serwer wizji nie wystartował w terminie.${logTail ? `\n${textPreview(logTail, 1600)}` : ""}`);
 }
 
 async function runVisionSupport(imagePath, prompt) {
@@ -2268,61 +2335,217 @@ async function runVisionSupport(imagePath, prompt) {
   await ensureVisionServer();
 
   const imageBase64 = fs.readFileSync(imagePath).toString("base64");
-  const finalPrompt = `Question: ${prompt}\n\nAnswer:`;
+  const ext = path.extname(imagePath).toLowerCase();
+  const mimeType = ext === ".jpg" || ext === ".jpeg" ? "image/jpeg" : ext === ".webp" ? "image/webp" : "image/png";
+  const question = compactWhitespace(prompt) || "Describe this image.";
 
-  const response = await fetch(`http://127.0.0.1:${VISION_PORT}/completion`, {
+  const response = await fetch(`http://127.0.0.1:${VISION_PORT}/v1/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      prompt: finalPrompt,
-      image_data: [{ data: imageBase64, id: 0 }],
-      n_predict: 512,
+      model: "moondream2",
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: question },
+          { type: "image_url", image_url: { url: `data:${mimeType};base64,${imageBase64}` } },
+        ],
+      }],
+      max_tokens: 512,
       temperature: 0.2,
-      stop: ["Question:", "User:", "<|im_end|>"]
-    })
+    }),
+    signal: AbortSignal.timeout(180000),
   });
 
-  if (!response.ok) throw new Error(`Błąd serwera wizji: ${response.status}`);
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new Error(`Błąd serwera wizji: ${response.status}${body ? ` ${textPreview(body, 800)}` : ""}`);
+  }
   const data = await response.json();
-  return data.content.trim();
+  const content = data?.choices?.[0]?.message?.content ?? data?.content ?? "";
+  const description = String(content).trim();
+  if (!description) throw new Error("Serwer wizji zwrocil pusta odpowiedz.");
+  return description;
 }
 
 let messages = createInitialMessages();
 
-function compactMessages() {
-  if (messages.length <= MAX_MESSAGES) return;
-  // Keep system prompt + summarize old messages + keep recent ones
-  const systemMsg = messages[0];
-  const keepRecent = Math.min(Math.floor(MAX_MESSAGES * 0.6), MAX_MESSAGES - 2);
-  const oldMessages = messages.slice(1, messages.length - keepRecent);
-  const recentMessages = messages.slice(-keepRecent);
-  // Create summary of old context
-  let summaryParts = [];
-  for (const msg of oldMessages) {
-    if (msg.role === "user") {
-      let rawText = "";
-      if (Array.isArray(msg.content)) {
-        rawText = msg.content.find(c => c.type === "text")?.text || "[Obraz]";
-      } else {
-        rawText = String(msg.content || "");
-      }
-      const text = rawText.slice(0, 150);
-      if (text.startsWith("Wynik narzedzia")) continue; // skip tool results
-      summaryParts.push(`Uzytkownik: ${text}`);
-    } else if (msg.role === "assistant") {
-      try {
-        const parsed = JSON.parse(msg.content);
-        if (parsed.final) summaryParts.push(`Agent zakonczyl: ${String(parsed.final).slice(0, 100)}`);
-        else if (parsed.note) summaryParts.push(`Agent: ${parsed.note}`);
-      } catch { summaryParts.push(`Agent: ${String(msg.content).slice(0, 80)}`); }
+function compactWhitespace(value) {
+  return String(value ?? "").replace(/\s+/g, " ").trim();
+}
+
+function messageContentToText(content) {
+  if (Array.isArray(content)) {
+    const textPart = content.find((part) => part && part.type === "text");
+    return textPart?.text ? String(textPart.text) : "[Obraz lub zalacznik]";
+  }
+  if (typeof content === "string") return content;
+  try {
+    return JSON.stringify(content ?? "");
+  } catch {
+    return String(content ?? "");
+  }
+}
+
+function summarizeToolResultForCompaction(text) {
+  const raw = String(text ?? "");
+  if (!raw.startsWith("Wynik narzedzia")) return null;
+  const jsonStart = raw.indexOf("\n");
+  if (jsonStart < 0) return "Narzędzie: wynik bez danych.";
+  try {
+    const payload = JSON.parse(raw.slice(jsonStart + 1));
+    if (!payload.ok) {
+      const error = compactWhitespace(payload.error).slice(0, 220);
+      const hint = payload.recoveryHint ? `; obejscie: ${compactWhitespace(payload.recoveryHint).slice(0, 220)}` : "";
+      return `Narzędzie: blad: ${error}${hint}`;
+    }
+
+    const result = payload.result;
+    if (result == null) return "Narzędzie: ok.";
+    if (typeof result !== "object" || Array.isArray(result)) {
+      return `Narzędzie: ok: ${compactWhitespace(result).slice(0, 260)}`;
+    }
+
+    const importantKeys = [
+      "path", "cwd", "file", "target", "url", "status", "exitCode",
+      "stdout", "stderr", "output", "summary", "message", "bytes", "savedAs",
+    ];
+    const reduced = {};
+    for (const key of importantKeys) {
+      if (!(key in result)) continue;
+      const value = result[key];
+      if (typeof value === "string") reduced[key] = textPreview(value, 360);
+      else reduced[key] = value;
+    }
+    const summary = Object.keys(reduced).length ? reduced : result;
+    return `Narzędzie: ok: ${textPreview(JSON.stringify(summary), 520)}`;
+  } catch {
+    return `Narzędzie: ${compactWhitespace(raw).slice(0, 260)}`;
+  }
+}
+
+function summarizeMessageForCompaction(msg) {
+  const text = messageContentToText(msg.content);
+  if (msg.role === "user") {
+    const toolSummary = summarizeToolResultForCompaction(text);
+    if (toolSummary) return toolSummary;
+    if (text.startsWith("[Kompaktowanie kontekstu]")) {
+      return `Wczesniejsze podsumowanie: ${compactWhitespace(text).slice(0, 520)}`;
+    }
+    return `Uzytkownik: ${compactWhitespace(text).slice(0, 320)}`;
+  }
+  if (msg.role === "assistant") {
+    try {
+      const parsed = JSON.parse(text);
+      const parts = [];
+      if (parsed.note) parts.push(`note=${compactWhitespace(parsed.note).slice(0, 160)}`);
+      if (parsed.tool) parts.push(`tool=${parsed.tool}`);
+      if (parsed.final) parts.push(`final=${compactWhitespace(parsed.final).slice(0, 220)}`);
+      return parts.length ? `Agent: ${parts.join("; ")}` : `Agent: ${compactWhitespace(text).slice(0, 220)}`;
+    } catch {
+      return `Agent: ${compactWhitespace(text).slice(0, 220)}`;
     }
   }
-  const summaryText = summaryParts.length > 0
-    ? `[Kompaktowanie kontekstu] Podsumowanie wczesniejszej rozmowy:\n${summaryParts.slice(-10).join("\n")}`
-    : "[Kompaktowanie kontekstu] Wczesniejsze wiadomosci zostaly usuniete.";
-  const summaryMsg = { role: "user", content: summaryText };
-  messages = [systemMsg, summaryMsg, ...recentMessages];
-  emit("status", { status: "context-compacted", detail: `Skompaktowano kontekst: ${messages.length} wiadomosci.` });
+  return `${msg.role || "wiadomosc"}: ${compactWhitespace(text).slice(0, 220)}`;
+}
+
+function buildCompactionSummary(oldMessages, contextTokensLimit) {
+  const maxSummaryChars = Math.max(1200, Math.min(12000, Math.floor(contextTokensLimit * 0.16 * 3.5)));
+  const summaryParts = oldMessages.map(summarizeMessageForCompaction).filter(Boolean);
+  if (!summaryParts.length) {
+    return { role: "user", content: "[Kompaktowanie kontekstu] Wczesniejsze wiadomosci zostaly usuniete." };
+  }
+  const visibleParts = summaryParts.slice(-28);
+  const omitted = summaryParts.length - visibleParts.length;
+  const header = `[Kompaktowanie kontekstu] Podsumowanie wczesniejszej rozmowy (${oldMessages.length} wiadomosci).`;
+  const omittedLine = omitted > 0 ? `Pominieto bardzo stare punkty: ${omitted}.` : "";
+  const content = [header, omittedLine, ...visibleParts].filter(Boolean).join("\n");
+  return { role: "user", content: textPreview(content, maxSummaryChars) };
+}
+
+function shrinkRetainedMessageForCompaction(msg, maxChars) {
+  const text = messageContentToText(msg.content);
+  if (text.length <= maxChars) return msg;
+  const toolSummary = summarizeToolResultForCompaction(text);
+  if (toolSummary) {
+    return {
+      role: msg.role,
+      content: `Wynik narzedzia zostal skrocony podczas kompaktowania kontekstu:\n${toolSummary}`,
+    };
+  }
+  return {
+    role: msg.role,
+    content: `${textPreview(text, maxChars)}\n[Skrocono podczas kompaktowania kontekstu.]`,
+  };
+}
+
+function compactMessages() {
+  const tokens = estimateTokens(messages);
+  const contextTokensLimit = clampContextTokens(customModelSettings.contextTokens ?? getModelConfig().contextTokens ?? 8192);
+  const overTokens = tokens > contextTokensLimit * 0.85;
+  if (messages.length <= MAX_MESSAGES && !overTokens) return;
+
+  const systemMsg = { role: "system", content: createSystemPrompt() };
+  const maxRecentMessages = Math.max(1, MAX_MESSAGES - 2);
+  const minRecentMessages = Math.min(6, maxRecentMessages);
+  const targetTokens = Math.max(MIN_CONTEXT_TOKENS, Math.floor(contextTokensLimit * 0.65));
+  const placeholderSummary = { role: "user", content: "[Kompaktowanie kontekstu] Podsumowanie poprzednich krokow." };
+
+  let recentStart = messages.length;
+  let recentMessages = [];
+  for (let i = messages.length - 1; i >= 1; i -= 1) {
+    const candidateRecent = [messages[i], ...recentMessages];
+    const candidate = [systemMsg, placeholderSummary, ...candidateRecent];
+    const underTokenTarget = estimateTokens(candidate) <= targetTokens;
+    const underMessageLimit = candidate.length <= MAX_MESSAGES && candidateRecent.length <= maxRecentMessages;
+    const keepMinimum = candidateRecent.length <= minRecentMessages;
+    if ((underTokenTarget && underMessageLimit) || keepMinimum) {
+      recentMessages = candidateRecent;
+      recentStart = i;
+    } else {
+      break;
+    }
+  }
+
+  let oldMessages = messages.slice(1, recentStart);
+  let summaryMsg = buildCompactionSummary(oldMessages, contextTokensLimit);
+  let nextMessages = [systemMsg, summaryMsg, ...recentMessages];
+
+  while ((nextMessages.length > MAX_MESSAGES || estimateTokens(nextMessages) > targetTokens) && recentMessages.length > minRecentMessages) {
+    oldMessages.push(recentMessages.shift());
+    summaryMsg = buildCompactionSummary(oldMessages, contextTokensLimit);
+    nextMessages = [systemMsg, summaryMsg, ...recentMessages];
+  }
+
+  if (estimateTokens(nextMessages) > contextTokensLimit * 0.9) {
+    const normalRecentLimit = Math.max(1800, Math.floor(contextTokensLimit * 0.08 * 3.5));
+    const latestLimit = Math.max(3000, Math.floor(contextTokensLimit * 0.22 * 3.5));
+    recentMessages = recentMessages.map((msg, index) => {
+      const limit = index === recentMessages.length - 1 ? latestLimit : normalRecentLimit;
+      return shrinkRetainedMessageForCompaction(msg, limit);
+    });
+    nextMessages = [systemMsg, summaryMsg, ...recentMessages];
+  }
+
+  while (estimateTokens(nextMessages) > contextTokensLimit * 0.9 && recentMessages.length > 1) {
+    oldMessages.push(recentMessages.shift());
+    summaryMsg = buildCompactionSummary(oldMessages, contextTokensLimit);
+    nextMessages = [systemMsg, summaryMsg, ...recentMessages];
+  }
+
+  if (estimateTokens(nextMessages) > contextTokensLimit * 0.9 && recentMessages.length === 1) {
+    const baseTokens = estimateTokens([systemMsg, summaryMsg]);
+    const remainingChars = Math.max(1200, Math.floor((contextTokensLimit * 0.84 - baseTokens) * 3.5));
+    recentMessages = [shrinkRetainedMessageForCompaction(recentMessages[0], remainingChars)];
+    nextMessages = [systemMsg, summaryMsg, ...recentMessages];
+  }
+
+  const afterTokens = estimateTokens(nextMessages);
+  messages = nextMessages;
+  emit("status", {
+    status: "context-compacted",
+    detail: `Skompaktowano kontekst: ${tokens} -> ${afterTokens} tokenow, ${messages.length} wiadomosci.`,
+  });
 }
 
 async function runAgent(userText) {
@@ -2481,6 +2704,7 @@ function createWindow() {
     minHeight: 640,
     backgroundColor: "#1a1a2e",
     title: "EndoCode",
+    icon: path.join(__dirname, "assets", "icon.ico"),
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,

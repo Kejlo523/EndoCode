@@ -18,11 +18,13 @@
     "appId": "dev.endocode.app",
     "productName": "EndoCode",
     "asar": false,
+    "icon": "src/assets/icon",
     "files": [
       "src/**/*",
       "package.json"
     ],
     "win": {
+      "icon": "src/assets/icon.ico",
       "target": [
         "dir"
       ],

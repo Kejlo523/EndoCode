@@ -482,11 +482,7 @@ async function startNewChat() {
   ws.id = "welcomeScreen";
   ws.innerHTML = `
     <div class="welcome-icon">
-      <svg viewBox="0 0 48 48" fill="none" width="56" height="56">
-        <defs><linearGradient id="wg2" x1="10" y1="10" x2="38" y2="38"><stop offset="0%" stop-color="#00d4aa"/><stop offset="100%" stop-color="#00b4d8"/></linearGradient></defs>
-        <path d="M12 16 L20 24 L12 32" stroke="url(#wg2)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
-        <path d="M24 16 L36 16 M24 24 L34 24 M24 32 L36 32 M24 16 L24 32" stroke="url(#wg2)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
-      </svg>
+      <img src="../assets/icon.svg" alt="" width="56" height="56" />
     </div>
     <h2>Co chcesz zbudować?</h2>
     <p class="welcome-sub">Opisz zadanie — EndoCode przeczyta pliki, zaproponuje zmiany i uruchomi komendy.</p>
@@ -568,13 +564,31 @@ async function updateSystemMonitor() {
 async function updateContextInfo() {
   try {
     const info = await window.endocode.getContextInfo();
-    contextText.textContent = `${info.messageCount} / ${info.maxMessages} wiadomości`;
+    
+    const tokensLabel = (info.estimatedTokens / 1000).toFixed(1) + "k";
+    const maxTokensLabel = (info.maxTokens / 1000).toFixed(1) + "k";
+    contextText.textContent = `${tokensLabel} / ${maxTokensLabel} tok. (${info.messageCount} wiad.)`;
+
+    const percent = Math.min(1, Math.max(0, info.estimatedTokens / (info.maxTokens || 1)));
+    const offset = 37.7 - (percent * 37.7);
+    const circle = document.getElementById("contextCircle");
+    if (circle) {
+      circle.style.strokeDashoffset = offset.toFixed(1);
+      if (percent > 0.85) {
+        circle.style.stroke = "#ef4444";
+      } else if (percent > 0.6) {
+        circle.style.stroke = "#f59e0b";
+      } else {
+        circle.style.stroke = "currentColor";
+      }
+    }
+
     if (info.isNearCompaction) {
       contextIndicator.classList.add("warning");
-      contextIndicator.title = "Blisko kompaktowania! Stare wiadomości zostaną usunięte.";
+      contextIndicator.title = "Blisko kompaktowania! (Agresywne skracanie)";
     } else {
       contextIndicator.classList.remove("warning");
-      contextIndicator.title = "Kontekst rozmowy";
+      contextIndicator.title = `Kontekst rozmowy: ${info.estimatedTokens} / ${info.maxTokens} tokenów`;
     }
   } catch { /* ignore */ }
 }
@@ -907,6 +921,14 @@ window.endocode.onEvent((event) => {
       addInlineEvent("error", "Fallback modelu", event.detail || "Model zapasowy nie wystartował.");
     } else if (event.status === "skills-changed") {
       showLive("Skills", event.detail || "");
+    } else if (event.status === "context-compacted") {
+      addInlineEvent("note", "Kontekst", event.detail || "Skompaktowano kontekst rozmowy.");
+      showLive("Kontekst", event.detail || "");
+      updateContextInfo();
+    } else if (event.status === "vision-analysis") {
+      showLive("Vision", event.detail || "Analizuję obraz...");
+    } else if (event.status === "downloading") {
+      showLive("Pobieranie", event.detail || "");
     } else if (event.status === "server-killing") showLive("Kill switch...", event.detail || "");
     else if (event.status === "server-killed") showLive("Kill switch", event.detail || "");
     else if (event.status === "server-starting" || event.status === "server-stopping") showLive("Runtime modelu", event.detail || "");
@@ -978,8 +1000,9 @@ window.endocode.onEvent((event) => {
   if (event.type === "tool-start") {
     removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
     const label = toolActionLabel(event.tool, event.args);
-    addInlineEvent("tool", label, toolActionDetail(event.tool, event.args, event.note || ""));
-    showLive(label);
+    const detail = toolActionDetail(event.tool, event.args, event.note || "");
+    addInlineEvent("tool", label, detail);
+    showLive(label, detail);
     return;
   }
   if (event.type === "tool-result") {
