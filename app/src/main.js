@@ -247,6 +247,9 @@ let currentChatId = null;
 const VISION_PORT = 11435;
 let previousCpuInfo = os.cpus();
 let nvidiaSmiAvailable = null;
+const GPU_PROBE_INTERVAL_MS = 15000;
+let lastGpuProbeAt = 0;
+let gpuProbeCache = { gpuPercent: -1, vramUsedMB: -1, vramTotalMB: -1 };
 
 let activeDownloads = new Map();
 // Custom model settings (overrides per-reasoning defaults when set)
@@ -628,28 +631,7 @@ async function installRecommendedSkills() {
   return getSkillsForUi();
 }
 
-function getSystemInfo() {
-  const cpus = os.cpus();
-  let cpuPercent = 0;
-  if (previousCpuInfo && previousCpuInfo.length === cpus.length) {
-    let totalIdle = 0, totalTick = 0;
-    for (let i = 0; i < cpus.length; i++) {
-      const prev = previousCpuInfo[i].times;
-      const curr = cpus[i].times;
-      const idle = curr.idle - prev.idle;
-      const total = (curr.user - prev.user) + (curr.nice - prev.nice) + (curr.sys - prev.sys) + (curr.irq - prev.irq) + idle;
-      totalIdle += idle;
-      totalTick += total;
-    }
-    cpuPercent = totalTick > 0 ? Math.round(((totalTick - totalIdle) / totalTick) * 100) : 0;
-  }
-  previousCpuInfo = cpus;
-
-  const totalMem = os.totalmem();
-  const freeMem = os.freemem();
-  const usedMem = totalMem - freeMem;
-  const ramPercent = Math.round((usedMem / totalMem) * 100);
-
+function probeGpuInfo() {
   let gpuPercent = -1;
   let vramUsedMB = -1;
   let vramTotalMB = -1;
@@ -705,15 +687,46 @@ function getSystemInfo() {
     }
   }
 
+  return { gpuPercent, vramUsedMB, vramTotalMB };
+}
+
+function getSystemInfo() {
+  const cpus = os.cpus();
+  let cpuPercent = 0;
+  if (previousCpuInfo && previousCpuInfo.length === cpus.length) {
+    let totalIdle = 0, totalTick = 0;
+    for (let i = 0; i < cpus.length; i++) {
+      const prev = previousCpuInfo[i].times;
+      const curr = cpus[i].times;
+      const idle = curr.idle - prev.idle;
+      const total = (curr.user - prev.user) + (curr.nice - prev.nice) + (curr.sys - prev.sys) + (curr.irq - prev.irq) + idle;
+      totalIdle += idle;
+      totalTick += total;
+    }
+    cpuPercent = totalTick > 0 ? Math.round(((totalTick - totalIdle) / totalTick) * 100) : 0;
+  }
+  previousCpuInfo = cpus;
+
+  const totalMem = os.totalmem();
+  const freeMem = os.freemem();
+  const usedMem = totalMem - freeMem;
+  const ramPercent = Math.round((usedMem / totalMem) * 100);
+
+  const now = Date.now();
+  if (now - lastGpuProbeAt >= GPU_PROBE_INTERVAL_MS || lastGpuProbeAt === 0) {
+    gpuProbeCache = probeGpuInfo();
+    lastGpuProbeAt = now;
+  }
+
   return {
     cpu: cpuPercent,
-    gpu: gpuPercent,
+    gpu: gpuProbeCache.gpuPercent,
     ramPercent,
     ramUsedGB: (usedMem / 1073741824).toFixed(1),
     ramTotalGB: (totalMem / 1073741824).toFixed(1),
-    vramUsedMB,
-    vramTotalMB,
-    vramPercent: vramTotalMB > 0 ? Math.round((vramUsedMB / vramTotalMB) * 100) : -1,
+    vramUsedMB: gpuProbeCache.vramUsedMB,
+    vramTotalMB: gpuProbeCache.vramTotalMB,
+    vramPercent: gpuProbeCache.vramTotalMB > 0 ? Math.round((gpuProbeCache.vramUsedMB / gpuProbeCache.vramTotalMB) * 100) : -1,
   };
 }
 
