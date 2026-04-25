@@ -5,7 +5,7 @@ Desktopowy interfejs do lokalnych modeli kodujacych GGUF.
 Modele sa definiowane w:
 
 ```text
-C:\Users\Kejlo\Desktop\bielik\config\models.json
+config\models.json
 ```
 
 Wybor modelu i intensywnosci pracy jest dostepny w gornej belce aplikacji. Zmiana modelu resetuje kontekst rozmowy i restartuje lokalny `llama-server`.
@@ -15,7 +15,7 @@ Modele moga miec dodatkowe parametry startowe, np. `reasoning: "off"` dla modeli
 ## Dev
 
 ```powershell
-cd C:\Users\Kejlo\Desktop\bielik\app
+\app
 npm install
 npm start
 ```
