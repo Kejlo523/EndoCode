@@ -9,3 +9,6 @@ __pycache__/
 app/node_modules/
 app/dist/
 app/*.log
+config/chat-history.json
+config/endocode-state.json
+config/skills.json
