@@ -4055,7 +4055,6 @@ async function performDownload(url, dest, modelId) {
         });
       });
 
-      request.setTimeout(30000, () => request.destroy(new Error("Timeout pobierania modelu.")));
       request.on("error", (err) => {
         fs.unlink(tempDest, () => {});
         activeDownloads.delete(modelId);
