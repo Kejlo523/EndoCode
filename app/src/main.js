@@ -3537,9 +3537,9 @@ function createDirectUrlResult(rawUrl, profile) {
 }
 
 async function searchHuggingFaceModels(options, profile) {
-  const query = String(options.query || "coder").trim();
-  const hfQuery = `${query || "coder"} gguf${filterQuerySuffix(options.filter)}`.trim();
-  const url = `https://huggingface.co/api/models?search=${encodeURIComponent(hfQuery)}&filter=gguf&sort=downloads&direction=-1&limit=18&full=true`;
+  const baseQuery = String(options.query || "").trim();
+  const hfQuery = `${baseQuery} gguf ${filterQuerySuffix(options.filter)}`.trim() || "gguf";
+  const url = `https://huggingface.co/api/models?search=${encodeURIComponent(hfQuery)}&filter=gguf&sort=downloads&direction=-1&limit=20&full=true`;
   const data = await fetchJson(url);
   return data.map((model) => {
     const siblings = Array.isArray(model.siblings) ? model.siblings : [];
@@ -3620,37 +3620,86 @@ async function getModelScopeRepoResult(repoId, profile) {
 
 async function searchModelSources(options = {}) {
   const source = options.source || "all";
-  const query = String(options.query || "").trim();
+  const query = String(options.query || "").trim().toLowerCase();
+  const filter = options.filter || "all";
   const profile = getHardwareModelProfile();
   const results = [];
 
-  if (/^https?:\/\/.+\.gguf(?:[?#].*)?$/i.test(query)) {
-    results.push(createDirectUrlResult(query, profile));
-  } else {
-    if (source === "all" || source === "huggingface") {
-      results.push(...await searchHuggingFaceModels(options, profile));
-    }
-    if (source === "all" || source === "modelscope") {
-      const repoId = parseModelScopeRepoQuery(query);
-      if (repoId) {
-        try {
-          results.push(await getModelScopeRepoResult(repoId, profile));
-        } catch (error) {
-          results.push({ ...buildExternalSourceCard("modelscope", query), description: `Nie udało się pobrać metadanych repo: ${error.message}` });
-        }
-      } else {
-        results.push(buildExternalSourceCard("modelscope", query || "gguf"));
-      }
-    }
-    if (source === "all" || source === "github") {
-      results.push(buildExternalSourceCard("github", query || "gguf"));
+  // 1. Search Presets (the "gotowe linki")
+  if (source === "all" || source === "presets" || source === "huggingface") {
+    const presets = loadModelPresets();
+    const filteredPresets = presets.filter(p => {
+      const text = `${p.displayName} ${p.id} ${p.description} ${p.category} ${p.source}`.toLowerCase();
+      const matchesQuery = !query || text.includes(query);
+      const matchesFilter = filter === "all" || p.category === filter;
+      return matchesQuery && matchesFilter;
+    });
+
+    results.push(...filteredPresets.map(p => {
+      const fit = scoreModelFit({
+        name: p.displayName,
+        fileName: p.file || p.fileName,
+        sizeBytes: p.expectedBytes
+      }, profile);
+      return {
+        id: `preset:${p.id}`,
+        repoId: p.source,
+        source: "presets",
+        sourceLabel: "Polecane",
+        author: p.author || "EndoCode",
+        name: p.displayName,
+        description: p.description || `Model z Twojej listy polecanych. ${fit.fitLabel}`,
+        tags: [p.category, ...(p.tags || [])],
+        recommended: true,
+        recommendation: fit,
+        files: [],
+        fileName: p.file || p.fileName,
+        expectedBytes: p.expectedBytes,
+        downloadUrl: p.downloadUrl || (p.source ? `https://huggingface.co/${p.source}/resolve/main/${p.file || p.fileName}` : ""),
+        openUrl: p.source ? `https://huggingface.co/${p.source}` : "",
+        canDownload: true,
+        hardwareProfile: profile.target
+      };
+    }));
+  }
+
+  // 2. Search External
+  if (source === "all" || source === "huggingface") {
+    try {
+      const hfResults = await searchHuggingFaceModels(options, profile);
+      // Avoid duplicates with presets
+      const presetRepos = new Set(results.map(r => r.repoId));
+      results.push(...hfResults.filter(r => !presetRepos.has(r.repoId)));
+    } catch (e) {
+      console.error("HF Search error:", e);
     }
   }
 
+  if (query && (source === "all" || source === "modelscope")) {
+    const repoId = parseModelScopeRepoQuery(query);
+    if (repoId) {
+      try {
+        results.push(await getModelScopeRepoResult(repoId, profile));
+      } catch (error) {
+        results.push({ ...buildExternalSourceCard("modelscope", query), description: `Błąd ModelScope: ${error.message}` });
+      }
+    } else if (source === "modelscope") {
+      results.push(buildExternalSourceCard("modelscope", query));
+    }
+  }
+
+  if (query && (source === "all" || source === "github")) {
+    results.push(buildExternalSourceCard("github", query));
+  }
+
+  // Sort: Presets first, then by recommendation score
   return results
-    .sort((a, b) => Number(b.recommended) - Number(a.recommended) || ((b.recommendation?.score || 0) - (a.recommendation?.score || 0)))
-    .slice(0, 24)
-    .map((result) => ({ ...result, hardwareProfile: profile.target }));
+    .sort((a, b) => {
+      if (a.source === "presets" && b.source !== "presets") return -1;
+      if (a.source !== "presets" && b.source === "presets") return 1;
+      return (Number(b.recommended) - Number(a.recommended)) || ((b.recommendation?.score || 0) - (a.recommendation?.score || 0));
+    })
+    .slice(0, 30);
 }
 
 ipcMain.handle("app:search-models", async (_event, options) => searchModelSources(options));
