@@ -445,6 +445,7 @@ async function switchToChat(chatId) {
     } else {
       await refreshState();
     }
+    await window.endocode.loadChatContext(chatId);
     chatTitle.textContent = session.title || "Czat";
     firstUserMessage = session.title || null;
     // Replay all stored entries
@@ -913,6 +914,8 @@ window.endocode.onEvent((event) => {
     else if (event.status === "model-call-retry") {
       addInlineEvent("note", "Runtime modelu", event.detail || "Ponawiam po błędzie modelu.");
       showLive("Restart modelu...", event.detail || "");
+    } else if (event.status === "model-action-ready") {
+      showLive("Akcja gotowa", event.detail || "");
     } else if (event.status === "model-fallback") {
       addInlineEvent("note", "Fallback modelu", event.detail || "Przełączam model.");
       showLive("Fallback modelu...", event.detail || "");
@@ -991,6 +994,10 @@ window.endocode.onEvent((event) => {
   }
   if (event.type === "content-delta") {
     const preview = (event.full || event.text || "").trim().slice(0, 50000);
+    if (!event.plainChat) {
+      showLive("Model wybiera akcję...");
+      return;
+    }
     const writingLabel = event.plainChat ? "Odpowiedź" : "Model pisze";
     const livePhrase = event.plainChat ? "Pisze…" : "Model pisze...";
     if (preview) upsertInlineEvent(MODEL_WRITING_ACTIVITY_ID, "activity", writingLabel, preview);

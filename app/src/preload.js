@@ -17,6 +17,7 @@ contextBridge.exposeInMainWorld("endocode", {
   setAccessLevel: (level) => ipcRenderer.invoke("app:set-access-level", level),
   saveChat: (session) => ipcRenderer.invoke("app:save-chat", session),
   loadChats: () => ipcRenderer.invoke("app:load-chats"),
+  loadChatContext: (chatId) => ipcRenderer.invoke("app:load-chat-context", chatId),
   deleteChat: (chatId) => ipcRenderer.invoke("app:delete-chat", chatId),
   listSkills: () => ipcRenderer.invoke("app:list-skills"),
   installSkill: (skillId) => ipcRenderer.invoke("app:install-skill", skillId),
