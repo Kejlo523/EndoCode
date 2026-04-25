@@ -152,6 +152,11 @@
         </div>
       </header>
 
+      <div class="runtime-warning hidden" id="runtimeWarning">
+        <strong>Brak llama.cpp</strong>
+        <span>Nie znaleziono runtime/llama-server.exe. Zainstaluj runtime llama.cpp w folderze runtime.</span>
+      </div>
+
       <section class="conversation-area" id="conversationArea">
         <div class="conversation-scroll" id="conversation">
           <!-- Welcome screen shown when empty -->
@@ -279,15 +284,46 @@
         <span class="modal-title">Biblioteka Modeli</span>
         <button class="modal-close" id="closeModels">&times;</button>
       </div>
-      <div class="models-toolbar">
-        <div class="models-import-group">
-          <input type="text" id="hfModelUrl" placeholder="Link do GGUF z HuggingFace..." />
-          <button class="modal-btn approve" id="addHfModel">Dodaj</button>
-        </div>
-        <span class="models-status" id="modelsStatus">Wszystkie systemy gotowe</span>
+      <div class="models-tabs">
+        <button class="model-tab-btn active" id="tabLibrary">Moja Biblioteka</button>
+        <button class="model-tab-btn" id="tabDiscover">Odkrywaj</button>
       </div>
-      <div class="models-list" id="modelsList">
-        <div class="models-empty">Ładowanie katalogu...</div>
+
+      <div id="modelsLibraryView">
+        <div class="models-toolbar">
+          <div class="models-import-group">
+            <input type="text" id="hfModelUrl" placeholder="Wklej link .gguf z HF, ModelScope, GitHub lub direct..." />
+            <button class="modal-btn approve" id="addHfModel">Dodaj</button>
+          </div>
+          <span class="models-status" id="modelsStatus">Wszystkie systemy gotowe</span>
+        </div>
+        <div class="models-list" id="modelsList">
+          <div class="models-empty">Ładowanie katalogu...</div>
+        </div>
+      </div>
+
+      <div id="modelsDiscoverView" class="hidden">
+        <div class="models-toolbar">
+          <div class="models-import-group">
+            <select id="modelSourceSelect" class="models-source-select">
+              <option value="all">Wszystkie źródła</option>
+              <option value="huggingface">Hugging Face</option>
+              <option value="modelscope">ModelScope</option>
+              <option value="github">GitHub / direct</option>
+            </select>
+            <input type="text" id="hfSearchInput" placeholder="Szukaj modeli albo wklej link/repo .gguf..." />
+            <button class="modal-btn" id="hfSearchBtn">Szukaj</button>
+          </div>
+          <div class="models-filters">
+             <button class="filter-btn active" data-filter="all">Wszystkie</button>
+             <button class="filter-btn" data-filter="small">Małe (7B)</button>
+             <button class="filter-btn" data-filter="medium">Średnie (14B)</button>
+             <button class="filter-btn" data-filter="large">Duże (30B+)</button>
+          </div>
+        </div>
+        <div class="discovery-list" id="discoveryList">
+          <div class="models-empty">Kliknij szukaj, aby przeglądać modele GGUF...</div>
+        </div>
       </div>
     </div>
   </div>

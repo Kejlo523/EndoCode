@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, ipcMain } = require("electron");
+const { app, BrowserWindow, dialog, ipcMain, shell } = require("electron");
 const path = require("node:path");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
@@ -630,6 +630,168 @@ function getSystemInfo() {
     vramTotalMB,
     vramPercent: vramTotalMB > 0 ? Math.round((vramUsedMB / vramTotalMB) * 100) : -1,
   };
+}
+
+function getHardwareModelProfile() {
+  const info = getSystemInfo();
+  const ramGB = Number(info.ramTotalGB) || Math.round(os.totalmem() / 1073741824);
+  const vramGB = info.vramTotalMB > 0 ? info.vramTotalMB / 1024 : 0;
+  let target = "1B-3B Q4";
+  let maxParamB = 3;
+  if (vramGB >= 20 || ramGB >= 64) {
+    target = "14B-30B Q4";
+    maxParamB = 30;
+  } else if (vramGB >= 11 || ramGB >= 32) {
+    target = "7B-14B Q4/Q5";
+    maxParamB = 14;
+  } else if (vramGB >= 6 || ramGB >= 16) {
+    target = "3B-8B Q4/Q5";
+    maxParamB = 8;
+  }
+  return {
+    ...info,
+    ramGB,
+    vramGB,
+    target,
+    maxParamB,
+    memoryBudgetGB: Math.max(2, ramGB * 0.55),
+    fastBudgetGB: vramGB > 0 ? Math.max(1, vramGB * 0.85) : 0,
+    hasNvidiaGpu: vramGB > 0,
+  };
+}
+
+function inferParamB(...values) {
+  const text = values.filter(Boolean).join(" ").toLowerCase();
+  const matches = [...text.matchAll(/(\d+(?:\.\d+)?)\s*b\b/g)].map((m) => Number(m[1])).filter(Number.isFinite);
+  if (!matches.length) return null;
+  return Math.max(...matches);
+}
+
+function inferQuant(fileName = "") {
+  const text = String(fileName).toUpperCase();
+  const match = text.match(/(?:^|[-_.])((?:IQ\d+_[A-Z0-9]+)|(?:Q\d(?:_\d)?(?:_[A-Z0-9]+)?))/);
+  return match ? match[1] : "";
+}
+
+function formatBytes(bytes) {
+  const value = Number(bytes || 0);
+  if (!value) return "";
+  if (value >= 1073741824) return `${(value / 1073741824).toFixed(1)} GB`;
+  if (value >= 1048576) return `${(value / 1048576).toFixed(0)} MB`;
+  return `${value} B`;
+}
+
+function scoreModelFit({ name, description, fileName, sizeBytes }, profile) {
+  const paramB = inferParamB(name, description, fileName);
+  const quant = inferQuant(fileName);
+  const sizeGB = Number(sizeBytes || 0) / 1073741824;
+  let score = 35;
+  const notes = [];
+
+  if (paramB) {
+    if (paramB <= profile.maxParamB) {
+      score += 24;
+      notes.push(`${paramB}B pasuje do profilu ${profile.target}`);
+    } else if (paramB <= profile.maxParamB * 1.6 && profile.ramGB >= 32) {
+      score += 8;
+      notes.push(`${paramB}B ruszy, ale może być wolniejszy`);
+    } else {
+      score -= 24;
+      notes.push(`${paramB}B wygląda za ciężko dla tej maszyny`);
+    }
+  }
+
+  if (sizeGB > 0) {
+    if (profile.fastBudgetGB > 0 && sizeGB <= profile.fastBudgetGB) {
+      score += 24;
+      notes.push(`plik ${sizeGB.toFixed(1)} GB mieści się w VRAM`);
+    } else if (sizeGB <= profile.memoryBudgetGB) {
+      score += 16;
+      notes.push(`plik ${sizeGB.toFixed(1)} GB mieści się w RAM`);
+    } else {
+      score -= 28;
+      notes.push(`plik ${sizeGB.toFixed(1)} GB przekracza komfortowy budżet RAM`);
+    }
+  }
+
+  if (/Q4_K_M|Q5_K_M|Q4_0|IQ4/i.test(quant)) score += 12;
+  else if (/Q8|F16|BF16/i.test(quant)) score -= 8;
+
+  return {
+    score,
+    recommended: score >= 62,
+    paramB,
+    quant,
+    fitLabel: notes[0] || `Profil: ${profile.target}`,
+    fitNotes: notes,
+  };
+}
+
+function normalizeGgufFile(file, profile, context = {}) {
+  const fileName = file.rfilename || file.Path || file.path || file.name || file.Name || "";
+  const sizeBytes = Number(file.size || file.Size || file.file_size || file.fileSize || 0);
+  const fit = scoreModelFit({
+    name: context.name,
+    description: context.description,
+    fileName,
+    sizeBytes,
+  }, profile);
+  return {
+    name: fileName,
+    sizeBytes,
+    sizeLabel: formatBytes(sizeBytes),
+    quant: fit.quant,
+    fit,
+  };
+}
+
+function chooseBestGgufFile(files, profile, context = {}) {
+  return files
+    .filter((file) => /\.gguf$/i.test(file.name || ""))
+    .filter((file) => !/mmproj|imatrix/i.test(file.name || ""))
+    .map((file) => ({
+      ...file,
+      fit: file.fit || scoreModelFit({
+        name: context.name,
+        description: context.description,
+        fileName: file.name,
+        sizeBytes: file.sizeBytes,
+      }, profile),
+    }))
+    .sort((a, b) => (b.fit.score - a.fit.score) || ((b.sizeBytes || 0) - (a.sizeBytes || 0)))[0] || null;
+}
+
+function encodeRepoPath(repoId) {
+  return String(repoId || "").split("/").filter(Boolean).map(encodeURIComponent).join("/");
+}
+
+function safeModelFileName(fileName) {
+  const clean = path.basename(String(fileName || "").split("?")[0]);
+  if (!/\.gguf$/i.test(clean)) throw new Error("Plik modelu musi mieć rozszerzenie .gguf.");
+  return clean.replace(/[<>:"\\|?*]/g, "_");
+}
+
+function createModelId(fileName, source = "") {
+  const base = String(fileName || "").replace(/\.gguf$/i, "");
+  const suffix = String(source || "").split("/").slice(-2).join("-");
+  return `${base}-${suffix}`.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80);
+}
+
+async function fetchJson(url, options = {}) {
+  const res = await fetch(url, {
+    ...options,
+    headers: {
+      "Accept": "application/json",
+      "User-Agent": "EndoCode-Desktop-App",
+      ...(options.headers || {}),
+    },
+    signal: options.signal || AbortSignal.timeout(15000),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`${res.status} ${res.statusText}${text ? `: ${text.slice(0, 160)}` : ""}`);
+  }
+  return res.json();
 }
 
 function estimateTokens(msgs) {
@@ -2869,6 +3031,7 @@ async function runSimpleChat(userText) {
 
 function getState() {
   const modelConfig = getModelConfig();
+  const serverExe = getRuntimeServerExe();
   return {
     bielikHome: BIELIK_HOME,
     workspaceRoot,
@@ -2879,7 +3042,11 @@ function getState() {
     models: getModelsForUi(),
     modelConfig,
     modelPath: getModelPath(),
-    serverExe: getRuntimeServerExe(),
+    serverExe,
+    runtimeStatus: {
+      llamaAvailable: Boolean(serverExe),
+      message: serverExe ? "" : "Nie znaleziono runtime/llama-server.exe. Zainstaluj runtime llama.cpp w folderze runtime.",
+    },
     port: DEFAULT_PORT,
     customModelSettings,
     maxMessages: MAX_MESSAGES,
@@ -3049,14 +3216,20 @@ ipcMain.handle("app:download-model", async (_event, modelId) => {
   const model = catalog.models.find(m => m.id === modelId);
   if (!model) throw new Error("Model nie znaleziony w katalogu.");
   if (model.kind !== "local-gguf") throw new Error("Ten model nie jest lokalnym plikiem GGUF.");
-  
+
   const dest = path.resolve(BIELIK_HOME, model.file);
-  const sourceRepo = model.source;
   const fileName = path.basename(model.file);
-  
-  // Try to derive HF URL from source and file
-  const url = `https://huggingface.co/${sourceRepo}/resolve/main/${fileName}`;
-  
+  const sourceRepo = model.source;
+  let url = model.downloadUrl;
+  if (!url && sourceRepo) {
+    if (model.sourceType === "modelscope") {
+      url = `https://www.modelscope.cn/models/${sourceRepo}/resolve/master/${encodeURIComponent(fileName)}`;
+    } else {
+      url = `https://huggingface.co/${sourceRepo}/resolve/main/${encodeURIComponent(fileName)}`;
+    }
+  }
+  if (!url) throw new Error("Brak adresu pobierania dla tego modelu.");
+
   try {
     await performDownload(url, dest, modelId);
     emit("status", { status: "download-complete", detail: `Pobrano model: ${model.displayName}` });
@@ -3079,57 +3252,298 @@ ipcMain.handle("app:delete-model", async (_event, modelId) => {
   return { ok: false, error: "Plik nie istnieje." };
 });
 
-ipcMain.handle("app:add-custom-model", async (_event, urlOrPath) => {
-  const catalog = loadModelCatalog();
-  let modelUrl = (urlOrPath || "").trim();
-  if (!modelUrl) throw new Error("Link nie moze byc pusty.");
+function parseModelDownloadInput(input) {
+  const options = typeof input === "object" && input !== null ? input : { url: input };
+  const rawUrl = String(options.url || options.urlOrPath || "").trim();
+  if (!rawUrl) throw new Error("Link nie moze byc pusty.");
 
   let repo = "";
   let file = "";
-  
-  if (modelUrl.startsWith("http")) {
-    try {
-      const u = new URL(modelUrl);
-      const parts = u.pathname.split("/").filter(Boolean);
-      const resolveIndex = parts.indexOf("resolve");
-      if (resolveIndex > 1) {
-        repo = parts.slice(resolveIndex - 2, resolveIndex).join("/");
-        file = parts.slice(resolveIndex + 2).join("/");
-      } else if (parts.length >= 3 && (parts[2] === "blob" || parts[2] === "resolve")) {
-         repo = parts.slice(0, 2).join("/");
-         file = parts.slice(3).join("/");
-      }
-    } catch { /* ignore */ }
-  } else if (modelUrl.includes("/")) {
-    const parts = modelUrl.split("/").filter(Boolean);
-    if (parts.length >= 3) {
-      repo = parts.slice(0, 2).join("/");
-      file = parts.slice(2).join("/");
+  let sourceType = "direct";
+  let downloadUrl = rawUrl;
+  let displayName = options.displayName || "";
+
+  if (!/^https:\/\//i.test(rawUrl)) {
+    throw new Error("Wklej bezpośredni link HTTPS do pliku .gguf.");
+  }
+
+  const u = new URL(rawUrl);
+  const parts = u.pathname.split("/").filter(Boolean).map(decodeURIComponent);
+  const host = u.hostname.toLowerCase();
+
+  if (host === "huggingface.co" || host.endsWith(".huggingface.co")) {
+    sourceType = "huggingface";
+    const resolveIndex = parts.findIndex((part) => part === "resolve" || part === "blob");
+    if (resolveIndex > 1) {
+      repo = parts.slice(0, resolveIndex).join("/");
+      file = parts.slice(resolveIndex + 2).join("/");
+      const revision = parts[resolveIndex + 1] || "main";
+      downloadUrl = `https://huggingface.co/${repo}/resolve/${encodeURIComponent(revision)}/${file.split("/").map(encodeURIComponent).join("/")}`;
     }
+  } else if (host.includes("modelscope.cn") || host.includes("modelscope.ai")) {
+    sourceType = "modelscope";
+    const modelsIndex = parts.indexOf("models");
+    const resolveIndex = parts.findIndex((part) => part === "resolve" || part === "blob");
+    if (modelsIndex >= 0 && resolveIndex > modelsIndex + 2) {
+      repo = parts.slice(modelsIndex + 1, resolveIndex).join("/");
+      file = parts.slice(resolveIndex + 2).join("/");
+      const revision = parts[resolveIndex + 1] || "master";
+      downloadUrl = `https://www.modelscope.cn/models/${repo}/resolve/${encodeURIComponent(revision)}/${file.split("/").map(encodeURIComponent).join("/")}`;
+    }
+  } else if (host === "github.com" || host.endsWith(".github.com")) {
+    sourceType = "github";
+    if (parts.length >= 5 && parts[2] === "releases" && parts[3] === "download") {
+      repo = parts.slice(0, 2).join("/");
+      file = parts.slice(5).join("/") || parts[4];
+    } else {
+      const blobIndex = parts.indexOf("blob");
+      if (blobIndex === 2 && parts.length > 4) {
+        repo = parts.slice(0, 2).join("/");
+        const revision = parts[3];
+        file = parts.slice(4).join("/");
+        downloadUrl = `https://raw.githubusercontent.com/${repo}/${encodeURIComponent(revision)}/${file.split("/").map(encodeURIComponent).join("/")}`;
+      }
+    }
+  } else {
+    file = parts[parts.length - 1] || "";
+    repo = host;
   }
 
-  if (!repo || !file || !file.toLowerCase().endsWith(".gguf")) {
-    throw new Error("Niepoprawny format. Wklej link 'resolve' do pliku .gguf z HuggingFace.");
-  }
+  if (!file) file = parts[parts.length - 1] || "";
+  const safeFile = safeModelFileName(file);
+  return {
+    repo,
+    file: safeFile,
+    sourceType,
+    downloadUrl,
+    displayName: displayName || safeFile.replace(/\.gguf$/i, "").replace(/[-_.]/g, " "),
+    description: options.description || "",
+    expectedBytes: Number(options.expectedBytes || 0),
+    contextTokens: Number(options.contextTokens || 8192),
+    gpuLayers: Number(options.gpuLayers || 35),
+  };
+}
 
-  const id = file.replace(/\.gguf$/i, "").toLowerCase().replace(/[^a-z0-9]/g, "-");
+ipcMain.handle("app:add-custom-model", async (_event, input) => {
+  const catalog = loadModelCatalog();
+  const parsed = parseModelDownloadInput(input);
+  const { repo, file, sourceType, downloadUrl } = parsed;
+  const id = createModelId(file, repo || sourceType);
   if (catalog.models.find(m => m.id === id)) throw new Error("Ten model jest juz w katalogu.");
 
   const newModel = {
     id,
-    displayName: file.replace(/\.gguf$/i, "").replace(/[-_.]/g, " "),
+    displayName: parsed.displayName,
     kind: "local-gguf",
     serverModel: id,
     file: `models/${file}`,
-    contextTokens: 8192,
-    gpuLayers: 35,
-    source: repo,
-    description: `Własny model dodany z HuggingFace (${repo})`,
+    contextTokens: parsed.contextTokens,
+    gpuLayers: parsed.gpuLayers,
+    expectedBytes: parsed.expectedBytes,
+    source: repo || sourceType,
+    sourceType,
+    downloadUrl,
+    description: parsed.description || `Własny model dodany z ${sourceType === "direct" ? "bezpośredniego linku" : sourceType}.`,
   };
 
   catalog.models.push(newModel);
   saveModelCatalog(catalog);
   return { ok: true, model: newModel };
+});
+
+function buildExternalSourceCard(source, query) {
+  const search = encodeURIComponent(query || "gguf");
+  const data = {
+    modelscope: {
+      label: "ModelScope",
+      url: `https://www.modelscope.cn/models?name=${search}`,
+      description: "ModelScope działa z bezpośrednim linkiem resolve do pliku .gguf albo z repo owner/model.",
+    },
+    github: {
+      label: "GitHub Releases",
+      url: `https://github.com/search?q=${search}%20gguf%20release&type=repositories`,
+      description: "GitHub działa z linkiem do assetu release .gguf lub raw/blob .gguf.",
+    },
+  }[source];
+  return {
+    id: `${source}:external:${query || "gguf"}`,
+    source,
+    sourceLabel: data.label,
+    author: data.label,
+    name: `Szukaj w ${data.label}`,
+    description: data.description,
+    tags: [],
+    files: [],
+    recommended: false,
+    externalOnly: true,
+    openUrl: data.url,
+    canDownload: false,
+  };
+}
+
+function filterQuerySuffix(filter) {
+  if (filter === "small") return " 3b 7b";
+  if (filter === "medium") return " 8b 14b";
+  if (filter === "large") return " 30b";
+  return "";
+}
+
+function createDirectUrlResult(rawUrl, profile) {
+  const parsed = parseModelDownloadInput(rawUrl);
+  const fit = scoreModelFit({
+    name: parsed.displayName,
+    fileName: parsed.file,
+    sizeBytes: parsed.expectedBytes,
+  }, profile);
+  return {
+    id: `${parsed.sourceType}:${parsed.repo || "direct"}:${parsed.file}`,
+    source: parsed.sourceType,
+    sourceLabel: parsed.sourceType === "modelscope" ? "ModelScope" : parsed.sourceType === "github" ? "GitHub" : "Direct",
+    author: parsed.repo || parsed.sourceType,
+    name: parsed.displayName,
+    description: `Bezpośredni plik GGUF. ${fit.fitLabel}`,
+    tags: [parsed.sourceType],
+    recommended: fit.recommended,
+    recommendation: fit,
+    files: [{
+      name: parsed.file,
+      sizeBytes: parsed.expectedBytes,
+      sizeLabel: formatBytes(parsed.expectedBytes),
+      quant: fit.quant,
+      fit,
+    }],
+    fileName: parsed.file,
+    expectedBytes: parsed.expectedBytes,
+    downloadUrl: parsed.downloadUrl,
+    openUrl: parsed.downloadUrl,
+    canDownload: true,
+  };
+}
+
+async function searchHuggingFaceModels(options, profile) {
+  const query = String(options.query || "coder").trim();
+  const hfQuery = `${query || "coder"} gguf${filterQuerySuffix(options.filter)}`.trim();
+  const url = `https://huggingface.co/api/models?search=${encodeURIComponent(hfQuery)}&filter=gguf&sort=downloads&direction=-1&limit=18&full=true`;
+  const data = await fetchJson(url);
+  return data.map((model) => {
+    const siblings = Array.isArray(model.siblings) ? model.siblings : [];
+    const files = siblings
+      .filter((file) => String(file.rfilename || "").toLowerCase().endsWith(".gguf"))
+      .map((file) => normalizeGgufFile(file, profile, { name: model.id, description: model.description }));
+    const best = chooseBestGgufFile(files, profile, { name: model.id, description: model.description });
+    if (!best) return null;
+    const downloads = Number(model.downloads || 0);
+    const likes = Number(model.likes || 0);
+    return {
+      id: `huggingface:${model.id}`,
+      repoId: model.id,
+      source: "huggingface",
+      sourceLabel: "Hugging Face",
+      author: model.author || model.id.split("/")[0],
+      name: model.id.split("/").slice(1).join("/") || model.id,
+      description: `HF: ${downloads.toLocaleString("pl-PL")} pobrań, ${likes.toLocaleString("pl-PL")} polubień. ${best.fit.fitLabel}.`,
+      tags: model.tags || [],
+      recommended: best.fit.recommended,
+      recommendation: best.fit,
+      files,
+      fileName: best.name,
+      expectedBytes: best.sizeBytes,
+      downloadUrl: `https://huggingface.co/${model.id}/resolve/main/${best.name.split("/").map(encodeURIComponent).join("/")}`,
+      openUrl: `https://huggingface.co/${model.id}`,
+      canDownload: true,
+    };
+  }).filter(Boolean);
+}
+
+function parseModelScopeRepoQuery(query) {
+  const value = String(query || "").trim();
+  if (!value) return "";
+  try {
+    const u = new URL(value);
+    if (u.hostname.includes("modelscope.cn") || u.hostname.includes("modelscope.ai")) {
+      const parts = u.pathname.split("/").filter(Boolean).map(decodeURIComponent);
+      const modelsIndex = parts.indexOf("models");
+      const stop = parts.findIndex((part, index) => index > modelsIndex && ["resolve", "blob", "files"].includes(part));
+      if (modelsIndex >= 0) return parts.slice(modelsIndex + 1, stop > 0 ? stop : undefined).join("/");
+    }
+  } catch { /* not a URL */ }
+  return /^[\w.-]+\/[\w./-]+$/.test(value) ? value : "";
+}
+
+async function getModelScopeRepoResult(repoId, profile) {
+  const encodedRepo = encodeRepoPath(repoId);
+  const detail = await fetchJson(`https://www.modelscope.cn/api/v1/models/${encodedRepo}`);
+  const model = detail.Data || {};
+  const revision = model.Revision || "master";
+  const filesResponse = await fetchJson(`https://www.modelscope.cn/api/v1/models/${encodedRepo}/repo/files?Revision=${encodeURIComponent(revision)}&Recursive=true`);
+  const rawFiles = filesResponse?.Data?.Files || [];
+  const files = rawFiles
+    .filter((file) => String(file.Path || file.Name || "").toLowerCase().endsWith(".gguf"))
+    .map((file) => normalizeGgufFile(file, profile, { name: repoId, description: model.Description || model.ChineseName }));
+  const best = chooseBestGgufFile(files, profile, { name: repoId, description: model.Description || model.ChineseName });
+  if (!best) throw new Error("Nie znaleziono pliku .gguf w repozytorium ModelScope.");
+  return {
+    id: `modelscope:${repoId}`,
+    repoId,
+    source: "modelscope",
+    sourceLabel: "ModelScope",
+    author: repoId.split("/")[0],
+    name: model.Name || repoId.split("/").slice(1).join("/"),
+    description: `ModelScope: ${(model.Downloads || 0).toLocaleString("pl-PL")} pobrań. ${best.fit.fitLabel}.`,
+    tags: model.Tags || model.Libraries || [],
+    recommended: best.fit.recommended,
+    recommendation: best.fit,
+    files,
+    fileName: best.name,
+    expectedBytes: best.sizeBytes,
+    downloadUrl: `https://www.modelscope.cn/models/${repoId}/resolve/${encodeURIComponent(revision)}/${best.name.split("/").map(encodeURIComponent).join("/")}`,
+    openUrl: `https://www.modelscope.cn/models/${repoId}`,
+    canDownload: true,
+  };
+}
+
+async function searchModelSources(options = {}) {
+  const source = options.source || "all";
+  const query = String(options.query || "").trim();
+  const profile = getHardwareModelProfile();
+  const results = [];
+
+  if (/^https?:\/\/.+\.gguf(?:[?#].*)?$/i.test(query)) {
+    results.push(createDirectUrlResult(query, profile));
+  } else {
+    if (source === "all" || source === "huggingface") {
+      results.push(...await searchHuggingFaceModels(options, profile));
+    }
+    if (source === "all" || source === "modelscope") {
+      const repoId = parseModelScopeRepoQuery(query);
+      if (repoId) {
+        try {
+          results.push(await getModelScopeRepoResult(repoId, profile));
+        } catch (error) {
+          results.push({ ...buildExternalSourceCard("modelscope", query), description: `Nie udało się pobrać metadanych repo: ${error.message}` });
+        }
+      } else {
+        results.push(buildExternalSourceCard("modelscope", query || "gguf"));
+      }
+    }
+    if (source === "all" || source === "github") {
+      results.push(buildExternalSourceCard("github", query || "gguf"));
+    }
+  }
+
+  return results
+    .sort((a, b) => Number(b.recommended) - Number(a.recommended) || ((b.recommendation?.score || 0) - (a.recommendation?.score || 0)))
+    .slice(0, 24)
+    .map((result) => ({ ...result, hardwareProfile: profile.target }));
+}
+
+ipcMain.handle("app:search-models", async (_event, options) => searchModelSources(options));
+ipcMain.handle("app:search-hf-models", async (_event, options) => searchModelSources({ ...(options || {}), source: "huggingface" }));
+ipcMain.handle("app:open-external", async (_event, url) => {
+  const target = String(url || "");
+  if (!/^https?:\/\//i.test(target)) throw new Error("Niepoprawny adres URL.");
+  await shell.openExternal(target);
+  return { ok: true };
 });
 
 async function performDownload(url, dest, modelId) {
@@ -3145,24 +3559,31 @@ async function performDownload(url, dest, modelId) {
 
   return new Promise((resolve, reject) => {
     function startRequest(requestUrl) {
-      const request = https.get(requestUrl, (response) => {
-        if (response.statusCode === 302 || response.statusCode === 301) {
-          startRequest(response.headers.location);
-          return;
-        }
-        
-        if (response.statusCode !== 200) {
-          reject(new Error(`Serwer HF zwrocil blad ${response.statusCode}`));
+      const request = https.get(requestUrl, { headers: { "User-Agent": "EndoCode-Desktop-App" } }, (response) => {
+        if ([301, 302, 303, 307, 308].includes(response.statusCode)) {
+          const location = response.headers.location;
+          if (!location) {
+            reject(new Error("Przekierowanie bez nagłówka Location."));
+            return;
+          }
+          startRequest(new URL(location, requestUrl).toString());
           return;
         }
 
-        const total = parseInt(response.headers["content-length"], 10);
+        if (response.statusCode !== 200) {
+          fs.unlink(tempDest, () => {});
+          activeDownloads.delete(modelId);
+          reject(new Error(`Serwer zwrocil blad ${response.statusCode}`));
+          return;
+        }
+
+        const total = parseInt(response.headers["content-length"], 10) || 0;
         let downloaded = 0;
         let lastPercent = -1;
 
         response.on("data", (chunk) => {
           downloaded += chunk.length;
-          const progress = Math.round((downloaded / total) * 100);
+          const progress = total > 0 ? Math.round((downloaded / total) * 100) : 0;
           if (progress !== lastPercent) {
             lastPercent = progress;
             activeDownloads.set(modelId, { progress, downloaded, total });
@@ -3178,13 +3599,15 @@ async function performDownload(url, dest, modelId) {
              if (fs.existsSync(dest)) fs.unlinkSync(dest);
              fs.renameSync(tempDest, dest);
              activeDownloads.delete(modelId);
-             resolve();
-          } catch (e) {
-             reject(e);
-          }
+              resolve();
+           } catch (e) {
+              activeDownloads.delete(modelId);
+              reject(e);
+           }
         });
       });
 
+      request.setTimeout(30000, () => request.destroy(new Error("Timeout pobierania modelu.")));
       request.on("error", (err) => {
         fs.unlink(tempDest, () => {});
         activeDownloads.delete(modelId);

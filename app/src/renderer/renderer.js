@@ -67,6 +67,7 @@ const modelsList = document.getElementById("modelsList");
 const modelsStatus = document.getElementById("modelsStatus");
 const hfModelUrl = document.getElementById("hfModelUrl");
 const addHfModel = document.getElementById("addHfModel");
+const runtimeWarning = document.getElementById("runtimeWarning");
 
 
 
@@ -103,6 +104,12 @@ function escapeHtml(value) {
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;");
+}
+
+function escapeAttr(value) {
+  return escapeHtml(value)
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
 }
 
 // ── Markdown & LaTeX Config ──
@@ -662,6 +669,11 @@ function applyStateToUi(state) {
   currentWorkspaceRoot = state.workspaceRoot || "";
   workspaceLabel.textContent = shortPath(state.workspaceRoot);
   composerWsName.textContent = shortPath(state.workspaceRoot);
+  if (runtimeWarning) {
+    const runtimeMissing = state.runtimeStatus ? !state.runtimeStatus.llamaAvailable : !state.serverExe;
+    runtimeWarning.classList.toggle("hidden", !runtimeMissing);
+    runtimeWarning.title = runtimeMissing ? (state.runtimeStatus?.message || "Brak runtime llama.cpp.") : "";
+  }
   renderModelSelect(state);
   renderReasoningSelect(state);
   updateAccessUI(state.accessLevel || "sandbox");
@@ -756,17 +768,17 @@ function renderModels(models = []) {
     const actions = [];
     if (model.kind !== "cloud-api") {
       if (isDownloaded) {
-        actions.push(`<button class="model-btn use" onclick="useModel('${escapeHtml(model.id)}')">${model.selected ? "Aktywny" : "Użyj"}</button>`);
+        actions.push(`<button class="model-btn use" onclick="useModel('${escapeAttr(model.id)}')">${model.selected ? "Aktywny" : "Użyj"}</button>`);
         actions.push(`<button class="model-btn use" onclick="openSettingsModal()">Ustawienia</button>`);
-        actions.push(`<button class="model-btn delete" onclick="deleteModel('${escapeHtml(model.id)}')">Usuń</button>`);
+        actions.push(`<button class="model-btn delete" onclick="deleteModel('${escapeAttr(model.id)}')">Usuń</button>`);
       } else if (isDownloading) {
         actions.push(`<button class="model-btn download" disabled>Pobieranie ${progress}%...</button>`);
       } else {
         const sizeGB = model.expectedBytes ? (model.expectedBytes / 1024 / 1024 / 1024).toFixed(1) : "?";
-        actions.push(`<button class="model-btn download" onclick="downloadModel('${escapeHtml(model.id)}')">Pobierz (${sizeGB} GB)</button>`);
+        actions.push(`<button class="model-btn download" onclick="downloadModel('${escapeAttr(model.id)}')">Pobierz (${sizeGB} GB)</button>`);
       }
     } else {
-      actions.push(`<button class="model-btn use" onclick="useModel('${escapeHtml(model.id)}')">${model.selected ? "Aktywny" : "Użyj"}</button>`);
+      actions.push(`<button class="model-btn use" onclick="useModel('${escapeAttr(model.id)}')">${model.selected ? "Aktywny" : "Użyj"}</button>`);
     }
 
     return `
@@ -1130,7 +1142,12 @@ window.endocode.onEvent(async (event) => {
       window._lastModelRefresh = now;
       renderModels(await window.endocode.listModels());
     }
-    if (modelsStatus) modelsStatus.textContent = `Pobieranie ${event.modelId}: ${event.progress}% (${(event.downloaded / 1024 / 1024).toFixed(0)} MB / ${(event.total / 1024 / 1024).toFixed(0)} MB)`;
+    if (modelsStatus) {
+      const downloadedMb = (event.downloaded / 1024 / 1024).toFixed(0);
+      const totalMb = event.total > 0 ? ` / ${(event.total / 1024 / 1024).toFixed(0)} MB` : "";
+      const progress = event.total > 0 ? `${event.progress}%` : `${downloadedMb} MB`;
+      modelsStatus.textContent = `Pobieranie ${event.modelId}: ${progress} (${downloadedMb} MB${totalMb})`;
+    }
     return;
   }
   if (event.type === "parse-error") {
@@ -1382,3 +1399,139 @@ resetSettings.addEventListener("click", async () => {
     addInlineEvent("error", "Ustawienia", e.message || String(e));
   }
 });
+// ── Tabs Switching ──
+const tabLibrary = document.getElementById("tabLibrary");
+const tabDiscover = document.getElementById("tabDiscover");
+const modelsLibraryView = document.getElementById("modelsLibraryView");
+const modelsDiscoverView = document.getElementById("modelsDiscoverView");
+
+if (tabLibrary && tabDiscover) {
+  tabLibrary.addEventListener("click", () => {
+    tabLibrary.classList.add("active");
+    tabDiscover.classList.remove("active");
+    modelsLibraryView.classList.remove("hidden");
+    modelsDiscoverView.classList.add("hidden");
+  });
+
+  tabDiscover.addEventListener("click", () => {
+    tabDiscover.classList.add("active");
+    tabLibrary.classList.remove("active");
+    modelsDiscoverView.classList.remove("hidden");
+    modelsLibraryView.classList.add("hidden");
+  });
+}
+
+// ── Discovery Logic ──
+const discoveryList = document.getElementById("discoveryList");
+const hfSearchInput = document.getElementById("hfSearchInput");
+const hfSearchBtn = document.getElementById("hfSearchBtn");
+const modelSourceSelect = document.getElementById("modelSourceSelect");
+let currentFilter = "all";
+let lastDiscoveryResults = new Map();
+
+if (hfSearchBtn) {
+  hfSearchBtn.addEventListener("click", async () => {
+    const query = hfSearchInput.value.trim();
+    const source = modelSourceSelect?.value || "all";
+    discoveryList.innerHTML = `<div class="models-empty">Przeszukuję źródła modeli...</div>`;
+    try {
+      const searchFn = window.endocode.searchModels || window.endocode.searchHfModels;
+      const results = await searchFn({ query, filter: currentFilter, source });
+      renderDiscovery(results);
+    } catch (e) {
+      discoveryList.innerHTML = `<div class="models-empty error">${e.message}</div>`;
+    }
+  });
+}
+
+document.querySelectorAll(".filter-btn").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".filter-btn").forEach(b => b.classList.remove("active"));
+    btn.classList.add("active");
+    currentFilter = btn.getAttribute("data-filter");
+    if (hfSearchBtn) hfSearchBtn.click();
+  });
+});
+
+if (modelSourceSelect) {
+  modelSourceSelect.addEventListener("change", () => {
+    if (hfSearchBtn) hfSearchBtn.click();
+  });
+}
+
+function renderDiscovery(results) {
+  if (!discoveryList) return;
+  discoveryList.innerHTML = "";
+  lastDiscoveryResults = new Map();
+  if (results.length === 0) {
+    discoveryList.innerHTML = `<div class="models-empty">Brak wyników dla podanych filtrów.</div>`;
+    return;
+  }
+
+  results.forEach(m => {
+    const card = document.createElement("div");
+    card.className = "model-item";
+    lastDiscoveryResults.set(m.id, m);
+
+    const badges = [];
+    if (m.recommended) badges.push(`<span class="model-badge recommended">Zalecane dla Twojego PC</span>`);
+    if (m.sourceLabel) badges.push(`<span class="model-badge source">${escapeHtml(m.sourceLabel)}</span>`);
+    if (m.hardwareProfile && m.recommended) badges.push(`<span class="model-badge fit">${escapeHtml(m.hardwareProfile)}</span>`);
+    const fileLine = m.fileName
+      ? `<span class="model-meta-item">Plik: <strong>${escapeHtml(m.fileName)}</strong>${m.expectedBytes ? ` (${escapeHtml((m.expectedBytes / 1024 / 1024 / 1024).toFixed(1))} GB)` : ""}</span>`
+      : "";
+    const actions = m.externalOnly
+      ? `<button class="model-btn use js-open-model-source" data-url="${escapeAttr(m.openUrl)}">Otwórz stronę</button>`
+      : `<button class="model-btn download js-add-discovery" data-model-id="${escapeAttr(m.id)}" ${m.canDownload ? "" : "disabled"}>Dodaj i pobierz</button>
+         ${m.openUrl ? `<button class="model-btn use js-open-model-source" data-url="${escapeAttr(m.openUrl)}">Źródło</button>` : ""}`;
+
+    card.innerHTML = `
+      <div class="model-info-header">
+        <div class="model-main-info">
+          <span class="model-name">${escapeHtml(m.name)}</span>
+          <span class="model-id">${escapeHtml(m.id)}</span>
+        </div>
+        <div class="model-badges">${badges.join("")}</div>
+      </div>
+      <p class="model-desc">${escapeHtml(m.description)}</p>
+      <div class="model-meta">
+        <span class="model-meta-item">Autor: ${escapeHtml(m.author)}</span>
+        ${fileLine}
+      </div>
+      <div class="model-actions">
+        ${actions}
+      </div>
+    `;
+    card.querySelector(".js-add-discovery")?.addEventListener("click", () => addAndDownload(m.id));
+    card.querySelectorAll(".js-open-model-source").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        try {
+          await window.endocode.openExternal(btn.getAttribute("data-url"));
+        } catch (e) {
+          alert(e.message || String(e));
+        }
+      });
+    });
+    discoveryList.appendChild(card);
+  });
+}
+
+window.addAndDownload = async (modelKey) => {
+  if (discoveryList) discoveryList.innerHTML = `<div class="models-empty">Przygotowuję model...</div>`;
+  try {
+    const model = lastDiscoveryResults.get(modelKey);
+    if (!model || !model.downloadUrl) throw new Error("Ten wynik nie ma bezpośredniego linku do pliku .gguf.");
+    const added = await window.endocode.addCustomModel({
+      url: model.downloadUrl,
+      displayName: model.name,
+      description: model.description,
+      expectedBytes: model.expectedBytes || 0,
+    });
+    if (tabLibrary) tabLibrary.click();
+    await loadModels();
+    if (added?.model?.id) window.endocode.downloadModel(added.model.id);
+  } catch (e) {
+    alert(e.message);
+    if (hfSearchBtn) hfSearchBtn.click();
+  }
+};

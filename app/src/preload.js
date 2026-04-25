@@ -30,6 +30,9 @@ contextBridge.exposeInMainWorld("endocode", {
   downloadModel: (modelId) => ipcRenderer.invoke("app:download-model", modelId),
   deleteModel: (modelId) => ipcRenderer.invoke("app:delete-model", modelId),
   addCustomModel: (urlOrPath) => ipcRenderer.invoke("app:add-custom-model", urlOrPath),
+  searchModels: (options) => ipcRenderer.invoke("app:search-models", options),
+  searchHfModels: (options) => ipcRenderer.invoke("app:search-hf-models", options),
+  openExternal: (url) => ipcRenderer.invoke("app:open-external", url),
   onEvent: (callback) => {
     const listener = (_event, payload) => callback(payload);
     ipcRenderer.on("agent:event", listener);
