@@ -1,6 +1,6 @@
 {
-  "selectedModelId": "qwen36-35b-a3b-mxfp4",
-  "reasoningLevel": "medium",
+  "selectedModelId": "zen4-coder-pro-iq2s",
+  "reasoningLevel": "low",
   "accessLevel": "sandbox",
   "customModelSettings": {
     "temperature": 0.35,

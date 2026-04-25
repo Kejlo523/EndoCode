@@ -3401,7 +3401,14 @@ async function runSimpleChat(userText) {
       { role: "user", content: text },
     ];
     const failedModelIds = new Set();
-    const reply = (await callModelWithRecovery(chatMessages, signal, failedModelIds, { plainChat: true })).trim();
+    const rawReply = await callModelWithRecovery(chatMessages, signal, failedModelIds, { plainChat: true });
+    const replySource =
+      typeof rawReply === "string"
+        ? rawReply
+        : rawReply && typeof rawReply === "object" && "content" in rawReply
+          ? rawReply.content
+          : rawReply;
+    const reply = String(replySource ?? "").trim();
     emit("final", { text: reply, chatMode: true });
     return { ok: true, final: reply };
   } catch (error) {

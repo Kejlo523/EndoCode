@@ -1,5 +1,233 @@
 [
   {
+    "id": "863bac27-8773-4344-bc4e-682643e5ab61",
+    "title": "siema",
+    "createdAt": "2026-04-25T20:34:37.064Z",
+    "updatedAt": "2026-04-25T20:37:25.267Z",
+    "workspaceRoot": "C:\\Users\\Kejlo\\Desktop\\testy-ai",
+    "entries": [
+      {
+        "type": "event",
+        "kind": "note",
+        "title": "Model",
+        "body": "Wybrano Zen4 Coder Pro i1 IQ2_S"
+      },
+      {
+        "type": "message",
+        "role": "user",
+        "text": "jak tam\n"
+      },
+      {
+        "type": "event",
+        "kind": "activity",
+        "title": "Czat",
+        "body": "Jedna odpowiedź tekstowa (bez narzędzi)."
+      },
+      {
+        "type": "message",
+        "role": "assistant",
+        "text": "[object Object]\n"
+      },
+      {
+        "type": "message",
+        "role": "user",
+        "text": "pogoda\n"
+      },
+      {
+        "type": "event",
+        "kind": "activity",
+        "title": "Agent startuje",
+        "body": "Rozpoczęto zadanie."
+      },
+      {
+        "type": "message",
+        "role": "assistant",
+        "text": "Przerwano zadanie.\n"
+      },
+      {
+        "type": "message",
+        "role": "user",
+        "text": "pogoda\n"
+      },
+      {
+        "type": "event",
+        "kind": "activity",
+        "title": "Czat",
+        "body": "Jedna odpowiedź tekstowa (bez narzędzi)."
+      },
+      {
+        "type": "message",
+        "role": "assistant",
+        "text": "[object Object]\n"
+      },
+      {
+        "type": "message",
+        "role": "user",
+        "text": "d\n"
+      },
+      {
+        "type": "event",
+        "kind": "activity",
+        "title": "Agent startuje",
+        "body": "Rozpoczęto zadanie."
+      },
+      {
+        "type": "message",
+        "role": "assistant",
+        "text": "Przerwano zadanie.\n"
+      },
+      {
+        "type": "event",
+        "kind": "note",
+        "title": "Tryb",
+        "body": "Szybko"
+      },
+      {
+        "type": "message",
+        "role": "user",
+        "text": "eee\n"
+      },
+      {
+        "type": "event",
+        "kind": "activity",
+        "title": "Czat",
+        "body": "Jedna odpowiedź tekstowa (bez narzędzi)."
+      },
+      {
+        "type": "message",
+        "role": "assistant",
+        "text": "Cześć! 😊 Co mogę dla Ciebie zrobić?\n"
+      }
+    ],
+    "messages": [
+      {
+        "type": "message",
+        "role": "user",
+        "text": "jak tam\n"
+      },
+      {
+        "type": "message",
+        "role": "assistant",
+        "text": "[object Object]\n"
+      },
+      {
+        "type": "message",
+        "role": "user",
+        "text": "pogoda\n"
+      },
+      {
+        "type": "message",
+        "role": "assistant",
+        "text": "Przerwano zadanie.\n"
+      },
+      {
+        "type": "message",
+        "role": "user",
+        "text": "pogoda\n"
+      },
+      {
+        "type": "message",
+        "role": "assistant",
+        "text": "[object Object]\n"
+      },
+      {
+        "type": "message",
+        "role": "user",
+        "text": "d\n"
+      },
+      {
+        "type": "message",
+        "role": "assistant",
+        "text": "Przerwano zadanie.\n"
+      },
+      {
+        "type": "message",
+        "role": "user",
+        "text": "eee\n"
+      },
+      {
+        "type": "message",
+        "role": "assistant",
+        "text": "Cześć! 😊 Co mogę dla Ciebie zrobić?\n"
+      }
+    ],
+    "fullContext": [
+      {
+        "role": "system",
+        "content": "Jestes EndoCode: lokalnym agentem kodujacym i produkcyjnym.\nPracujesz na lokalnych modelach, lokalnych plikach i jawnych narzedziach. UI pokazuje uzytkownikowi Twoje kroki.\n\nFORMAT ODPOWIEDZI:\n- Odpowiadaj wylacznie jednym poprawnym obiektem JSON.\n- Kazdy krok to dokladnie jedna akcja: albo {\"tool\":\"...\",\"args\":{...}}, albo {\"final\":\"...\"}.\n- Mozesz dodac \"note\", ale to publiczna, krotka informacja dla UI. Nie ujawniaj ukrytego toku rozumowania.\n- Nie zwracaj tablic, Markdownu ani tekstu poza JSON.\n- W stringach JSON nie uzywaj surowych nowych linii; uzyj \\n. W sciezkach uzywaj /.\n\nDOSTEPNE NARZEDZIA:\n- pwd {}\n- cd {\"path\":\"folder\"}\n- ls {\"path\":\".\",\"maxEntries\":100}\n- read_file {\"path\":\"plik\",\"maxBytes\":30000}\n- write_file {\"path\":\"plik\",\"content\":\"...\",\"mode\":\"overwrite albo append\"}\n- mkdir {\"path\":\"folder\"}\n- replace_text {\"path\":\"plik\",\"old\":\"tekst\",\"new\":\"tekst\",\"count\":1}\n- create_pdf {\"path\":\"raport.pdf\",\"title\":\"Tytul\",\"markdown\":\"# Tresc\"} albo {\"path\":\"raport.pdf\",\"title\":\"Tytul\",\"html\":\"<h1>Tresc</h1>\"}\n- create_pptx {\"path\":\"prez.pptx\",\"title\":\"Tytul\",\"markdown\":\"## Slajd 1\\n- punkt\\n## Slajd 2\"}\n- create_docx {\"path\":\"dok.docx\",\"title\":\"Tytul\",\"markdown\":\"# Naglowek\\nAkapit\"}\n- run_powershell {\"command\":\"npm test\",\"timeout\":60}\n- fetch_url {\"url\":\"https://example.com\",\"timeout\":15,\"raw\":false}\n- extract_media {\"url\":\"https://example.com\",\"timeout\":15}\n- download_file {\"url\":\"https://example.com/file.zip\",\"path\":\"plik.zip\"}\n- analyze_image {\"path\":\"plik.jpg\"}\n\nPODSTAWOWY LOOP:\n1. Zrozum zadanie i sprawdz obecny folder.\n2. Przed edycja istniejacego pliku przeczytaj istotny fragment.\n3. Zmieniaj najmniejszy sensowny fragment. Nie przepisuj calego pliku dla drobnej poprawki.\n4. Po bledzie przeczytaj dokladna tresc bledu, popraw przyczyne i sprobuj ponownie.\n5. Po zmianie uruchom waska weryfikacje: syntax check, test, smoke test albo odczyt pliku.\n6. Final po polsku: co zmieniono, jakie pliki, jaka weryfikacja.\n\nZASADY EDYCJI:\n- Dla nowych plikow mozna uzyc write_file overwrite.\n- Dla istniejacych plikow preferuj replace_text z precyzyjnym starym tekstem.\n- Append stosuj do celowych dopisek albo dzielenia duzego pliku na fragmenty.\n- Pelny overwrite istniejacego pliku tylko gdy plik jest generowany, bardzo maly, albo uzytkownik wyraznie chce przepisania.\n- SyntaxError/build error: nie panikuj. Odczytaj plik i linie z bledu, popraw minimalny region, rerun tego samego checka.\n- Jesli zapis sie nie uda, wyjasnij sobie powod z bledu: brak folderu -> mkdir; za dlugi content -> mniejsze chunki; odmowa -> alternatywa w workspace.\n\nZASADY NARZEDZI I SIECI:\n- Nie zgaduj URL-i. Przy 404/403 wroc do strony glownej, dokumentacji, API albo uzyj extract_media.\n- Nie powtarzaj identycznego nieudanego wywolania narzedzia. Po drugim podobnym bledzie zmien taktyke.\n- Fetch nie renderuje JavaScriptu. Preferuj API JSON/CSV/XML lub stabilne zrodla.\n- Pobieraj i zapisuj duze odpowiedzi jako pliki, nie wklejaj ich w JSON.\n\nARTEFAKTY:\n- Dokumenty, PDF, PPTX, arkusze i obrazy tworz lokalnie.\n- Dla dokumentow i prezentacji zachowaj zrodlo Markdown/HTML, gdy ulatwia to poprawki.\n- Estetyka ma pasowac do zadania: narzedzia operacyjne maja byc czytelne i zwarte; prezentacje i strony moga byc bardziej dopracowane wizualnie.\n\nODZYSK PO PROBLEMACH:\n- Brak narzedzia/dependency: sprawdz PATH albo lokalne skrypty; zaproponuj lub wykonaj lokalna instalacje tylko gdy to uzasadnione.\n- Brak uprawnien: zapisz w bezpiecznym folderze workspace i powiedz dlaczego.\n- Model zwrocil blad JSON: napraw tylko JSON kontraktu, nie zmieniaj celu zadania.\n- Jesli nie da sie kontynuowac, final musi podac konkretna przyczyne i najblizszy mozliwy nastepny krok.\n\nAktualny model: Zen4 Coder Pro i1 IQ2_S.\nIntensywnosc pracy: Szybko.\nInstrukcja intensywnosci: Dzialaj szybko: zrob minimalne rozpoznanie, wykonaj najprostszy bezpieczny krok i sprawdz rezultat.\n\nDostepne lokalne skills:\n- Documents (aktywny, local-only): Do ogolnej pracy z dokumentami preferuj Markdown lub HTML jako zrodlo, zapisuj artefakty w workspace i opisz uzytkownikowi finalne pliki. Nie uzywaj uslug chmurowych.\n- DOCX (aktywny, local-only): Dla DOCX preferuj narzedzie create_docx (markdown) po pip install python-docx; alternatywnie skrypt przez run_powershell lub zrodlo HTML/Markdown.\n- PDF (aktywny, local-only): Dla PDF pracuj lokalnie: ekstrakcja tekstu, tworzenie HTML jako zrodla, scalanie lub eksport przez dostepne lokalne narzedzia. Nie wysylaj dokumentow poza maszyne.\n- Slides (aktywny, local-only): Dla prezentacji dobierz pipeline do celu. Szybki funkcjonalny PPTX: create_pptx. Bogaty wizualnie deck: przygotuj Markdown/HTML i eksportuj lokalnym Marp/Slidev, jesli narzedzie jest dostepne. Zachowaj zrodlo obok wyniku.\n- Sheets / CSV (aktywny, local-only): Dla danych tabelarycznych uzywaj CSV/TSV/XLSX w workspace, zachowuj typy danych i podsumowuj transformacje. Formuly i wykresy opisuj tak, zeby byly odtwarzalne lokalnie.\n- Image Gen (aktywny, local-only): Dla obrazow pracuj lokalnie: SVG dla ikon/diagramow, HTML/CSS/canvas dla UI, albo lokalny generator jesli istnieje. Nie zakladaj chmurowego image API bez wyraznej prosby uzytkownika.\n- Figma Local (aktywny, local-only): Dla Figmy pracuj na wyeksportowanych lokalnie plikach. Nie lacz sie z Figma API. Mapuj style, warstwy i komponenty na kod lub dokumentacje w workspace.\n- SVG / Icons (aktywny, local-only): Dla SVG dbaj o viewBox, dostepnosc, skale i minimalny kod. Preferuj edytowalne pliki SVG zamiast bitmap, gdy obiekt jest ikoną, diagramem albo prostym assetem.\n- File Export (aktywny, local-only): Dla eksportow tworz przewidywalne foldery wyjsciowe, manifest plikow i formaty latwe do sprawdzenia lokalnie. Nie nadpisuj niepowiazanych plikow.\n- Data Extract (aktywny, local-only): Dla ekstrakcji danych czytaj pliki lokalnie, zapisuj surowe i oczyszczone wyniki osobno, a transformacje opisuj w sposob audytowalny. Nie wysylaj danych do zewnetrznych serwisow.\n- Vision (VLM Support) (aktywny, local-only): Gdy używasz analyze_image lub wiesz, że użytkownik dostarczył obraz, polegasz na zewnętrznym asystencie wizji (Moondream2). Pamiętaj, aby opierać się na jego odczytach i przekazywać wnioski użytkownikowi wprost, ponieważ główny model działa bez obsługi obrazów.\n\nSkills sa lokalnymi instrukcjami pracy, nie zewnetrznymi API. Jesli zadanie pasuje do skilla, uzyj go samodzielnie i zapisz artefakty w workspace.\n\nInstrukcje projektowe i playbooki:\n--- AGENTS.md ---\n# EndoCode Agent Guide\n\nEndoCode is a local desktop coding agent. It uses local GGUF models, local files, and explicit tools. Treat this file as the short map; detailed playbooks live in `config/agent-playbooks/`.\n\n## Operating Contract\n\n- Work like a steady senior engineer: inspect first, change narrowly, verify, then summarize.\n- Prefer small, reversible edits over rewriting whole files.\n- Preserve user work. Never delete, reset, or overwrite unrelated changes.\n- If a tool fails, read the error and continue with a safer local workaround.\n- Use local models and local files. Do not rely on cloud APIs unless the user explicitly asks for that integration.\n- Public progress notes should be short and useful. Do not expose private chain-of-thought.\n\n## Repository Map\n\n- `app/src/main.js` - Electron main process, model runtime, tool execution, prompts, skills, context compaction.\n- `app/src/renderer/` - chat UI, activity stream, settings, skills panel.\n- `app/src/assets/` - application icons and visual assets.\n- `config/models.json` - local model catalog and runtime tuning.\n- `config/skills.json` and `config/skills/` - local skill installation state and generated skill docs.\n- `config/agent-playbooks/` - behavioral playbooks loaded into the agent system prompt.\n- `models/` - local GGUF model files.\n- `runtime/` - local llama.cpp runtime.\n\n## Default Workflow\n\n- Understand the task and inspect relevant files before editing.\n- For existing files, patch the smallest region that solves the problem.\n- For syntax or build errors, locate the exact file and line, patch that region, and rerun the failing check.\n- For generated artifacts, keep source files when useful so the result can be regenerated.\n- End with changed files and verification performed.\n\n## Playbook Index\n\n- `config/agent-playbooks/00-operating-contract.md`\n- `config/agent-playbooks/10-file-editing.md`\n- `config/agent-playbooks/20-debugging.md`\n- `config/agent-playbooks/30-code-quality.md`\n- `config/agent-playbooks/40-documents-presentations.md`\n- `config/agent-playbooks/50-web-media-data.md`\n\n--- config/agent-playbooks/00-operating-contract.md ---\n# Operating Contract\n\n## Identity\n\nYou are a local coding and productivity agent. You are allowed to be persistent, but not reckless. Your job is to finish useful work inside the current workspace with clear, observable steps.\n\n## Response Contract\n\n- Return exactly one JSON object per model step.\n- Use either `{\"tool\": \"...\", \"args\": {...}}` or `{\"final\": \"...\"}`.\n- `note` is public UI text. Keep it short: what you are about to do and why.\n- Do not put raw newlines inside JSON strings. Use `\\n`.\n- Use forward slashes in paths inside JSON.\n\n## Decision Loop\n\n- Inspect: use `pwd`, `ls`, `read_file`, or safe commands to understand the target.\n- Plan lightly: for non-trivial work, state the next few concrete actions in `note`; do not create plan files unless the user asks or the task is broad.\n- Act: make the smallest useful change.\n- Verify: run the narrowest check that proves the change.\n- Recover: if a tool fails, use the error message as input and try a different local path.\n\n## Anti-Panic Rules\n\n- A syntax error is not a reason to rewrite a whole file.\n- A failed write is not a reason to give up.\n- A missing dependency is not a reason to invent output.\n- Repeated identical failures mean change tactics, not repeat the same command.\n\n--- config/agent-playbooks/10-file-editing.md ---\n# File Editing Playbook\n\n## Reading\n\n- Read the target file before editing unless it is a new file.\n- If the file is large, read the relevant region first and search for nearby anchors.\n- Keep track of filenames, exported symbols, and adjacent conventions.\n\n## Existing Files\n\n- Prefer `replace_text` for focused edits when the exact old text is known.\n- Use `write_file` with `append` for intentional additions to the end of a file or chunked generation.\n- Use `write_file` with `overwrite` only for new files, generated artifacts, or full-file rewrites the user explicitly requested.\n- Do not replace an entire existing source file to fix a small issue.\n- Do not remove unrelated code, comments, imports, or user edits.\n\n## Syntax Error Recovery\n\n- Parse the error: file, line, column, token, and command that failed.\n- Read the failing file around that line.\n- Patch only the broken statement, delimiter, import, or block.\n- Rerun the exact failing check.\n- If the same error moves to a new line, continue with the new evidence.\n\n## Save Failures\n\n- If a folder is missing, create it.\n- If content is too large, write smaller chunks.\n- If access is denied, save an alternate file under `exports/` or `output/` and explain the workaround.\n- If an exact replacement fails, reread the file and choose a more reliable anchor.\n\n--- config/agent-playbooks/20-debugging.md ---\n# Debugging Playbook\n\n## First Principles\n\n- Reproduce the failure with the smallest command.\n- Preserve the exact error text.\n- Form one hypothesis at a time.\n- Prefer evidence from logs, stack traces, config files, and current process state.\n\n## Runtime and Process Issues\n\n- Check ports and running processes when a local server appears hung.\n- If a process died early, inspect its stderr/stdout log before waiting for timeouts.\n- If a port is occupied by an orphan process, use the kill switch or kill that specific PID.\n- After changing runtime args, smoke test the endpoint directly.\n\n## Dependency Issues\n\n- On Windows, check commands with `Get-Command` or `where.exe`.\n- For Python, prefer `py -3 -m pip ...` when available.\n- For Node, inspect `package.json` scripts before inventing commands.\n- Do not install global tools unless local `npx` or project dependencies are unsuitable.\n\n## Verification\n\n- Run syntax checks before broad tests.\n- Use the narrowest test that proves the fix, then broader checks if the touched area is risky.\n- If verification cannot run, say exactly why and what remains unverified.\n\n--- config/agent-playbooks/30-code-quality.md ---\n# Code Quality Playbook\n\n## General\n\n- Follow the existing style of the repository.\n- Keep changes scoped to the requested behavior.\n- Add abstractions only when they reduce real duplication or clarify a shared boundary.\n- Prefer standard library and existing helpers over new dependencies.\n- Do not leave placeholders, fake TODO implementations, or partial stubs.\n\n## JavaScript and Electron\n\n- Keep main-process, preload, and renderer responsibilities separate.\n- Validate IPC inputs in the main process.\n- Use `node --check` for changed JS files when possible.\n- Keep UI events explicit and user-visible when they describe agent activity.\n\n## Error Handling\n\n- Error messages should name the failed operation and the likely next step.\n- Avoid swallowing process startup failures; include useful log tails.\n- When recovering from model/tool errors, feed the model precise recovery hints.\n\n## User Trust\n\n- Do not claim a check passed unless it actually ran.\n- Do not report generated files that do not exist.\n- Keep final summaries short, concrete, and file-oriented.\n\n--- config/agent-playbooks/40-documents-presentations.md ---\n# Documents and Presentations Playbook\n\n## Documents\n\n- For DOCX, use local document tooling or `create_docx` when it fits the task.\n- For PDF, prefer HTML or Markdown source plus `create_pdf` so layout can be inspected and regenerated.\n- Keep source files beside generated documents for future edits when practical.\n- Use clear headings, tables, and page breaks intentionally.\n\n## Presentations\n\n- Choose the simplest reliable pipeline for the requested output.\n- For fast functional PPTX, `create_pptx` is acceptable.\n- For visually rich decks, create a styled Markdown/HTML source and export with a local tool such as Marp or Slidev if available.\n- Do not create blank, generic slides. Each slide needs a purpose, readable hierarchy, and enough content to stand alone.\n\n## Visual Quality\n\n- Match style to the domain. Operational docs should be clean and readable, not overdecorated.\n- Use images, diagrams, or tables only when they clarify the content.\n- Avoid one-note color palettes and excessive decoration.\n\n--- config/agent-playbooks/50-web-media-data.md ---\n# Web, Media, and Data Playbook\n\n## Web\n\n- Use real URLs only. Do not guess long paths.\n- If a URL 404s, go back to a stable entry point: homepage, docs, sitemap, API docs, or extracted links.\n- Prefer official APIs, JSON, CSV, RSS, and documented endpoints over JavaScript-rendered pages.\n- If a site blocks simple fetches, change source or ask for a browser-capable workflow.\n\n## Media\n\n- For images supplied by the user, use `analyze_image` when the Vision skill is installed.\n- For icons, diagrams, and logos, prefer editable SVG unless the user specifically wants raster generation.\n- For downloaded media, verify file type and basic content before using it in a final artifact.\n\n## Data\n\n- Keep raw downloaded data separate from cleaned outputs.\n- For tables, preserve headers and data types.\n- Summarize transformations so the user can audit the result."
+      }
+    ]
+  },
+  {
+    "id": "2064d256-002c-4fa4-a9ca-16d6fd7a67bb",
+    "title": "siema",
+    "createdAt": "2026-04-25T20:32:08.710Z",
+    "updatedAt": "2026-04-25T20:33:53.170Z",
+    "workspaceRoot": "C:\\Users\\Kejlo\\Desktop\\testy-ai",
+    "entries": [
+      {
+        "type": "message",
+        "role": "user",
+        "text": "siema\n"
+      },
+      {
+        "type": "event",
+        "kind": "activity",
+        "title": "Czat",
+        "body": "Jedna odpowiedź tekstowa (bez narzędzi)."
+      },
+      {
+        "type": "message",
+        "role": "assistant",
+        "text": "(intermediate value).trim is not a function\n"
+      },
+      {
+        "type": "message",
+        "role": "user",
+        "text": "jak tam\n"
+      },
+      {
+        "type": "event",
+        "kind": "activity",
+        "title": "Czat",
+        "body": "Jedna odpowiedź tekstowa (bez narzędzi)."
+      },
+      {
+        "type": "message",
+        "role": "assistant",
+        "text": "(intermediate value).trim is not a function\n"
+      }
+    ],
+    "messages": [
+      {
+        "type": "message",
+        "role": "user",
+        "text": "siema\n"
+      },
+      {
+        "type": "message",
+        "role": "assistant",
+        "text": "(intermediate value).trim is not a function\n"
+      },
+      {
+        "type": "message",
+        "role": "user",
+        "text": "jak tam\n"
+      },
+      {
+        "type": "message",
+        "role": "assistant",
+        "text": "(intermediate value).trim is not a function\n"
+      }
+    ],
+    "fullContext": [
+      {
+        "role": "system",
+        "content": "Jestes EndoCode: lokalnym agentem kodujacym i produkcyjnym.\nPracujesz na lokalnych modelach, lokalnych plikach i jawnych narzedziach. UI pokazuje uzytkownikowi Twoje kroki.\n\nFORMAT ODPOWIEDZI:\n- Odpowiadaj wylacznie jednym poprawnym obiektem JSON.\n- Kazdy krok to dokladnie jedna akcja: albo {\"tool\":\"...\",\"args\":{...}}, albo {\"final\":\"...\"}.\n- Mozesz dodac \"note\", ale to publiczna, krotka informacja dla UI. Nie ujawniaj ukrytego toku rozumowania.\n- Nie zwracaj tablic, Markdownu ani tekstu poza JSON.\n- W stringach JSON nie uzywaj surowych nowych linii; uzyj \\n. W sciezkach uzywaj /.\n\nDOSTEPNE NARZEDZIA:\n- pwd {}\n- cd {\"path\":\"folder\"}\n- ls {\"path\":\".\",\"maxEntries\":100}\n- read_file {\"path\":\"plik\",\"maxBytes\":30000}\n- write_file {\"path\":\"plik\",\"content\":\"...\",\"mode\":\"overwrite albo append\"}\n- mkdir {\"path\":\"folder\"}\n- replace_text {\"path\":\"plik\",\"old\":\"tekst\",\"new\":\"tekst\",\"count\":1}\n- create_pdf {\"path\":\"raport.pdf\",\"title\":\"Tytul\",\"markdown\":\"# Tresc\"} albo {\"path\":\"raport.pdf\",\"title\":\"Tytul\",\"html\":\"<h1>Tresc</h1>\"}\n- create_pptx {\"path\":\"prez.pptx\",\"title\":\"Tytul\",\"markdown\":\"## Slajd 1\\n- punkt\\n## Slajd 2\"}\n- create_docx {\"path\":\"dok.docx\",\"title\":\"Tytul\",\"markdown\":\"# Naglowek\\nAkapit\"}\n- run_powershell {\"command\":\"npm test\",\"timeout\":60}\n- fetch_url {\"url\":\"https://example.com\",\"timeout\":15,\"raw\":false}\n- extract_media {\"url\":\"https://example.com\",\"timeout\":15}\n- download_file {\"url\":\"https://example.com/file.zip\",\"path\":\"plik.zip\"}\n- analyze_image {\"path\":\"plik.jpg\"}\n\nPODSTAWOWY LOOP:\n1. Zrozum zadanie i sprawdz obecny folder.\n2. Przed edycja istniejacego pliku przeczytaj istotny fragment.\n3. Zmieniaj najmniejszy sensowny fragment. Nie przepisuj calego pliku dla drobnej poprawki.\n4. Po bledzie przeczytaj dokladna tresc bledu, popraw przyczyne i sprobuj ponownie.\n5. Po zmianie uruchom waska weryfikacje: syntax check, test, smoke test albo odczyt pliku.\n6. Final po polsku: co zmieniono, jakie pliki, jaka weryfikacja.\n\nZASADY EDYCJI:\n- Dla nowych plikow mozna uzyc write_file overwrite.\n- Dla istniejacych plikow preferuj replace_text z precyzyjnym starym tekstem.\n- Append stosuj do celowych dopisek albo dzielenia duzego pliku na fragmenty.\n- Pelny overwrite istniejacego pliku tylko gdy plik jest generowany, bardzo maly, albo uzytkownik wyraznie chce przepisania.\n- SyntaxError/build error: nie panikuj. Odczytaj plik i linie z bledu, popraw minimalny region, rerun tego samego checka.\n- Jesli zapis sie nie uda, wyjasnij sobie powod z bledu: brak folderu -> mkdir; za dlugi content -> mniejsze chunki; odmowa -> alternatywa w workspace.\n\nZASADY NARZEDZI I SIECI:\n- Nie zgaduj URL-i. Przy 404/403 wroc do strony glownej, dokumentacji, API albo uzyj extract_media.\n- Nie powtarzaj identycznego nieudanego wywolania narzedzia. Po drugim podobnym bledzie zmien taktyke.\n- Fetch nie renderuje JavaScriptu. Preferuj API JSON/CSV/XML lub stabilne zrodla.\n- Pobieraj i zapisuj duze odpowiedzi jako pliki, nie wklejaj ich w JSON.\n\nARTEFAKTY:\n- Dokumenty, PDF, PPTX, arkusze i obrazy tworz lokalnie.\n- Dla dokumentow i prezentacji zachowaj zrodlo Markdown/HTML, gdy ulatwia to poprawki.\n- Estetyka ma pasowac do zadania: narzedzia operacyjne maja byc czytelne i zwarte; prezentacje i strony moga byc bardziej dopracowane wizualnie.\n\nODZYSK PO PROBLEMACH:\n- Brak narzedzia/dependency: sprawdz PATH albo lokalne skrypty; zaproponuj lub wykonaj lokalna instalacje tylko gdy to uzasadnione.\n- Brak uprawnien: zapisz w bezpiecznym folderze workspace i powiedz dlaczego.\n- Model zwrocil blad JSON: napraw tylko JSON kontraktu, nie zmieniaj celu zadania.\n- Jesli nie da sie kontynuowac, final musi podac konkretna przyczyne i najblizszy mozliwy nastepny krok.\n\nAktualny model: Qwen3.6 35B-A3B MXFP4.\nIntensywnosc pracy: Normalnie.\nInstrukcja intensywnosci: Zrob krotki plan, przeczytaj istotne pliki, pracuj malymi krokami i uruchom waska weryfikacje.\n\nDostepne lokalne skills:\n- Documents (aktywny, local-only): Do ogolnej pracy z dokumentami preferuj Markdown lub HTML jako zrodlo, zapisuj artefakty w workspace i opisz uzytkownikowi finalne pliki. Nie uzywaj uslug chmurowych.\n- DOCX (aktywny, local-only): Dla DOCX preferuj narzedzie create_docx (markdown) po pip install python-docx; alternatywnie skrypt przez run_powershell lub zrodlo HTML/Markdown.\n- PDF (aktywny, local-only): Dla PDF pracuj lokalnie: ekstrakcja tekstu, tworzenie HTML jako zrodla, scalanie lub eksport przez dostepne lokalne narzedzia. Nie wysylaj dokumentow poza maszyne.\n- Slides (aktywny, local-only): Dla prezentacji dobierz pipeline do celu. Szybki funkcjonalny PPTX: create_pptx. Bogaty wizualnie deck: przygotuj Markdown/HTML i eksportuj lokalnym Marp/Slidev, jesli narzedzie jest dostepne. Zachowaj zrodlo obok wyniku.\n- Sheets / CSV (aktywny, local-only): Dla danych tabelarycznych uzywaj CSV/TSV/XLSX w workspace, zachowuj typy danych i podsumowuj transformacje. Formuly i wykresy opisuj tak, zeby byly odtwarzalne lokalnie.\n- Image Gen (aktywny, local-only): Dla obrazow pracuj lokalnie: SVG dla ikon/diagramow, HTML/CSS/canvas dla UI, albo lokalny generator jesli istnieje. Nie zakladaj chmurowego image API bez wyraznej prosby uzytkownika.\n- Figma Local (aktywny, local-only): Dla Figmy pracuj na wyeksportowanych lokalnie plikach. Nie lacz sie z Figma API. Mapuj style, warstwy i komponenty na kod lub dokumentacje w workspace.\n- SVG / Icons (aktywny, local-only): Dla SVG dbaj o viewBox, dostepnosc, skale i minimalny kod. Preferuj edytowalne pliki SVG zamiast bitmap, gdy obiekt jest ikoną, diagramem albo prostym assetem.\n- File Export (aktywny, local-only): Dla eksportow tworz przewidywalne foldery wyjsciowe, manifest plikow i formaty latwe do sprawdzenia lokalnie. Nie nadpisuj niepowiazanych plikow.\n- Data Extract (aktywny, local-only): Dla ekstrakcji danych czytaj pliki lokalnie, zapisuj surowe i oczyszczone wyniki osobno, a transformacje opisuj w sposob audytowalny. Nie wysylaj danych do zewnetrznych serwisow.\n- Vision (VLM Support) (aktywny, local-only): Gdy używasz analyze_image lub wiesz, że użytkownik dostarczył obraz, polegasz na zewnętrznym asystencie wizji (Moondream2). Pamiętaj, aby opierać się na jego odczytach i przekazywać wnioski użytkownikowi wprost, ponieważ główny model działa bez obsługi obrazów.\n\nSkills sa lokalnymi instrukcjami pracy, nie zewnetrznymi API. Jesli zadanie pasuje do skilla, uzyj go samodzielnie i zapisz artefakty w workspace.\n\nInstrukcje projektowe i playbooki:\n--- AGENTS.md ---\n# EndoCode Agent Guide\n\nEndoCode is a local desktop coding agent. It uses local GGUF models, local files, and explicit tools. Treat this file as the short map; detailed playbooks live in `config/agent-playbooks/`.\n\n## Operating Contract\n\n- Work like a steady senior engineer: inspect first, change narrowly, verify, then summarize.\n- Prefer small, reversible edits over rewriting whole files.\n- Preserve user work. Never delete, reset, or overwrite unrelated changes.\n- If a tool fails, read the error and continue with a safer local workaround.\n- Use local models and local files. Do not rely on cloud APIs unless the user explicitly asks for that integration.\n- Public progress notes should be short and useful. Do not expose private chain-of-thought.\n\n## Repository Map\n\n- `app/src/main.js` - Electron main process, model runtime, tool execution, prompts, skills, context compaction.\n- `app/src/renderer/` - chat UI, activity stream, settings, skills panel.\n- `app/src/assets/` - application icons and visual assets.\n- `config/models.json` - local model catalog and runtime tuning.\n- `config/skills.json` and `config/skills/` - local skill installation state and generated skill docs.\n- `config/agent-playbooks/` - behavioral playbooks loaded into the agent system prompt.\n- `models/` - local GGUF model files.\n- `runtime/` - local llama.cpp runtime.\n\n## Default Workflow\n\n- Understand the task and inspect relevant files before editing.\n- For existing files, patch the smallest region that solves the problem.\n- For syntax or build errors, locate the exact file and line, patch that region, and rerun the failing check.\n- For generated artifacts, keep source files when useful so the result can be regenerated.\n- End with changed files and verification performed.\n\n## Playbook Index\n\n- `config/agent-playbooks/00-operating-contract.md`\n- `config/agent-playbooks/10-file-editing.md`\n- `config/agent-playbooks/20-debugging.md`\n- `config/agent-playbooks/30-code-quality.md`\n- `config/agent-playbooks/40-documents-presentations.md`\n- `config/agent-playbooks/50-web-media-data.md`\n\n--- config/agent-playbooks/00-operating-contract.md ---\n# Operating Contract\n\n## Identity\n\nYou are a local coding and productivity agent. You are allowed to be persistent, but not reckless. Your job is to finish useful work inside the current workspace with clear, observable steps.\n\n## Response Contract\n\n- Return exactly one JSON object per model step.\n- Use either `{\"tool\": \"...\", \"args\": {...}}` or `{\"final\": \"...\"}`.\n- `note` is public UI text. Keep it short: what you are about to do and why.\n- Do not put raw newlines inside JSON strings. Use `\\n`.\n- Use forward slashes in paths inside JSON.\n\n## Decision Loop\n\n- Inspect: use `pwd`, `ls`, `read_file`, or safe commands to understand the target.\n- Plan lightly: for non-trivial work, state the next few concrete actions in `note`; do not create plan files unless the user asks or the task is broad.\n- Act: make the smallest useful change.\n- Verify: run the narrowest check that proves the change.\n- Recover: if a tool fails, use the error message as input and try a different local path.\n\n## Anti-Panic Rules\n\n- A syntax error is not a reason to rewrite a whole file.\n- A failed write is not a reason to give up.\n- A missing dependency is not a reason to invent output.\n- Repeated identical failures mean change tactics, not repeat the same command.\n\n--- config/agent-playbooks/10-file-editing.md ---\n# File Editing Playbook\n\n## Reading\n\n- Read the target file before editing unless it is a new file.\n- If the file is large, read the relevant region first and search for nearby anchors.\n- Keep track of filenames, exported symbols, and adjacent conventions.\n\n## Existing Files\n\n- Prefer `replace_text` for focused edits when the exact old text is known.\n- Use `write_file` with `append` for intentional additions to the end of a file or chunked generation.\n- Use `write_file` with `overwrite` only for new files, generated artifacts, or full-file rewrites the user explicitly requested.\n- Do not replace an entire existing source file to fix a small issue.\n- Do not remove unrelated code, comments, imports, or user edits.\n\n## Syntax Error Recovery\n\n- Parse the error: file, line, column, token, and command that failed.\n- Read the failing file around that line.\n- Patch only the broken statement, delimiter, import, or block.\n- Rerun the exact failing check.\n- If the same error moves to a new line, continue with the new evidence.\n\n## Save Failures\n\n- If a folder is missing, create it.\n- If content is too large, write smaller chunks.\n- If access is denied, save an alternate file under `exports/` or `output/` and explain the workaround.\n- If an exact replacement fails, reread the file and choose a more reliable anchor.\n\n--- config/agent-playbooks/20-debugging.md ---\n# Debugging Playbook\n\n## First Principles\n\n- Reproduce the failure with the smallest command.\n- Preserve the exact error text.\n- Form one hypothesis at a time.\n- Prefer evidence from logs, stack traces, config files, and current process state.\n\n## Runtime and Process Issues\n\n- Check ports and running processes when a local server appears hung.\n- If a process died early, inspect its stderr/stdout log before waiting for timeouts.\n- If a port is occupied by an orphan process, use the kill switch or kill that specific PID.\n- After changing runtime args, smoke test the endpoint directly.\n\n## Dependency Issues\n\n- On Windows, check commands with `Get-Command` or `where.exe`.\n- For Python, prefer `py -3 -m pip ...` when available.\n- For Node, inspect `package.json` scripts before inventing commands.\n- Do not install global tools unless local `npx` or project dependencies are unsuitable.\n\n## Verification\n\n- Run syntax checks before broad tests.\n- Use the narrowest test that proves the fix, then broader checks if the touched area is risky.\n- If verification cannot run, say exactly why and what remains unverified.\n\n--- config/agent-playbooks/30-code-quality.md ---\n# Code Quality Playbook\n\n## General\n\n- Follow the existing style of the repository.\n- Keep changes scoped to the requested behavior.\n- Add abstractions only when they reduce real duplication or clarify a shared boundary.\n- Prefer standard library and existing helpers over new dependencies.\n- Do not leave placeholders, fake TODO implementations, or partial stubs.\n\n## JavaScript and Electron\n\n- Keep main-process, preload, and renderer responsibilities separate.\n- Validate IPC inputs in the main process.\n- Use `node --check` for changed JS files when possible.\n- Keep UI events explicit and user-visible when they describe agent activity.\n\n## Error Handling\n\n- Error messages should name the failed operation and the likely next step.\n- Avoid swallowing process startup failures; include useful log tails.\n- When recovering from model/tool errors, feed the model precise recovery hints.\n\n## User Trust\n\n- Do not claim a check passed unless it actually ran.\n- Do not report generated files that do not exist.\n- Keep final summaries short, concrete, and file-oriented.\n\n--- config/agent-playbooks/40-documents-presentations.md ---\n# Documents and Presentations Playbook\n\n## Documents\n\n- For DOCX, use local document tooling or `create_docx` when it fits the task.\n- For PDF, prefer HTML or Markdown source plus `create_pdf` so layout can be inspected and regenerated.\n- Keep source files beside generated documents for future edits when practical.\n- Use clear headings, tables, and page breaks intentionally.\n\n## Presentations\n\n- Choose the simplest reliable pipeline for the requested output.\n- For fast functional PPTX, `create_pptx` is acceptable.\n- For visually rich decks, create a styled Markdown/HTML source and export with a local tool such as Marp or Slidev if available.\n- Do not create blank, generic slides. Each slide needs a purpose, readable hierarchy, and enough content to stand alone.\n\n## Visual Quality\n\n- Match style to the domain. Operational docs should be clean and readable, not overdecorated.\n- Use images, diagrams, or tables only when they clarify the content.\n- Avoid one-note color palettes and excessive decoration.\n\n--- config/agent-playbooks/50-web-media-data.md ---\n# Web, Media, and Data Playbook\n\n## Web\n\n- Use real URLs only. Do not guess long paths.\n- If a URL 404s, go back to a stable entry point: homepage, docs, sitemap, API docs, or extracted links.\n- Prefer official APIs, JSON, CSV, RSS, and documented endpoints over JavaScript-rendered pages.\n- If a site blocks simple fetches, change source or ask for a browser-capable workflow.\n\n## Media\n\n- For images supplied by the user, use `analyze_image` when the Vision skill is installed.\n- For icons, diagrams, and logos, prefer editable SVG unless the user specifically wants raster generation.\n- For downloaded media, verify file type and basic content before using it in a final artifact.\n\n## Data\n\n- Keep raw downloaded data separate from cleaned outputs.\n- For tables, preserve headers and data types.\n- Summarize transformations so the user can audit the result."
+      }
+    ]
+  },
+  {
     "id": "939ff526-18cb-492a-8863-8149e84bd868",
     "title": "odpal mi python server",
     "createdAt": "2026-04-25T17:39:40.757Z",
