@@ -95,6 +95,41 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;");
 }
 
+// ── Markdown & LaTeX Config ──
+marked.setOptions({
+  highlight: function (code, lang) {
+    const language = hljs.getLanguage(lang) ? lang : "plaintext";
+    return hljs.highlight(code, { language }).value;
+  },
+  langPrefix: "hljs language-",
+  breaks: true,
+  gfm: true,
+});
+
+function formatMessage(text) {
+  if (!text) return "";
+  // Render Markdown
+  let html = marked.parse(text);
+  
+  // Create a temporary div to use KaTeX auto-render
+  const temp = document.createElement("div");
+  temp.innerHTML = html;
+  
+  renderMathInElement(temp, {
+    delimiters: [
+      { left: "$$", right: "$$", display: true },
+      { left: "$", right: "$", display: false },
+      { left: "\\(", right: "\\)", display: false },
+      { left: "\\[", right: "\\]", display: true },
+      { left: "{\\displaystyle", right: "}", display: true }, // User's specific case
+    ],
+    throwOnError: false,
+  });
+  
+  return temp.innerHTML;
+}
+
+
 function generateId() {
   return crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2);
 }
@@ -177,12 +212,12 @@ function addMessage(role, text, imageBase64 = null) {
   }
   
   if (text && text !== "[Wysłano obraz]") {
-    const span = document.createElement("span");
-    span.textContent = text;
-    div.appendChild(span);
-  } else if (!imageBase64) {
-    div.textContent = text || "";
+    const contentDiv = document.createElement("div");
+    contentDiv.className = "message-content";
+    contentDiv.innerHTML = formatMessage(text);
+    div.appendChild(contentDiv);
   }
+
   
   conversation.appendChild(div);
   smartScroll();
@@ -351,15 +386,17 @@ function renderDiff(diff) {
 }
 
 // ── Thinking Bubble ──
-function createThinkingBubble() {
+function createThinkingBubble(step = null) {
+  const stepLabel = step ? `Krok ${step}: ` : "";
   const bubble = document.createElement("div");
   bubble.className = "thinking-bubble";
   bubble.innerHTML = `
     <button class="thinking-toggle" type="button">
-      Myślenie modelu <span class="thinking-spinner"></span>
+      ${stepLabel}Myślenie modelu <span class="thinking-spinner"></span>
     </button>
     <div class="thinking-content"></div>
   `;
+
   bubble.querySelector(".thinking-toggle").addEventListener("click", () => {
     bubble.classList.toggle("expanded");
   });
@@ -975,16 +1012,19 @@ window.endocode.onEvent((event) => {
     return;
   }
   if (event.type === "thinking-start") {
-    currentThinkingBubble = createThinkingBubble();
-    showLive("Model myśli...");
+    currentThinkingBubble = createThinkingBubble(event.step);
+    showLive(event.step ? `Krok ${event.step}: Myślenie...` : "Model myśli...");
     return;
   }
+
   if (event.type === "thinking-delta") {
     if (currentThinkingBubble) appendThinkingText(currentThinkingBubble, event.text);
     const lastLine = (event.full || "").split("\n").filter(Boolean).pop() || "";
-    showLive("Model myśli...", lastLine.slice(0, 120));
+    const stepLabel = event.step ? `Krok ${event.step}: ` : "";
+    showLive(`${stepLabel}Myślenie...`, lastLine.slice(0, 120));
     return;
   }
+
   if (event.type === "thinking-end") {
     if (currentThinkingBubble) {
       finalizeThinkingBubble(currentThinkingBubble);
@@ -993,17 +1033,20 @@ window.endocode.onEvent((event) => {
     return;
   }
   if (event.type === "content-delta") {
-    const preview = (event.full || event.text || "").trim().slice(0, 50000);
-    if (!event.plainChat) {
-      showLive("Model wybiera akcję...");
-      return;
+    const full = event.full || "";
+    const text = event.text || "";
+    const preview = full.trim().slice(0, 50000);
+    
+    const writingLabel = event.plainChat ? "Odpowiedź" : "Model wybiera akcję";
+    const livePhrase = event.plainChat ? "Pisze…" : "Planuje akcję...";
+
+    if (preview) {
+      upsertInlineEvent(MODEL_WRITING_ACTIVITY_ID, "activity", writingLabel, preview);
     }
-    const writingLabel = event.plainChat ? "Odpowiedź" : "Model pisze";
-    const livePhrase = event.plainChat ? "Pisze…" : "Model pisze...";
-    if (preview) upsertInlineEvent(MODEL_WRITING_ACTIVITY_ID, "activity", writingLabel, preview);
     showLive(livePhrase, preview.slice(-500));
     return;
   }
+
   if (event.type === "tool-start") {
     removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
     const label = toolActionLabel(event.tool, event.args);

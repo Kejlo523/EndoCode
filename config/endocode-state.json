@@ -1,6 +1,6 @@
 {
   "selectedModelId": "qwen36-35b-a3b-mxfp4",
-  "reasoningLevel": "max",
+  "reasoningLevel": "medium",
   "accessLevel": "sandbox",
   "customModelSettings": {
     "temperature": 0.15,

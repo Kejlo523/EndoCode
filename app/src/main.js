@@ -79,16 +79,16 @@ const REASONING_LEVELS = {
   high: {
     label: "Dokladnie",
     maxSteps: 24,
-    maxTokens: 2800,
+    maxTokens: 8192,
     temperature: 0.2,
     instruction: "Poswiec wiecej krokow na rozpoznanie, minimalne poprawki, diagnostyke i testy. Note ma byc publiczne i zwiezle.",
   },
   max: {
     label: "Maksymalnie",
     maxSteps: 36,
-    maxTokens: 3800,
+    maxTokens: 16384,
     temperature: 0.25,
-    instruction: "Maksymalna starannosc: rozpoznanie zaleznosci, etapowe wdrozenie, odzysk po bledach i mocniejsza weryfikacja.",
+    instruction: "Maksymalna starannosc: rozpoznanie zaleznosci, etapowe wdrozenie, odzysk po bledach i mocniejsza weryfikacja. Jesli generujesz duze dokumenty (PDF/PPTX), rob to partiami: najpierw zapisz tresc w pliku .md/.html przez write_file (append), a na koncu wywolaj create_... podajac 'inputPath' do tego pliku.",
   },
 };
 
@@ -1136,8 +1136,8 @@ async function killModelServerResources() {
   return { aborted: hadRun, ownedPid, killedPids, port: DEFAULT_PORT, visionPort: VISION_PORT, alive, visionAlive };
 }
 
-async function callModel(messages, abortSignal, streamOptions = {}) {
-  const plainChat = Boolean(streamOptions.plainChat);
+async function callModel(messages, abortSignal, options = {}, step = null) {
+  const plainChat = options.plainChat === true;
   if (abortSignal?.aborted) throw new Error("Przerwano przez uzytkownika.");
   const abortGuard = createModelAbortGuard(abortSignal);
   const reasoning = getReasoningProfile();
@@ -1167,7 +1167,6 @@ async function callModel(messages, abortSignal, streamOptions = {}) {
       throw new Error(`Model API ${res.status}: ${text.slice(0, 600)}`);
     }
 
-    // Stream response for live display
     let fullContent = "";
     let thinkingContent = "";
     let inThinking = false;
@@ -1194,33 +1193,33 @@ async function callModel(messages, abortSignal, streamOptions = {}) {
           const delta = chunk.choices?.[0]?.delta;
           if (!delta) continue;
 
-          // Handle reasoning_content (thinking tokens)
           if (delta.reasoning_content) {
             thinkingContent += delta.reasoning_content;
             if (!inThinking) {
               inThinking = true;
-              emit("thinking-start", {});
+              emit("thinking-start", { step });
             }
-            emit("thinking-delta", { text: delta.reasoning_content, full: thinkingContent });
+            emit("thinking-delta", { text: delta.reasoning_content, full: thinkingContent, step });
           }
 
-          // Handle regular content
           if (delta.content) {
             if (inThinking) {
               inThinking = false;
-              emit("thinking-end", { full: thinkingContent });
+              emit("thinking-end", { full: thinkingContent, step });
             }
+
             fullContent += delta.content;
             if (!plainChat) {
               const firstObject = extractFirstJsonObject(fullContent);
               if (firstObject) {
-                emit("content-delta", { text: firstObject, full: firstObject, plainChat });
-                emit("status", { status: "model-action-ready", detail: "Odebrano pierwsza kompletna akcje JSON; ucinam dalsze generowanie." });
+                emit("content-delta", { text: firstObject, full: firstObject, plainChat, step });
+                emit("status", { status: "model-action-ready", detail: "Odebrano pierwsza kompletna akcje JSON; ucinam dalsze generowanie.", step });
+
                 try { await reader.cancel(); } catch { /* ignore */ }
-                return firstObject;
+                return { content: firstObject, reasoning: thinkingContent };
               }
             }
-            emit("content-delta", { text: delta.content, full: fullContent, plainChat });
+            emit("content-delta", { text: delta.content, full: fullContent, plainChat, step });
           }
         } catch {
           // malformed SSE chunk, skip
@@ -1229,10 +1228,10 @@ async function callModel(messages, abortSignal, streamOptions = {}) {
     }
 
     if (inThinking) {
-      emit("thinking-end", { full: thinkingContent });
+      emit("thinking-end", { full: thinkingContent, step });
     }
 
-    return fullContent;
+    return { content: fullContent, reasoning: thinkingContent };
   } catch (error) {
     if (abortSignal?.aborted) throw new Error("Przerwano przez uzytkownika.");
     if (abortGuard.isTimedOut()) {
@@ -1250,28 +1249,17 @@ function isTransientModelError(error) {
   return /fetch failed|ECONNREFUSED|ECONNRESET|socket|terminated|timeout|nie wyslal danych|Model API 5\d\d/i.test(message);
 }
 
-async function callModelWithRecovery(messages, abortSignal, failedModelIds, streamOptions = {}) {
-  let lastError = null;
-  for (let attempt = 0; attempt <= MODEL_CALL_RETRY_LIMIT; attempt += 1) {
-    try {
-      return await callModel(messages, abortSignal, streamOptions);
-    } catch (error) {
-      if (abortSignal?.aborted) throw error;
-      lastError = error;
-      if (attempt >= MODEL_CALL_RETRY_LIMIT || !isTransientModelError(error)) break;
-      emit("status", {
-        status: "model-call-retry",
-        detail: `Problem z runtime modelu. Restart i ponowna proba (${attempt + 1}/${MODEL_CALL_RETRY_LIMIT}).`,
-      });
-      await stopOwnedServer({ force: true });
-      await ensureServer(DEFAULT_PORT);
-    }
+async function callModelWithRecovery(messages, abortSignal, failedModelIds, options = {}, step = null) {
+  try {
+    const { content, reasoning } = await callModel(messages, abortSignal, options, step);
+    return { content, reasoning };
+  } catch (error) {
+    if (abortSignal?.aborted || !isTransientModelError(error)) throw error;
+    emit("status", { status: "model-error-retry", detail: `Blad polaczenia: ${textPreview(error.message, 120)}. Ponawiam...`, step });
+    await sleep(2000);
+    const { content, reasoning } = await callModel(messages, abortSignal, options, step);
+    return { content, reasoning };
   }
-  if (lastError && isTransientModelError(lastError) && failedModelIds) {
-    const fallback = await switchToFallbackModel(lastError.message || String(lastError), failedModelIds);
-    if (fallback) return callModelWithRecovery(messages, abortSignal, failedModelIds, streamOptions);
-  }
-  throw lastError;
 }
 
 function parseJsonCandidate(candidate) {
@@ -1590,7 +1578,8 @@ Odrzucona odpowiedz (fragment):
 ${String(raw || "").slice(0, 1600)}`;
 }
 
-async function getNextActionWithRepair(abortSignal, failedModelIds) {
+async function getNextActionWithRepair(abortSignal, failedModelIds, step = null) {
+  let actionRawReasoning = "";
   let lastError = null;
   while (true) {
     for (let attempt = 0; attempt <= MODEL_JSON_RETRY_LIMIT; attempt += 1) {
@@ -1600,7 +1589,8 @@ async function getNextActionWithRepair(abortSignal, failedModelIds) {
           detail: `Naprawiam odpowiedz JSON / kontrakt (${attempt}/${MODEL_JSON_RETRY_LIMIT}).`,
         });
       }
-      const raw = await callModelWithRecovery(messages, abortSignal, failedModelIds);
+      const { content: raw, reasoning } = await callModelWithRecovery(messages, abortSignal, failedModelIds, {}, step);
+      if (reasoning) actionRawReasoning = reasoning;
       emit("model-raw", { raw });
       let parsed;
       try {
@@ -1649,7 +1639,8 @@ async function getNextActionWithRepair(abortSignal, failedModelIds) {
         continue;
       }
 
-      return validated.action;
+      return { action: validated.action, reasoning: actionRawReasoning };
+
     }
     const fallback = failedModelIds
       ? await switchToFallbackModel(`niepoprawny JSON lub kontrakt: ${lastError?.message || "blad"}`, failedModelIds)
@@ -1662,6 +1653,7 @@ async function getNextActionWithRepair(abortSignal, failedModelIds) {
   }
   throw new Error(`Model zwrocil niepoprawny JSON lub kontrakt akcji po kilku probach: ${lastError?.message || "nieznany blad"}`);
 }
+
 
 function textPreview(value, limit = 26000) {
   const text = String(value ?? "");
@@ -1756,9 +1748,18 @@ async function createPdfFile(args) {
   await fsp.mkdir(path.join(workspaceRoot, ".tmp"), { recursive: true });
 
   const title = String(args.title || path.basename(pdfPath, ".pdf"));
+  let rawContent = "";
+  if (args.inputPath) {
+    const src = normalizeInsideRoot(args.inputPath);
+    rawContent = await fsp.readFile(src, "utf8");
+  } else {
+    rawContent = args.markdown ?? args.content ?? "";
+  }
+
   const contentHtml = args.html
     ? String(args.html)
-    : simpleMarkdownToHtml(args.markdown ?? args.content ?? "");
+    : simpleMarkdownToHtml(rawContent);
+
   const pageHtml = `<!doctype html>
 <html lang="pl">
 <head>
@@ -1874,12 +1875,19 @@ async function createPptxFile(args) {
   const outPath = target.toLowerCase().endsWith(".pptx") ? target : `${target}.pptx`;
   await fsp.mkdir(path.dirname(outPath), { recursive: true });
   const title = String(args.title || path.basename(outPath, ".pptx"));
-  const markdown = String(args.markdown ?? args.content ?? "");
-  if (!markdown.trim()) throw new Error("create_pptx wymaga niepustego pola markdown (lub content).");
+  let markdown = "";
+  if (args.inputPath) {
+    const src = normalizeInsideRoot(args.inputPath);
+    markdown = await fsp.readFile(src, "utf8");
+  } else {
+    markdown = String(args.markdown ?? args.content ?? "");
+  }
+  if (!markdown.trim()) throw new Error("create_pptx wymaga niepustego pola markdown (lub content) lub inputPath.");
   if (markdown.length > OFFICE_MARKDOWN_MAX) {
-    throw new Error(`Markdown za dlugi (max ${OFFICE_MARKDOWN_MAX} znakow). Zapisz tresc przez write_file i skroc.`);
+    throw new Error(`Tresc za dluga (max ${OFFICE_MARKDOWN_MAX} znakow). Podziel zadanie na mniejsze pliki.`);
   }
   await runPythonOfficeHelper("gen_pptx.py", { out: outPath, title, markdown });
+
   return { path: relativeToRoot(outPath), bytes: fs.statSync(outPath).size, title };
 }
 
@@ -1888,12 +1896,19 @@ async function createDocxFile(args) {
   const outPath = target.toLowerCase().endsWith(".docx") ? target : `${target}.docx`;
   await fsp.mkdir(path.dirname(outPath), { recursive: true });
   const title = String(args.title || path.basename(outPath, ".docx"));
-  const markdown = String(args.markdown ?? args.content ?? "");
-  if (!markdown.trim()) throw new Error("create_docx wymaga niepustego pola markdown (lub content).");
+  let markdown = "";
+  if (args.inputPath) {
+    const src = normalizeInsideRoot(args.inputPath);
+    markdown = await fsp.readFile(src, "utf8");
+  } else {
+    markdown = String(args.markdown ?? args.content ?? "");
+  }
+  if (!markdown.trim()) throw new Error("create_docx wymaga niepustego pola markdown (lub content) lub inputPath.");
   if (markdown.length > OFFICE_MARKDOWN_MAX) {
-    throw new Error(`Markdown za dlugi (max ${OFFICE_MARKDOWN_MAX} znakow). Zapisz tresc przez write_file i skroc.`);
+    throw new Error(`Tresc za dluga (max ${OFFICE_MARKDOWN_MAX} znakow). Podziel zadanie na mniejsze pliki.`);
   }
   await runPythonOfficeHelper("gen_docx.py", { out: outPath, title, markdown });
+
   return { path: relativeToRoot(outPath), bytes: fs.statSync(outPath).size, title };
 }
 
@@ -2720,22 +2735,37 @@ async function runAgent(userText) {
     const reasoning = getReasoningProfile();
     const failedModelIds = new Set();
     const actionCounts = new Map();
+    const reasoningHistory = [];
     const effectiveMaxSteps = customModelSettings.maxSteps === 0
+
       ? 999999
       : (customModelSettings.maxSteps ?? reasoning.maxSteps);
     for (let step = 1; step <= effectiveMaxSteps; step += 1) {
       if (signal.aborted) throw new Error("Przerwano przez uzytkownika.");
       compactMessages();
-      const stepLabel = effectiveMaxSteps >= 999999 ? `krok ${step} (∞)` : `krok ${step}/${effectiveMaxSteps}`;
-      emit("status", { status: "model-thinking", detail: `${getModelConfig().displayName} — ${stepLabel}` });
-      const action = await getNextActionWithRepair(signal, failedModelIds);
-      if (action.note) emit("note", { note: action.note });
+      const stepLabel = effectiveMaxSteps >= 999999 ? `Krok ${step}` : `Krok ${step} / ${effectiveMaxSteps}`;
+      emit("status", { status: "model-thinking", detail: `${getModelConfig().displayName} — ${stepLabel}`, step });
+      const { action, reasoning } = await getNextActionWithRepair(signal, failedModelIds, step);
+      
+      // Loop Detection for Reasoning
+      if (reasoning && reasoning.trim().length > 10) {
+        const lastReasoning = reasoningHistory[reasoningHistory.length - 1];
+        if (lastReasoning === reasoning.trim()) {
+           throw new Error(`Wykryto petle myslenia modelu (identyczne rozumowanie w kroku ${step-1} i ${step}). Zatrzymuje zadanie, aby uniknac nieskonczonej petli.`);
+        }
+        reasoningHistory.push(reasoning.trim());
+        if (reasoningHistory.length > 3) reasoningHistory.shift();
+      }
+
+      if (action.note) emit("note", { note: action.note, step });
 
       if (action.final) {
-        emit("final", { note: action.note || "", text: action.final });
+        emit("final", { note: action.note || "", text: action.final, step });
         messages.push({ role: "assistant", content: JSON.stringify(action) });
         return { ok: true, final: action.final };
       }
+
+
 
       messages.push({ role: "assistant", content: JSON.stringify(action) });
       if (signal.aborted) throw new Error("Przerwano przez uzytkownika.");
