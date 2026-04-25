@@ -1329,8 +1329,9 @@ async function installLlamaRuntime() {
   emit("runtime-install-progress", { phase: "prepare", progress: 5, detail: "Pobieranie metadanych wydania..." });
   const release = await fetchJsonViaHttpsWithRetry("https://api.github.com/repos/ggml-org/llama.cpp/releases/latest", 3);
 
-  const hw = getHardwareModelProfile();
-  const runtimeAssets = rankRuntimeAssets(release?.assets || [], Boolean(hw?.hasNvidiaGpu));
+  // Prefer CPU package for reliability and smaller download size.
+  // GPU-specific runtimes can be added later without blocking first install.
+  const runtimeAssets = rankRuntimeAssets(release?.assets || [], false);
   if (!runtimeAssets.length) {
     throw new Error("Nie znalazlem binarki llama.cpp dla Windows x64 w najnowszym wydaniu.");
   }
@@ -1353,10 +1354,20 @@ async function installLlamaRuntime() {
         emit("status", { status: "runtime-install", detail: `Wybrany asset: ${asset.name}` });
         emit("status", { status: "runtime-install", detail: `Pobieram runtime: ${asset.name}` });
         emit("runtime-install-progress", { phase: "download", progress: 8, detail: `Pobieranie ${asset.name}` });
-        await downloadFileWithProgress(asset.browser_download_url, zipPath, "Pobieranie runtime llama.cpp", (downloadPct) => {
-          const bounded = Math.max(0, Math.min(100, Number(downloadPct) || 0));
-          const uiPct = 8 + Math.round((bounded / 100) * 72);
-          emit("runtime-install-progress", { phase: "download", progress: uiPct, detail: `Pobieranie runtime: ${bounded}%` });
+        await downloadFileWithProgress(asset.browser_download_url, zipPath, "Pobieranie runtime llama.cpp", (downloadPct, downloadedBytes, totalBytes) => {
+          if (totalBytes > 0) {
+            const bounded = Math.max(0, Math.min(100, Number(downloadPct) || 0));
+            const uiPct = 8 + Math.round((bounded / 100) * 72);
+            emit("runtime-install-progress", { phase: "download", progress: uiPct, detail: `Pobieranie runtime: ${bounded}%` });
+          } else {
+            const downloadedMb = Number(downloadedBytes || 0) / 1024 / 1024;
+            const pseudoPct = Math.min(79, 8 + Math.round(downloadedMb));
+            emit("runtime-install-progress", {
+              phase: "download",
+              progress: pseudoPct,
+              detail: `Pobieranie runtime: ${downloadedMb.toFixed(1)} MB`,
+            });
+          }
         });
 
         emit("status", { status: "runtime-install", detail: "Rozpakowuje runtime llama.cpp..." });
