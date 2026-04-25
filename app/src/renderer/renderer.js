@@ -1049,7 +1049,13 @@ const SETTINGS_FIELDS = [
   { id: "topP", slider: "set_topP", display: "val_topP", decimals: 2 },
   { id: "topK", slider: "set_topK", display: "val_topK", decimals: 0 },
   { id: "repeatPenalty", slider: "set_repeatPenalty", display: "val_repeatPenalty", decimals: 2 },
-  { id: "contextTokens", slider: "set_contextTokens", display: "val_contextTokens", decimals: 0 },
+  {
+    id: "contextTokens",
+    slider: "set_contextTokens",
+    display: "val_contextTokens",
+    decimals: 0,
+    formatFn: (v) => Number(v).toLocaleString("pl-PL"),
+  },
   { id: "gpuLayers", slider: "set_gpuLayers", display: "val_gpuLayers", decimals: 0 },
   { id: "maxMessages", slider: "set_maxMessages", display: "val_maxMessages", decimals: 0 },
 ];
@@ -1077,7 +1083,13 @@ async function openSettingsModal() {
     setSlider("set_topP", "val_topP", settings.topP ?? 1.0, 2);
     setSlider("set_topK", "val_topK", settings.topK ?? 0, 0);
     setSlider("set_repeatPenalty", "val_repeatPenalty", settings.repeatPenalty ?? 1.0, 2);
-    setSlider("set_contextTokens", "val_contextTokens", settings.contextTokens ?? eff.contextTokens, 0);
+    setSlider(
+      "set_contextTokens",
+      "val_contextTokens",
+      settings.contextTokens ?? eff.contextTokens,
+      0,
+      (v) => Number(v).toLocaleString("pl-PL"),
+    );
     setSlider("set_gpuLayers", "val_gpuLayers", settings.gpuLayers ?? eff.gpuLayers, 0);
     setSlider("set_maxMessages", "val_maxMessages", settings.maxMessages ?? 32, 0);
   } catch { /* ignore */ }
@@ -1087,8 +1099,16 @@ async function openSettingsModal() {
 function setSlider(sliderId, displayId, value, decimals, formatFn) {
   const slider = document.getElementById(sliderId);
   const display = document.getElementById(displayId);
-  if (slider) slider.value = value;
-  if (display) display.textContent = formatFn ? formatFn(value) : (decimals > 0 ? Number(value).toFixed(decimals) : String(Math.round(value)));
+  let v = Number(value);
+  if (slider && slider.min !== "" && slider.max !== "") {
+    const lo = parseFloat(slider.min);
+    const hi = parseFloat(slider.max);
+    if (Number.isFinite(lo) && Number.isFinite(hi)) {
+      v = Math.min(hi, Math.max(lo, Number.isFinite(v) ? v : lo));
+    }
+  }
+  if (slider) slider.value = v;
+  if (display) display.textContent = formatFn ? formatFn(v) : (decimals > 0 ? Number(v).toFixed(decimals) : String(Math.round(v)));
 }
 
 function collectSettingsFromUI() {

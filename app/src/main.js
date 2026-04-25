@@ -20,6 +20,24 @@ const MODEL_STREAM_IDLE_TIMEOUT_MS = 6 * 60 * 1000;
 const SERVER_SHUTDOWN_TIMEOUT_MS = 6000;
 let MAX_MESSAGES = 32;
 
+/** Górny limit okna kontekstu (llama.cpp -c); suwak w UI do ~2.5 mln — realnie ogranicza RAM/VRAM. */
+const MIN_CONTEXT_TOKENS = 1024;
+const MAX_CONTEXT_TOKENS = 2_500_000;
+/** Ile wiadomości w historii agenta przed kompaktowaniem (górny limit suwaka). */
+const MAX_CHAT_MESSAGES_CAP = 32_768;
+
+function clampContextTokens(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 8192;
+  return Math.min(MAX_CONTEXT_TOKENS, Math.max(MIN_CONTEXT_TOKENS, Math.round(n)));
+}
+
+function clampMaxMessages(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 32;
+  return Math.min(MAX_CHAT_MESSAGES_CAP, Math.max(8, Math.round(n)));
+}
+
 /** Zgodne z gałęziami w executeTool — nie zmieniaj nazw bez aktualizacji obu miejsc. */
 const ALLOWED_TOOLS = new Set([
   "pwd",
@@ -103,6 +121,7 @@ Dostepne narzedzia:
 - Dane z sieci (arkusze, kursy, statystyki): preferuj udokumentowane API HTTPS (JSON/CSV/XML) zamiast statycznych stron HTML, ktore laduja dane w JS. W dokumentacji szukaj stabilnych endpointow (/last/, /latest/, archiwum po dacie) — sciezki typu /today/ lub „aktualny dzien” bywaja 404 do czasu publikacji. Wiele serwisow obsluguje ?format=json / ?format=csv lub naglowek Accept. Calych duzych odpowiedzi nie wklejaj do write_file ani do JSON narzedzia: download_file do workspace, potem read_file (fragment) albo krotka strona HTML z probka wierszy w <pre>.
 
 W fetch_url, extract_media i download_file pole "url" musi byc krotkim prawdziwym adresem (max ok. 2048 znakow). Nie wymyslaj URL ani nie dopisuj powtorzen/zer — jesli nie znasz sciezki, fetch_url na strone glowna domeny, potem extract_media aby wyciagnac prawdziwe linki z HTML.
+- NIGDY nie generuj sciezki przez wielokrotne te same slowa/foldery (np. /cz/segment/segment/segment/...) — to blad modelu; prawdziwe serwisy tak nie dzialaja. Nie znasz sciezki: krotki URL (glowna, dokumentacja API), potem extract_media lub link z wyniku wyszukiwania.
 
 Gdy konczysz (odpowiedz tekstowa dla uzytkownika — cala tresc w polu "final", nie w samym "note"):
 {"note":"krotkie podsumowanie toku pracy","final":"odpowiedz po polsku"}
@@ -942,7 +961,7 @@ async function ensureServer(port = DEFAULT_PORT) {
     throw new Error(`Model nie jest jeszcze gotowy: ${config.displayName} (${percent}%).`);
   }
 
-  const contextTokens = customModelSettings.contextTokens ?? config.contextTokens ?? 8192;
+  const contextTokens = clampContextTokens(customModelSettings.contextTokens ?? config.contextTokens ?? 8192);
   const configuredGpuLayers = customModelSettings.gpuLayers ?? config.gpuLayers ?? 99;
   const gpuLayerAttempts = customModelSettings.gpuLayers != null
     ? [configuredGpuLayers]
@@ -1273,6 +1292,43 @@ function normalizeRootJsonToActionObject(parsed) {
   return first ?? null;
 }
 
+function safeDecodeUrlPathSegment(seg) {
+  try {
+    return decodeURIComponent(String(seg).replace(/\+/g, "%20"));
+  } catch {
+    return String(seg);
+  }
+}
+
+/** Zwraca powod lub null — chroni przed „zapetleniem” segmentu sciezki przez model (np. /a/a/a/...). */
+function getSuspiciousUrlPathIssue(pathname) {
+  const raw = String(pathname ?? "");
+  if (!raw || raw === "/") return null;
+  const parts = raw.split("/").filter(Boolean).map(safeDecodeUrlPathSegment);
+  if (parts.length > 48) return "too_many_segments";
+  let run = 1;
+  let maxConsecutive = 1;
+  for (let i = 1; i < parts.length; i += 1) {
+    if (parts[i] === parts[i - 1]) {
+      run += 1;
+      maxConsecutive = Math.max(maxConsecutive, run);
+    } else {
+      run = 1;
+    }
+  }
+  if (maxConsecutive >= 4) return "consecutive_dup";
+  const freq = new Map();
+  for (const p of parts) {
+    const key = p.toLowerCase();
+    if (!key) continue;
+    freq.set(key, (freq.get(key) || 0) + 1);
+  }
+  for (const n of freq.values()) {
+    if (n >= 10) return "segment_flood";
+  }
+  return null;
+}
+
 function assertReasonableToolUrl(url) {
   const s = String(url ?? "").trim();
   if (!s) throw new Error("URL jest pusty.");
@@ -1289,6 +1345,17 @@ function assertReasonableToolUrl(url) {
   }
   if (!/^https?:$/i.test(parsedUrl.protocol)) {
     throw new Error("Dozwolone sa tylko URL http lub https.");
+  }
+  const pathIssue = getSuspiciousUrlPathIssue(parsedUrl.pathname || "");
+  if (pathIssue === "too_many_segments") {
+    throw new Error(
+      "URL ma zbyt dluga sciezke (za duzo segmentow) — to zwykle blad generacji modelu. Uzyj krotkiego adresu z dokumentacji lub strony glownej domeny.",
+    );
+  }
+  if (pathIssue === "consecutive_dup" || pathIssue === "segment_flood") {
+    throw new Error(
+      "URL zawiera wielokrotne powtorzenia tego samego fragmentu sciezki (typowy blad modelu zamiast prawdziwego linku). Podaj krotki URL z paska przegladarki albo strone glowna + extract_media.",
+    );
   }
   return s;
 }
@@ -1712,6 +1779,12 @@ function getToolRecoveryHint(error, action) {
   }
   if (/URL za dlugi|Nieprawidlowy format URL|Dozwolone sa tylko URL http/i.test(message)) {
     return "Skroc URL do prawdziwego linku (max ok. 2048 znakow). Wejdz na strone glowna domeny przez fetch_url, potem extract_media aby wyciagnac konkretne href z HTML — nie wklejaj sztucznego dlugiego ciagu.";
+  }
+  if (
+    /wielokrotne powtorzenia|za duzo segmentow|typowy blad generacji modelu/i.test(message) &&
+    (tool === "fetch_url" || tool === "extract_media" || tool === "download_file")
+  ) {
+    return "Model czesto „zapetla” ten sam fragment sciezki, gdy nie zna prawdziwego URL. Nie powtarzaj segmentu — wejdz na krotki adres (strona glowna lub dokumentacja), potem extract_media / prawdziwe href z HTML albo znany endpoint API.";
   }
   if (tool === "fetch_url" && /HTTP Error: 404/.test(message)) {
     return "404: sprawdz dokumentacje uslugi — czesto sa trwalsze sciezki (/last/, /latest/, zasoby archiwalne po dacie) zamiast /today/ lub wygaslych linkow. Wiele API: ?format=json, ?format=csv albo naglowek Accept. Duza odpowiedz: download_file, nie calosc w write_file/JSON.";
@@ -2424,8 +2497,11 @@ app.whenReady().then(async () => {
   if (settings.accessLevel) accessLevel = settings.accessLevel;
   if (settings.customModelSettings) {
     Object.assign(customModelSettings, settings.customModelSettings);
+    if (customModelSettings.contextTokens != null) {
+      customModelSettings.contextTokens = clampContextTokens(customModelSettings.contextTokens);
+    }
   }
-  if (settings.maxMessages) MAX_MESSAGES = Math.max(8, settings.maxMessages);
+  if (settings.maxMessages) MAX_MESSAGES = clampMaxMessages(settings.maxMessages);
   if (workspaceResult.workspaceFallback?.used) saveAppSettings();
   createWindow();
   if (workspaceResult.workspaceFallback?.used) {
@@ -2538,9 +2614,9 @@ ipcMain.handle("app:set-model-settings", async (_event, settings) => {
   if (settings.topP !== undefined) customModelSettings.topP = settings.topP;
   if (settings.topK !== undefined) customModelSettings.topK = settings.topK;
   if (settings.repeatPenalty !== undefined) customModelSettings.repeatPenalty = settings.repeatPenalty;
-  if (settings.contextTokens !== undefined) customModelSettings.contextTokens = settings.contextTokens;
+  if (settings.contextTokens !== undefined) customModelSettings.contextTokens = clampContextTokens(settings.contextTokens);
   if (settings.gpuLayers !== undefined) customModelSettings.gpuLayers = settings.gpuLayers;
-  if (settings.maxMessages !== undefined) MAX_MESSAGES = Math.max(8, settings.maxMessages);
+  if (settings.maxMessages !== undefined) MAX_MESSAGES = clampMaxMessages(settings.maxMessages);
   saveAppSettings();
   // If context/gpu changed, need server restart
   if (settings.contextTokens !== undefined || settings.gpuLayers !== undefined) {
