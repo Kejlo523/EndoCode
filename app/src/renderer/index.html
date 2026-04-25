@@ -156,6 +156,12 @@
         <strong>Brak llama.cpp</strong>
         <span>Nie znaleziono runtime/llama-server.exe. Zainstaluj runtime llama.cpp w folderze runtime.</span>
         <button type="button" class="runtime-install-btn" id="installRuntimeBtn">Pobierz i zainstaluj</button>
+        <div class="runtime-install-progress hidden" id="runtimeInstallProgress">
+          <div class="runtime-install-progress-track">
+            <div class="runtime-install-progress-fill" id="runtimeInstallProgressFill"></div>
+          </div>
+          <span class="runtime-install-progress-text" id="runtimeInstallProgressText">Przygotowanie...</span>
+        </div>
       </div>
 
       <section class="conversation-area" id="conversationArea">

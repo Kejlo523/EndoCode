@@ -246,6 +246,7 @@ let chatHistory = [];
 let currentChatId = null;
 const VISION_PORT = 11435;
 let previousCpuInfo = os.cpus();
+let nvidiaSmiAvailable = null;
 
 let activeDownloads = new Map();
 // Custom model settings (overrides per-reasoning defaults when set)
@@ -652,34 +653,50 @@ function getSystemInfo() {
   let gpuPercent = -1;
   let vramUsedMB = -1;
   let vramTotalMB = -1;
-  try {
-    const out = execSync("nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits", { timeout: 2000, windowsHide: true }).toString().trim();
-    const firstRow = out.split(/\r?\n/).find((line) => line.trim()) || "";
-    const parts = firstRow.split(",").map((s) => s.trim());
-    gpuPercent = parseInt(parts[0], 10) || 0;
-    vramUsedMB = parseInt(parts[1], 10) || 0;
-    vramTotalMB = parseInt(parts[2], 10) || 0;
-  } catch {
-    // fallback on Windows when nvidia-smi is unavailable
-    if (process.platform === "win32") {
+  if (nvidiaSmiAvailable !== false) {
+    try {
+      const out = execSync("nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits", { timeout: 2000, windowsHide: true }).toString().trim();
+      const firstRow = out.split(/\r?\n/).find((line) => line.trim()) || "";
+      const parts = firstRow.split(",").map((s) => s.trim());
+      gpuPercent = parseInt(parts[0], 10) || 0;
+      vramUsedMB = parseInt(parts[1], 10) || 0;
+      vramTotalMB = parseInt(parts[2], 10) || 0;
+      nvidiaSmiAvailable = true;
+    } catch {
+      nvidiaSmiAvailable = false;
+    }
+  }
+
+  if (nvidiaSmiAvailable === false && process.platform === "win32") {
+    try {
+      const gpuOut = execSync(
+        "powershell -NoProfile -ExecutionPolicy Bypass -Command \"$cards = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Select-Object Name,AdapterRAM; $cards | ConvertTo-Json -Compress\"",
+        { timeout: 4000, windowsHide: true },
+      ).toString().trim();
+      if (gpuOut) {
+        const parsed = JSON.parse(gpuOut);
+        const cards = Array.isArray(parsed) ? parsed : [parsed];
+        const maxVram = cards
+          .map((card) => Number(card?.AdapterRAM || 0))
+          .filter((value) => Number.isFinite(value) && value > 0)
+          .sort((a, b) => b - a)[0];
+        if (maxVram) vramTotalMB = Math.round(maxVram / (1024 * 1024));
+      }
+    } catch { /* ignore WMI fallback errors */ }
+    if (gpuPercent < 0) {
       try {
-        const gpuOut = execSync(
-          "powershell -NoProfile -ExecutionPolicy Bypass -Command \"$cards = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Select-Object Name,AdapterRAM; $cards | ConvertTo-Json -Compress\"",
+        const gpuWmiOut = execSync(
+          "powershell -NoProfile -ExecutionPolicy Bypass -Command \"$g = Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine -ErrorAction SilentlyContinue; if ($g) { [math]::Round((($g | Measure-Object -Property UtilizationPercentage -Average).Average),0) }\"",
           { timeout: 4000, windowsHide: true },
         ).toString().trim();
-        if (gpuOut) {
-          const parsed = JSON.parse(gpuOut);
-          const cards = Array.isArray(parsed) ? parsed : [parsed];
-          const maxVram = cards
-            .map((card) => Number(card?.AdapterRAM || 0))
-            .filter((value) => Number.isFinite(value) && value > 0)
-            .sort((a, b) => b - a)[0];
-          if (maxVram) vramTotalMB = Math.round(maxVram / (1024 * 1024));
-        }
-      } catch { /* ignore WMI fallback errors */ }
+        const value = Number.parseFloat(gpuWmiOut);
+        if (Number.isFinite(value)) gpuPercent = Math.max(0, Math.min(100, Math.round(value)));
+      } catch { /* ignore WMI perf fallback errors */ }
+    }
+    if (gpuPercent < 0) {
       try {
         const gpuCounterOut = execSync(
-          "powershell -NoProfile -ExecutionPolicy Bypass -Command \"$s = Get-Counter '\\GPU Engine(*)\\Utilization Percentage' -ErrorAction SilentlyContinue; if ($s -and $s.CounterSamples) { [math]::Round((($s.CounterSamples | Measure-Object -Property CookedValue -Sum).Sum), 0) }\"",
+          "powershell -NoProfile -ExecutionPolicy Bypass -Command \"$s = Get-Counter '\\GPU Engine(*)\\Utilization Percentage' -ErrorAction SilentlyContinue; if ($s -and $s.CounterSamples) { [math]::Round((($s.CounterSamples | Measure-Object -Property CookedValue -Average).Average), 0) }\"",
           { timeout: 4000, windowsHide: true },
         ).toString().trim();
         const value = Number.parseFloat(gpuCounterOut);
@@ -935,6 +952,59 @@ async function fetchJson(url, options = {}) {
     throw new Error(`${res.status} ${res.statusText}${text ? `: ${text.slice(0, 160)}` : ""}`);
   }
   return res.json();
+}
+
+function fetchJsonViaHttps(url, timeoutMs = 45000) {
+  return new Promise((resolve, reject) => {
+    const request = https.get(url, {
+      headers: {
+        "Accept": "application/json",
+        "User-Agent": "EndoCode-Desktop-App",
+      },
+    }, (response) => {
+      if ([301, 302, 303, 307, 308].includes(response.statusCode)) {
+        const location = response.headers.location;
+        if (!location) {
+          reject(new Error("Przekierowanie bez naglowka Location."));
+          return;
+        }
+        fetchJsonViaHttps(new URL(location, url).toString(), timeoutMs).then(resolve).catch(reject);
+        return;
+      }
+      if (response.statusCode !== 200) {
+        let body = "";
+        response.on("data", (chunk) => { body += chunk.toString("utf8"); });
+        response.on("end", () => reject(new Error(`HTTP ${response.statusCode}: ${body.slice(0, 180)}`)));
+        return;
+      }
+
+      let raw = "";
+      response.on("data", (chunk) => { raw += chunk.toString("utf8"); });
+      response.on("end", () => {
+        try {
+          resolve(JSON.parse(raw));
+        } catch (error) {
+          reject(new Error(`Niepoprawny JSON odpowiedzi: ${error.message}`));
+        }
+      });
+    });
+
+    request.setTimeout(timeoutMs, () => request.destroy(new Error("Timeout pobierania JSON.")));
+    request.on("error", reject);
+  });
+}
+
+async function fetchJsonViaHttpsWithRetry(url, attempts = 3) {
+  let lastError = null;
+  for (let i = 1; i <= attempts; i += 1) {
+    try {
+      return await fetchJsonViaHttps(url, 45000 + i * 5000);
+    } catch (error) {
+      lastError = error;
+      if (i < attempts) await sleep(600 * i);
+    }
+  }
+  throw lastError || new Error("Nie udalo sie pobrac JSON.");
 }
 
 function estimateTokens(msgs) {
@@ -1248,11 +1318,9 @@ async function installLlamaRuntime() {
     return { ok: true, alreadyInstalled: true, serverExe: alreadyInstalled };
   }
 
-  emit("status", { status: "downloading", detail: "Sprawdzam najnowsze wydanie llama.cpp dla Windows..." });
-  const release = await fetchJson("https://api.github.com/repos/ggml-org/llama.cpp/releases/latest", {
-    headers: { "Accept": "application/vnd.github+json" },
-    signal: AbortSignal.timeout(30000),
-  });
+  emit("status", { status: "runtime-install", detail: "Sprawdzam najnowsze wydanie llama.cpp dla Windows..." });
+  emit("runtime-install-progress", { phase: "prepare", progress: 5, detail: "Pobieranie metadanych wydania..." });
+  const release = await fetchJsonViaHttpsWithRetry("https://api.github.com/repos/ggml-org/llama.cpp/releases/latest", 3);
 
   const hw = getHardwareModelProfile();
   const asset = pickRuntimeAsset(release?.assets || [], Boolean(hw?.hasNvidiaGpu));
@@ -1271,24 +1339,36 @@ async function installLlamaRuntime() {
   await fsp.mkdir(extractDir, { recursive: true });
 
   try {
-    emit("status", { status: "downloading", detail: `Pobieram runtime: ${asset.name}` });
-    await downloadFileWithProgress(asset.browser_download_url, zipPath, "Pobieranie runtime llama.cpp");
-
-    emit("status", { status: "downloading", detail: "Rozpakowuje runtime llama.cpp..." });
-    const unzip = spawnSync("powershell", [
-      "-NoProfile",
-      "-ExecutionPolicy",
-      "Bypass",
-      "-Command",
-      `Expand-Archive -LiteralPath '${zipPath.replace(/'/g, "''")}' -DestinationPath '${extractDir.replace(/'/g, "''")}' -Force`,
-    ], {
-      windowsHide: true,
-      encoding: "utf8",
+    emit("status", { status: "runtime-install", detail: `Pobieram runtime: ${asset.name}` });
+    emit("runtime-install-progress", { phase: "download", progress: 8, detail: `Pobieranie ${asset.name}` });
+    await downloadFileWithProgress(asset.browser_download_url, zipPath, "Pobieranie runtime llama.cpp", (downloadPct) => {
+      const bounded = Math.max(0, Math.min(100, Number(downloadPct) || 0));
+      const uiPct = 8 + Math.round((bounded / 100) * 72);
+      emit("runtime-install-progress", { phase: "download", progress: uiPct, detail: `Pobieranie runtime: ${bounded}%` });
     });
-    if (unzip.status !== 0) {
-      throw new Error(`Rozpakowanie nie powiodlo sie: ${(unzip.stderr || unzip.stdout || "").trim()}`);
-    }
 
+    emit("status", { status: "runtime-install", detail: "Rozpakowuje runtime llama.cpp..." });
+    emit("runtime-install-progress", { phase: "extract", progress: 84, detail: "Rozpakowywanie archiwum..." });
+    await new Promise((resolve, reject) => {
+      const child = spawn("powershell", [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        `Expand-Archive -LiteralPath '${zipPath.replace(/'/g, "''")}' -DestinationPath '${extractDir.replace(/'/g, "''")}' -Force`,
+      ], { windowsHide: true });
+      let stderr = "";
+      let stdout = "";
+      child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+      child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+      child.on("error", reject);
+      child.on("close", (code) => {
+        if (code === 0) resolve();
+        else reject(new Error(`Rozpakowanie nie powiodlo sie: ${(stderr || stdout || "").trim()}`));
+      });
+    });
+
+    emit("runtime-install-progress", { phase: "install", progress: 92, detail: "Kopiowanie runtime..." });
     await fsp.rm(finalDir, { recursive: true, force: true });
     await fsp.mkdir(finalDir, { recursive: true });
     await fsp.cp(extractDir, finalDir, { recursive: true, force: true });
@@ -1297,7 +1377,8 @@ async function installLlamaRuntime() {
     if (!serverExe) {
       throw new Error("Instalacja zakonczona, ale nie znaleziono pliku llama-server.exe.");
     }
-    emit("status", { status: "download-complete", detail: "Runtime llama.cpp zainstalowany." });
+    emit("runtime-install-progress", { phase: "done", progress: 100, detail: "Runtime llama.cpp zainstalowany." });
+    emit("status", { status: "runtime-install-complete", detail: "Runtime llama.cpp zainstalowany." });
     return { ok: true, serverExe, asset: asset.name, tag: release?.tag_name || "latest" };
   } finally {
     await fsp.rm(tempDir, { recursive: true, force: true }).catch(() => {});
@@ -2760,11 +2841,11 @@ async function executeTool(action) {
   return result;
 }
 
-async function downloadFileWithProgress(url, targetPath, label) {
+async function downloadFileWithProgress(url, targetPath, label, onProgress = null) {
   return new Promise((resolve, reject) => {
     https.get(url, (res) => {
       if (res.statusCode === 301 || res.statusCode === 302) {
-        return downloadFileWithProgress(res.headers.location, targetPath, label).then(resolve).catch(reject);
+        return downloadFileWithProgress(res.headers.location, targetPath, label, onProgress).then(resolve).catch(reject);
       }
       if (res.statusCode !== 200) return reject(new Error(`Błąd HTTP ${res.statusCode} pobierania ${label}`));
       
@@ -2778,6 +2859,7 @@ async function downloadFileWithProgress(url, targetPath, label) {
         const now = Date.now();
         if (now - lastReportTime > 500 && totalBytes > 0) {
           const pct = Math.round((downloadedBytes / totalBytes) * 100);
+          if (typeof onProgress === "function") onProgress(pct, downloadedBytes, totalBytes);
           emit("status", { status: "downloading", detail: `${label}: ${pct}%` });
           lastReportTime = now;
         }

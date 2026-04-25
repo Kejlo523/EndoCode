@@ -69,6 +69,9 @@ const hfModelUrl = document.getElementById("hfModelUrl");
 const addHfModel = document.getElementById("addHfModel");
 const runtimeWarning = document.getElementById("runtimeWarning");
 const installRuntimeBtn = document.getElementById("installRuntimeBtn");
+const runtimeInstallProgress = document.getElementById("runtimeInstallProgress");
+const runtimeInstallProgressFill = document.getElementById("runtimeInstallProgressFill");
+const runtimeInstallProgressText = document.getElementById("runtimeInstallProgressText");
 
 
 
@@ -98,6 +101,7 @@ let currentAccessLevel = "sandbox";
 let currentWorkspaceRoot = "";
 let chatSessions = [];
 let activeChatId = null;
+let runtimeInstallInProgress = false;
 
 // ── Helpers ──
 function escapeHtml(value) {
@@ -675,8 +679,13 @@ function applyStateToUi(state) {
     runtimeWarning.classList.toggle("hidden", !runtimeMissing);
     runtimeWarning.title = runtimeMissing ? (state.runtimeStatus?.message || "Brak runtime llama.cpp.") : "";
     if (installRuntimeBtn) {
-      installRuntimeBtn.disabled = !runtimeMissing;
-      installRuntimeBtn.textContent = "Pobierz i zainstaluj";
+      installRuntimeBtn.disabled = !runtimeMissing || runtimeInstallInProgress;
+      installRuntimeBtn.textContent = runtimeInstallInProgress ? "Instalowanie..." : "Pobierz i zainstaluj";
+    }
+    if (runtimeInstallProgress && !runtimeInstallInProgress) {
+      runtimeInstallProgress.classList.add("hidden");
+      if (runtimeInstallProgressFill) runtimeInstallProgressFill.style.width = "0%";
+      if (runtimeInstallProgressText) runtimeInstallProgressText.textContent = "Przygotowanie...";
     }
   }
   renderModelSelect(state);
@@ -1024,23 +1033,26 @@ killServerBtn.addEventListener("click", async () => {
 
 if (installRuntimeBtn) {
   installRuntimeBtn.addEventListener("click", async () => {
+    runtimeInstallInProgress = true;
     installRuntimeBtn.disabled = true;
     installRuntimeBtn.textContent = "Instalowanie...";
+    if (runtimeInstallProgress) runtimeInstallProgress.classList.remove("hidden");
+    if (runtimeInstallProgressFill) runtimeInstallProgressFill.style.width = "2%";
+    if (runtimeInstallProgressText) runtimeInstallProgressText.textContent = "Start instalacji runtime...";
     showLive("Runtime", "Pobieram i instaluje llama.cpp...");
     try {
       const result = await window.endocode.installRuntime();
       if (result?.alreadyInstalled) {
         addInlineEvent("note", "Runtime", "Runtime llama.cpp jest juz zainstalowany.");
-      } else {
-        addInlineEvent("note", "Runtime", "Runtime llama.cpp pobrany i zainstalowany.");
       }
       await refreshState();
     } catch (e) {
       addInlineEvent("error", "Runtime", e.message || String(e));
+      if (runtimeInstallProgressText) runtimeInstallProgressText.textContent = e.message || String(e);
     } finally {
       hideLive();
-      installRuntimeBtn.disabled = false;
-      installRuntimeBtn.textContent = "Pobierz i zainstaluj";
+      runtimeInstallInProgress = false;
+      await refreshState();
     }
   });
 }
@@ -1163,6 +1175,11 @@ window.endocode.onEvent(async (event) => {
       showLive("Vision", event.detail || "Analizuję obraz...");
     } else if (event.status === "downloading") {
       showLive("Pobieranie", event.detail || "");
+    } else if (event.status === "runtime-install") {
+      showLive("Instalacja runtime", event.detail || "");
+    } else if (event.status === "runtime-install-complete") {
+      addInlineEvent("note", "Runtime", event.detail || "Runtime llama.cpp zainstalowany.");
+      showLive("Instalacja runtime", event.detail || "");
     } else if (event.status === "server-killing") showLive("Kill switch...", event.detail || "");
     else if (event.status === "server-killed") showLive("Kill switch", event.detail || "");
     else if (event.status === "server-starting" || event.status === "server-stopping") showLive("Runtime modelu", event.detail || "");
@@ -1185,6 +1202,13 @@ window.endocode.onEvent(async (event) => {
       const progress = event.total > 0 ? `${event.progress}%` : `${downloadedMb} MB`;
       modelsStatus.textContent = `Pobieranie ${event.modelId}: ${progress} (${downloadedMb} MB${totalMb})`;
     }
+    return;
+  }
+  if (event.type === "runtime-install-progress") {
+    const pct = Math.max(0, Math.min(100, Number(event.progress) || 0));
+    if (runtimeInstallProgress) runtimeInstallProgress.classList.remove("hidden");
+    if (runtimeInstallProgressFill) runtimeInstallProgressFill.style.width = `${pct}%`;
+    if (runtimeInstallProgressText) runtimeInstallProgressText.textContent = event.detail || `Instalacja runtime: ${pct}%`;
     return;
   }
   if (event.type === "parse-error") {
