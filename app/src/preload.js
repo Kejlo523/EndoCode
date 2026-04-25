@@ -13,6 +13,7 @@ contextBridge.exposeInMainWorld("endocode", {
   killServer: () => ipcRenderer.invoke("agent:kill-server"),
   approve: (approvalId, approved) => ipcRenderer.invoke("approval:reply", approvalId, approved),
   getSystemInfo: () => ipcRenderer.invoke("app:system-info"),
+  installRuntime: () => ipcRenderer.invoke("app:install-runtime"),
   getContextInfo: () => ipcRenderer.invoke("app:context-info"),
   setAccessLevel: (level) => ipcRenderer.invoke("app:set-access-level", level),
   saveChat: (session) => ipcRenderer.invoke("app:save-chat", session),

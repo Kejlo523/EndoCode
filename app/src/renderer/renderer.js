@@ -68,6 +68,7 @@ const modelsStatus = document.getElementById("modelsStatus");
 const hfModelUrl = document.getElementById("hfModelUrl");
 const addHfModel = document.getElementById("addHfModel");
 const runtimeWarning = document.getElementById("runtimeWarning");
+const installRuntimeBtn = document.getElementById("installRuntimeBtn");
 
 
 
@@ -673,6 +674,10 @@ function applyStateToUi(state) {
     const runtimeMissing = state.runtimeStatus ? !state.runtimeStatus.llamaAvailable : !state.serverExe;
     runtimeWarning.classList.toggle("hidden", !runtimeMissing);
     runtimeWarning.title = runtimeMissing ? (state.runtimeStatus?.message || "Brak runtime llama.cpp.") : "";
+    if (installRuntimeBtn) {
+      installRuntimeBtn.disabled = !runtimeMissing;
+      installRuntimeBtn.textContent = "Pobierz i zainstaluj";
+    }
   }
   renderModelSelect(state);
   renderReasoningSelect(state);
@@ -1016,6 +1021,29 @@ killServerBtn.addEventListener("click", async () => {
     killServerBtn.disabled = false;
   }
 });
+
+if (installRuntimeBtn) {
+  installRuntimeBtn.addEventListener("click", async () => {
+    installRuntimeBtn.disabled = true;
+    installRuntimeBtn.textContent = "Instalowanie...";
+    showLive("Runtime", "Pobieram i instaluje llama.cpp...");
+    try {
+      const result = await window.endocode.installRuntime();
+      if (result?.alreadyInstalled) {
+        addInlineEvent("note", "Runtime", "Runtime llama.cpp jest juz zainstalowany.");
+      } else {
+        addInlineEvent("note", "Runtime", "Runtime llama.cpp pobrany i zainstalowany.");
+      }
+      await refreshState();
+    } catch (e) {
+      addInlineEvent("error", "Runtime", e.message || String(e));
+    } finally {
+      hideLive();
+      installRuntimeBtn.disabled = false;
+      installRuntimeBtn.textContent = "Pobierz i zainstaluj";
+    }
+  });
+}
 
 // ── Auto-resize textarea ──
 promptEl.addEventListener("input", () => {

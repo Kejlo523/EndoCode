@@ -653,12 +653,40 @@ function getSystemInfo() {
   let vramUsedMB = -1;
   let vramTotalMB = -1;
   try {
-    const out = execSync('nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits', { timeout: 2000, windowsHide: true }).toString().trim();
-    const parts = out.split(',').map(s => s.trim());
+    const out = execSync("nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits", { timeout: 2000, windowsHide: true }).toString().trim();
+    const firstRow = out.split(/\r?\n/).find((line) => line.trim()) || "";
+    const parts = firstRow.split(",").map((s) => s.trim());
     gpuPercent = parseInt(parts[0], 10) || 0;
     vramUsedMB = parseInt(parts[1], 10) || 0;
     vramTotalMB = parseInt(parts[2], 10) || 0;
-  } catch { /* no nvidia-smi */ }
+  } catch {
+    // fallback on Windows when nvidia-smi is unavailable
+    if (process.platform === "win32") {
+      try {
+        const gpuOut = execSync(
+          "powershell -NoProfile -ExecutionPolicy Bypass -Command \"$cards = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Select-Object Name,AdapterRAM; $cards | ConvertTo-Json -Compress\"",
+          { timeout: 4000, windowsHide: true },
+        ).toString().trim();
+        if (gpuOut) {
+          const parsed = JSON.parse(gpuOut);
+          const cards = Array.isArray(parsed) ? parsed : [parsed];
+          const maxVram = cards
+            .map((card) => Number(card?.AdapterRAM || 0))
+            .filter((value) => Number.isFinite(value) && value > 0)
+            .sort((a, b) => b - a)[0];
+          if (maxVram) vramTotalMB = Math.round(maxVram / (1024 * 1024));
+        }
+      } catch { /* ignore WMI fallback errors */ }
+      try {
+        const gpuCounterOut = execSync(
+          "powershell -NoProfile -ExecutionPolicy Bypass -Command \"$s = Get-Counter '\\GPU Engine(*)\\Utilization Percentage' -ErrorAction SilentlyContinue; if ($s -and $s.CounterSamples) { [math]::Round((($s.CounterSamples | Measure-Object -Property CookedValue -Sum).Sum), 0) }\"",
+          { timeout: 4000, windowsHide: true },
+        ).toString().trim();
+        const value = Number.parseFloat(gpuCounterOut);
+        if (Number.isFinite(value)) gpuPercent = Math.max(0, Math.min(100, Math.round(value)));
+      } catch { /* ignore perf counter fallback errors */ }
+    }
+  }
 
   return {
     cpu: cpuPercent,
@@ -1183,6 +1211,97 @@ function getRuntimeServerExe() {
     }
   }
   return null;
+}
+
+function pickRuntimeAsset(assets, preferCuda) {
+  if (!Array.isArray(assets) || assets.length === 0) return null;
+  const candidates = assets.filter((asset) => {
+    const name = String(asset?.name || "").toLowerCase();
+    return name.endsWith(".zip") && name.includes("win") && name.includes("x64") && !name.includes("arm");
+  });
+  if (!candidates.length) return null;
+
+  const scoreAsset = (asset) => {
+    const name = String(asset?.name || "").toLowerCase();
+    let score = 0;
+    if (name.includes("llama")) score += 5;
+    if (name.includes("bin")) score += 4;
+    if (name.includes("server")) score += 3;
+    if (preferCuda) {
+      if (name.includes("cuda") || name.includes("cu12") || name.includes("cu11")) score += 30;
+      if (name.includes("vulkan")) score += 15;
+      if (name.includes("cpu")) score += 5;
+    } else {
+      if (name.includes("cpu")) score += 30;
+      if (name.includes("vulkan")) score += 18;
+      if (name.includes("cuda") || name.includes("cu12") || name.includes("cu11")) score += 10;
+    }
+    return score;
+  };
+
+  return candidates.sort((a, b) => scoreAsset(b) - scoreAsset(a))[0] || null;
+}
+
+async function installLlamaRuntime() {
+  const alreadyInstalled = getRuntimeServerExe();
+  if (alreadyInstalled) {
+    return { ok: true, alreadyInstalled: true, serverExe: alreadyInstalled };
+  }
+
+  emit("status", { status: "downloading", detail: "Sprawdzam najnowsze wydanie llama.cpp dla Windows..." });
+  const release = await fetchJson("https://api.github.com/repos/ggml-org/llama.cpp/releases/latest", {
+    headers: { "Accept": "application/vnd.github+json" },
+    signal: AbortSignal.timeout(30000),
+  });
+
+  const hw = getHardwareModelProfile();
+  const asset = pickRuntimeAsset(release?.assets || [], Boolean(hw?.hasNvidiaGpu));
+  if (!asset?.browser_download_url || !asset?.name) {
+    throw new Error("Nie znalazlem binarki llama.cpp dla Windows x64 w najnowszym wydaniu.");
+  }
+
+  const runtimeDir = path.join(BIELIK_HOME, "runtime");
+  const tempDir = path.join(runtimeDir, "_install_tmp");
+  const zipPath = path.join(tempDir, String(asset.name).replace(/[<>:\"\\|?*]/g, "_"));
+  const extractDir = path.join(tempDir, "extract");
+  const releaseTag = String(release?.tag_name || "latest").replace(/[^a-z0-9._-]/gi, "_");
+  const finalDir = path.join(runtimeDir, `llama.cpp-${releaseTag}`);
+
+  await fsp.mkdir(tempDir, { recursive: true });
+  await fsp.mkdir(extractDir, { recursive: true });
+
+  try {
+    emit("status", { status: "downloading", detail: `Pobieram runtime: ${asset.name}` });
+    await downloadFileWithProgress(asset.browser_download_url, zipPath, "Pobieranie runtime llama.cpp");
+
+    emit("status", { status: "downloading", detail: "Rozpakowuje runtime llama.cpp..." });
+    const unzip = spawnSync("powershell", [
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-Command",
+      `Expand-Archive -LiteralPath '${zipPath.replace(/'/g, "''")}' -DestinationPath '${extractDir.replace(/'/g, "''")}' -Force`,
+    ], {
+      windowsHide: true,
+      encoding: "utf8",
+    });
+    if (unzip.status !== 0) {
+      throw new Error(`Rozpakowanie nie powiodlo sie: ${(unzip.stderr || unzip.stdout || "").trim()}`);
+    }
+
+    await fsp.rm(finalDir, { recursive: true, force: true });
+    await fsp.mkdir(finalDir, { recursive: true });
+    await fsp.cp(extractDir, finalDir, { recursive: true, force: true });
+
+    const serverExe = getRuntimeServerExe();
+    if (!serverExe) {
+      throw new Error("Instalacja zakonczona, ale nie znaleziono pliku llama-server.exe.");
+    }
+    emit("status", { status: "download-complete", detail: "Runtime llama.cpp zainstalowany." });
+    return { ok: true, serverExe, asset: asset.name, tag: release?.tag_name || "latest" };
+  } finally {
+    await fsp.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  }
 }
 
 function getModelPath() {
@@ -3267,6 +3386,7 @@ ipcMain.handle("approval:reply", (_event, approvalId, approved) => {
 });
 ipcMain.handle("app:system-info", () => getSystemInfo());
 ipcMain.handle("app:context-info", () => getContextInfo());
+ipcMain.handle("app:install-runtime", async () => installLlamaRuntime());
 ipcMain.handle("app:set-access-level", (_event, level) => {
   if (level !== "sandbox" && level !== "full") throw new Error(`Nieznany poziom: ${level}`);
   accessLevel = level;
