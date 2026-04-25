@@ -26,10 +26,5 @@ npm start
 npm run dist
 ```
 
-Gotowy plik EXE:
 
-```text
-C:\Users\Kejlo\Desktop\bielik\app\dist\win-unpacked\Local Codex.exe
-```
-
-Aplikacja szuka katalogu `models`, `runtime`, `workspace` i `config/model.json` w folderach nadrzednych. Mozesz tez ustawic `BIELIK_HOME`.
+Aplikacja szuka katalogu `models`, `runtime`, `workspace` i `config/model.json` w folderach nadrzednych.
