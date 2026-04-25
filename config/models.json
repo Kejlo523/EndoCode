@@ -82,13 +82,6 @@
       "gpuLayers": 28,
       "source": "bartowski/DeepSeek-Coder-V2-Lite-Instruct-GGUF",
       "description": "Alternatywny coder MoE. Dobry do kodu, ale mniej nowy niz Qwen3."
-    },
-    {
-      "id": "claude-opus-4-5-api",
-      "displayName": "Claude Opus 4.5 (API only)",
-      "kind": "cloud-api",
-      "enabled": false,
-      "description": "Claude nie ma lokalnych wag GGUF do instalacji. To pozycja informacyjna."
     }
   ]
 }

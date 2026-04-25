@@ -60,6 +60,16 @@ const killServerBtn = document.getElementById("killServerBtn");
 const skillsList = document.getElementById("skillsList");
 const skillsCount = document.getElementById("skillsCount");
 const installRecommendedSkillsBtn = document.getElementById("installRecommendedSkills");
+const modelsBtn = document.getElementById("modelsBtn");
+const modelsModal = document.getElementById("modelsModal");
+const closeModels = document.getElementById("closeModels");
+const modelsList = document.getElementById("modelsList");
+const modelsStatus = document.getElementById("modelsStatus");
+const hfModelUrl = document.getElementById("hfModelUrl");
+const addHfModel = document.getElementById("addHfModel");
+
+
+
 
 // System monitor refs
 const cpuBar = document.getElementById("cpuBar");
@@ -723,6 +733,117 @@ async function loadSkills() {
   }
 }
 
+// ══════════════ MODELS ══════════════
+function renderModels(models = []) {
+  if (!modelsList) return;
+  if (!models.length) {
+    modelsList.innerHTML = `<div class="models-empty">Brak modeli w katalogu.</div>`;
+    return;
+  }
+
+  modelsList.innerHTML = models.map((model) => {
+    const status = model.fileStatus || {};
+    const isDownloaded = status.available;
+    const isDownloading = status.downloading;
+    const progress = status.progress || 0;
+
+    let badge = "";
+    if (model.kind === "cloud-api") badge = '<span class="model-badge cloud">Cloud API</span>';
+    else if (isDownloaded) badge = '<span class="model-badge installed">Pobrany</span>';
+    else if (isDownloading) badge = '<span class="model-badge">Pobieranie...</span>';
+    else badge = '<span class="model-badge">Dostępny GGUF</span>';
+
+    const actions = [];
+    if (model.kind !== "cloud-api") {
+      if (isDownloaded) {
+        actions.push(`<button class="model-btn use" onclick="useModel('${escapeHtml(model.id)}')">${model.selected ? "Aktywny" : "Użyj"}</button>`);
+        actions.push(`<button class="model-btn use" onclick="openSettingsModal()">Ustawienia</button>`);
+        actions.push(`<button class="model-btn delete" onclick="deleteModel('${escapeHtml(model.id)}')">Usuń</button>`);
+      } else if (isDownloading) {
+        actions.push(`<button class="model-btn download" disabled>Pobieranie ${progress}%...</button>`);
+      } else {
+        const sizeGB = model.expectedBytes ? (model.expectedBytes / 1024 / 1024 / 1024).toFixed(1) : "?";
+        actions.push(`<button class="model-btn download" onclick="downloadModel('${escapeHtml(model.id)}')">Pobierz (${sizeGB} GB)</button>`);
+      }
+    } else {
+      actions.push(`<button class="model-btn use" onclick="useModel('${escapeHtml(model.id)}')">${model.selected ? "Aktywny" : "Użyj"}</button>`);
+    }
+
+    return `
+      <article class="model-item ${model.selected ? "selected" : ""}">
+        <div class="model-info-header">
+          <div class="model-main-info">
+            <span class="model-name">${escapeHtml(model.displayName)}</span>
+            <span class="model-id">${escapeHtml(model.id)}</span>
+          </div>
+          ${badge}
+        </div>
+        <p class="model-desc">${escapeHtml(model.description)}</p>
+        <div class="model-meta">
+          <div class="model-meta-item">
+            <span>Rodzaj:</span> <strong>${model.kind === "local-gguf" ? "Lokalny" : "API"}</strong>
+          </div>
+          ${model.contextTokens ? `
+          <div class="model-meta-item">
+            <span>Kontekst:</span> <strong>${(model.contextTokens / 1024).toFixed(0)}k</strong>
+          </div>` : ""}
+        </div>
+        ${isDownloading ? `
+        <div class="download-progress-container">
+          <div class="download-progress-fill" style="width: ${progress}%"></div>
+        </div>` : ""}
+        <div class="model-actions">
+          ${actions.join("")}
+        </div>
+      </article>
+    `;
+  }).join("");
+}
+
+async function loadModels() {
+  if (!modelsList) return;
+  modelsList.innerHTML = `<div class="models-empty">Ładowanie...</div>`;
+  try {
+    renderModels(await window.endocode.listModels());
+  } catch (e) {
+    modelsList.innerHTML = `<div class="models-empty error">${escapeHtml(e.message || String(e))}</div>`;
+  }
+}
+
+window.useModel = async (modelId) => {
+  try {
+    setBusy(true);
+    const state = await window.endocode.setModel(modelId);
+    applyStateToUi(state);
+    modelsModal.classList.add("hidden");
+    addInlineEvent("note", "Model", `Wybrano ${state.modelConfig.displayName}`);
+  } catch (e) {
+    addInlineEvent("error", "Model", e.message || String(e));
+  } finally {
+    setBusy(false);
+  }
+};
+
+window.downloadModel = async (modelId) => {
+  try {
+    if (modelsStatus) modelsStatus.textContent = "Rozpoczynam pobieranie...";
+    await window.endocode.downloadModel(modelId);
+    await loadModels();
+  } catch (e) {
+    alert(`Błąd pobierania: ${e.message}`);
+  }
+};
+
+window.deleteModel = async (modelId) => {
+  if (!confirm(`Czy na pewno usunąć plik modelu ${modelId}?`)) return;
+  try {
+    await window.endocode.deleteModel(modelId);
+    await loadModels();
+  } catch (e) {
+    alert(`Błąd usuwania: ${e.message}`);
+  }
+};
+
 // ══════════════ APPROVAL MODAL ══════════════
 function openApproval(request, approvalId) {
   pendingApprovalId = approvalId;
@@ -754,6 +875,30 @@ skillsBtn.addEventListener("click", async () => {
   await loadSkills();
 });
 closeSkills.addEventListener("click", () => skillsModal.classList.add("hidden"));
+
+modelsBtn.addEventListener("click", async () => {
+  modelsModal.classList.remove("hidden");
+  await loadModels();
+});
+closeModels.addEventListener("click", () => modelsModal.classList.add("hidden"));
+
+if (addHfModel) {
+  addHfModel.addEventListener("click", async () => {
+    const url = hfModelUrl.value.trim();
+    if (!url) return;
+    addHfModel.disabled = true;
+    try {
+      await window.endocode.addCustomModel(url);
+      hfModelUrl.value = "";
+      await loadModels();
+      addInlineEvent("note", "Katalog", "Dodano własny model do listy.");
+    } catch (e) {
+      alert(e.message);
+    } finally {
+      addHfModel.disabled = false;
+    }
+  });
+}
 
 if (skillsList) {
   skillsList.addEventListener("click", async (event) => {
@@ -944,7 +1089,7 @@ promptEl.addEventListener("keydown", (event) => {
 });
 
 // ══════════════ EVENT HANDLER ══════════════
-window.endocode.onEvent((event) => {
+window.endocode.onEvent(async (event) => {
   if (event.type === "status") {
     if (event.status === "model-thinking") showLive("Myśli...", event.detail || "");
     else if (event.status === "model-json-retry") showLive("Naprawiam JSON...", event.detail || "");
@@ -972,6 +1117,20 @@ window.endocode.onEvent((event) => {
     } else if (event.status === "server-killing") showLive("Kill switch...", event.detail || "");
     else if (event.status === "server-killed") showLive("Kill switch", event.detail || "");
     else if (event.status === "server-starting" || event.status === "server-stopping") showLive("Runtime modelu", event.detail || "");
+    else if (event.status === "download-complete") {
+      addInlineEvent("note", "Pobieranie", event.detail || "Model pobrany pomyślnie.");
+      loadModels();
+    }
+    return;
+  }
+  if (event.type === "model-download-progress") {
+    // Throttled refresh for the UI
+    const now = Date.now();
+    if (!window._lastModelRefresh || now - window._lastModelRefresh > 500) {
+      window._lastModelRefresh = now;
+      renderModels(await window.endocode.listModels());
+    }
+    if (modelsStatus) modelsStatus.textContent = `Pobieranie ${event.modelId}: ${event.progress}% (${(event.downloaded / 1024 / 1024).toFixed(0)} MB / ${(event.total / 1024 / 1024).toFixed(0)} MB)`;
     return;
   }
   if (event.type === "parse-error") {
@@ -1168,6 +1327,7 @@ async function openSettingsModal() {
   } catch { /* ignore */ }
   settingsModal.classList.remove("hidden");
 }
+window.openSettingsModal = openSettingsModal;
 
 function setSlider(sliderId, displayId, value, decimals, formatFn) {
   const slider = document.getElementById(sliderId);

@@ -1047,6 +1047,9 @@ select:focus { border-color: var(--border-focus); }
   border-radius: 14px;
   padding: 20px;
   box-shadow: var(--shadow-lg);
+  display: flex;
+  flex-direction: column;
+  max-height: 85vh;
 }
 
 .modal-header {
@@ -1142,6 +1145,7 @@ select:focus { border-color: var(--border-focus); }
   font-family: var(--mono);
 }
 .skills-list {
+  flex: 1;
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
@@ -1356,10 +1360,209 @@ select:focus { border-color: var(--border-focus); }
   cursor: wait;
 }
 
+/* ── Models Panel ── */
+.models-card {
+  max-width: 860px;
+  width: 90%;
+}
+
+.models-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border-subtle);
+  margin-bottom: 12px;
+  gap: 12px;
+}
+
+.models-import-group {
+  display: flex;
+  gap: 8px;
+  flex: 1;
+}
+
+.models-import-group input {
+  flex: 1;
+  background: var(--bg-deep);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 6px 12px;
+  color: var(--text);
+  font-size: 13px;
+  outline: none;
+  transition: border-color 0.2s ease;
+}
+
+.models-import-group input:focus {
+  border-color: var(--accent);
+}
+
+.models-status {
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.models-list {
+  flex: 1;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
+  gap: 16px;
+  overflow-y: auto;
+  padding-right: 8px;
+}
+
+.model-item {
+  background: var(--surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  transition: border-color 0.2s ease, transform 0.2s ease;
+}
+
+.model-item:hover {
+  border-color: var(--accent-subtle);
+  transform: translateY(-2px);
+}
+
+.model-item.selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+.model-info-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+}
+
+.model-main-info {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.model-name {
+  font-weight: 600;
+  font-size: 15px;
+  color: var(--text);
+}
+
+.model-id {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.model-badge {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--bg-deep);
+  color: var(--text-secondary);
+}
+
+.model-badge.installed {
+  background: var(--success-bg);
+  color: var(--success);
+}
+
+.model-badge.cloud {
+  background: var(--warning-bg);
+  color: var(--warning);
+}
+
+.model-desc {
+  font-size: 13px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+  flex: 1;
+}
+
+.model-meta {
+  display: flex;
+  gap: 12px;
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+
+.model-meta-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.model-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.model-btn {
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.model-btn.download {
+  background: var(--accent);
+  color: white;
+  border: none;
+}
+
+.model-btn.download:hover {
+  filter: brightness(1.1);
+}
+
+.model-btn.delete {
+  background: transparent;
+  color: var(--danger);
+  border: 1px solid var(--danger-subtle);
+}
+
+.model-btn.delete:hover {
+  background: var(--danger-bg);
+}
+
+.model-btn.use {
+  background: var(--surface-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+
+.model-btn.use:hover {
+  border-color: var(--accent);
+}
+
+.download-progress-container {
+  height: 6px;
+  background: var(--bg-deep);
+  border-radius: 3px;
+  overflow: hidden;
+  margin-top: 8px;
+}
+
+.download-progress-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.3s ease;
+}
+
 /* ══════════════ RESPONSIVE ══════════════ */
 @media (max-width: 900px) {
   .app-shell { grid-template-columns: 240px 1fr; }
   .setting-row { grid-template-columns: 1fr; gap: 8px; }
+  .models-list { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 700px) {

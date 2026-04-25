@@ -247,6 +247,7 @@ let currentChatId = null;
 const VISION_PORT = 11435;
 let previousCpuInfo = os.cpus();
 
+let activeDownloads = new Map();
 // Custom model settings (overrides per-reasoning defaults when set)
 let customModelSettings = {
   temperature: null,     // null = use reasoning profile default
@@ -429,7 +430,14 @@ function loadModelCatalog() {
       },
     ],
   };
-  return readJsonFile(path.join(BIELIK_HOME, "config", "models.json"), fallback);
+  const catalog = readJsonFile(path.join(BIELIK_HOME, "config", "models.json"), fallback);
+  // Filter out Claude Opus (API only) as requested
+  catalog.models = catalog.models.filter(m => m.id !== "claude-opus-4-5-api");
+  return catalog;
+}
+
+function saveModelCatalog(catalog) {
+  writeJsonFile(path.join(BIELIK_HOME, "config", "models.json"), catalog);
 }
 
 function loadAppSettings() {
@@ -2060,7 +2068,7 @@ async function runPowerShell(command, timeoutSeconds) {
         ...process.env,
         TEMP: path.join(workspaceRoot, ".tmp"),
         TMP: path.join(workspaceRoot, ".tmp"),
-        BIELIK_SANDBOX_ROOT: workspaceRoot,
+        AGENT_SANDBOX_ROOT: workspaceRoot,
       },
       windowsHide: true,
     });
@@ -3017,6 +3025,177 @@ ipcMain.handle("app:list-skills", () => getSkillsForUi());
 ipcMain.handle("app:install-skill", (_event, skillId) => installSkill(String(skillId ?? "")));
 ipcMain.handle("app:uninstall-skill", (_event, skillId) => uninstallSkill(String(skillId ?? "")));
 ipcMain.handle("app:install-recommended-skills", () => installRecommendedSkills());
+
+ipcMain.handle("app:list-models", () => {
+  const catalog = loadModelCatalog();
+  return catalog.models.map((model) => {
+    const status = getModelFileStatus(model);
+    const downloadInfo = activeDownloads.get(model.id);
+    return {
+      ...model,
+      available: model.kind === "local-gguf" ? status.available : Boolean(model.enabled),
+      fileStatus: {
+        ...status,
+        downloading: !!downloadInfo,
+        progress: downloadInfo?.progress || 0,
+      },
+      selected: model.id === selectedModelId,
+    };
+  });
+});
+
+ipcMain.handle("app:download-model", async (_event, modelId) => {
+  const catalog = loadModelCatalog();
+  const model = catalog.models.find(m => m.id === modelId);
+  if (!model) throw new Error("Model nie znaleziony w katalogu.");
+  if (model.kind !== "local-gguf") throw new Error("Ten model nie jest lokalnym plikiem GGUF.");
+  
+  const dest = path.resolve(BIELIK_HOME, model.file);
+  const sourceRepo = model.source;
+  const fileName = path.basename(model.file);
+  
+  // Try to derive HF URL from source and file
+  const url = `https://huggingface.co/${sourceRepo}/resolve/main/${fileName}`;
+  
+  try {
+    await performDownload(url, dest, modelId);
+    emit("status", { status: "download-complete", detail: `Pobrano model: ${model.displayName}` });
+    return { ok: true };
+  } catch (error) {
+    throw new Error(`Blad pobierania: ${error.message}`);
+  }
+});
+
+ipcMain.handle("app:delete-model", async (_event, modelId) => {
+  const catalog = loadModelCatalog();
+  const model = catalog.models.find(m => m.id === modelId);
+  if (!model) throw new Error("Model nie znaleziony.");
+  
+  const filePath = path.resolve(BIELIK_HOME, model.file);
+  if (fs.existsSync(filePath)) {
+    fs.unlinkSync(filePath);
+    return { ok: true };
+  }
+  return { ok: false, error: "Plik nie istnieje." };
+});
+
+ipcMain.handle("app:add-custom-model", async (_event, urlOrPath) => {
+  const catalog = loadModelCatalog();
+  let modelUrl = (urlOrPath || "").trim();
+  if (!modelUrl) throw new Error("Link nie moze byc pusty.");
+
+  let repo = "";
+  let file = "";
+  
+  if (modelUrl.startsWith("http")) {
+    try {
+      const u = new URL(modelUrl);
+      const parts = u.pathname.split("/").filter(Boolean);
+      const resolveIndex = parts.indexOf("resolve");
+      if (resolveIndex > 1) {
+        repo = parts.slice(resolveIndex - 2, resolveIndex).join("/");
+        file = parts.slice(resolveIndex + 2).join("/");
+      } else if (parts.length >= 3 && (parts[2] === "blob" || parts[2] === "resolve")) {
+         repo = parts.slice(0, 2).join("/");
+         file = parts.slice(3).join("/");
+      }
+    } catch { /* ignore */ }
+  } else if (modelUrl.includes("/")) {
+    const parts = modelUrl.split("/").filter(Boolean);
+    if (parts.length >= 3) {
+      repo = parts.slice(0, 2).join("/");
+      file = parts.slice(2).join("/");
+    }
+  }
+
+  if (!repo || !file || !file.toLowerCase().endsWith(".gguf")) {
+    throw new Error("Niepoprawny format. Wklej link 'resolve' do pliku .gguf z HuggingFace.");
+  }
+
+  const id = file.replace(/\.gguf$/i, "").toLowerCase().replace(/[^a-z0-9]/g, "-");
+  if (catalog.models.find(m => m.id === id)) throw new Error("Ten model jest juz w katalogu.");
+
+  const newModel = {
+    id,
+    displayName: file.replace(/\.gguf$/i, "").replace(/[-_.]/g, " "),
+    kind: "local-gguf",
+    serverModel: id,
+    file: `models/${file}`,
+    contextTokens: 8192,
+    gpuLayers: 35,
+    source: repo,
+    description: `Własny model dodany z HuggingFace (${repo})`,
+  };
+
+  catalog.models.push(newModel);
+  saveModelCatalog(catalog);
+  return { ok: true, model: newModel };
+});
+
+async function performDownload(url, dest, modelId) {
+  if (activeDownloads.has(modelId)) throw new Error("Pobieranie juz trwa.");
+  
+  const destDir = path.dirname(dest);
+  if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
+
+  const tempDest = dest + ".downloading";
+  const file = fs.createWriteStream(tempDest);
+  
+  activeDownloads.set(modelId, { progress: 0 });
+
+  return new Promise((resolve, reject) => {
+    function startRequest(requestUrl) {
+      const request = https.get(requestUrl, (response) => {
+        if (response.statusCode === 302 || response.statusCode === 301) {
+          startRequest(response.headers.location);
+          return;
+        }
+        
+        if (response.statusCode !== 200) {
+          reject(new Error(`Serwer HF zwrocil blad ${response.statusCode}`));
+          return;
+        }
+
+        const total = parseInt(response.headers["content-length"], 10);
+        let downloaded = 0;
+        let lastPercent = -1;
+
+        response.on("data", (chunk) => {
+          downloaded += chunk.length;
+          const progress = Math.round((downloaded / total) * 100);
+          if (progress !== lastPercent) {
+            lastPercent = progress;
+            activeDownloads.set(modelId, { progress, downloaded, total });
+            emit("agent:event", { type: "model-download-progress", modelId, progress, downloaded, total });
+          }
+        });
+
+        response.pipe(file);
+
+        file.on("finish", () => {
+          file.close();
+          try {
+             if (fs.existsSync(dest)) fs.unlinkSync(dest);
+             fs.renameSync(tempDest, dest);
+             activeDownloads.delete(modelId);
+             resolve();
+          } catch (e) {
+             reject(e);
+          }
+        });
+      });
+
+      request.on("error", (err) => {
+        fs.unlink(tempDest, () => {});
+        activeDownloads.delete(modelId);
+        reject(err);
+      });
+    }
+    
+    startRequest(url);
+  });
+}
+
 ipcMain.handle("app:get-model-settings", () => ({
   ...customModelSettings,
   maxMessages: MAX_MESSAGES,

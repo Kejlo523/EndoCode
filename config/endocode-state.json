@@ -3,7 +3,7 @@
   "reasoningLevel": "medium",
   "accessLevel": "sandbox",
   "customModelSettings": {
-    "temperature": 0.15,
+    "temperature": 0.35,
     "maxTokens": 32512,
     "maxSteps": 0,
     "topP": 1,

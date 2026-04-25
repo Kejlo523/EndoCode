@@ -26,6 +26,10 @@ contextBridge.exposeInMainWorld("endocode", {
   getModelSettings: () => ipcRenderer.invoke("app:get-model-settings"),
   setModelSettings: (settings) => ipcRenderer.invoke("app:set-model-settings", settings),
   resetModelSettings: () => ipcRenderer.invoke("app:reset-model-settings"),
+  listModels: () => ipcRenderer.invoke("app:list-models"),
+  downloadModel: (modelId) => ipcRenderer.invoke("app:download-model", modelId),
+  deleteModel: (modelId) => ipcRenderer.invoke("app:delete-model", modelId),
+  addCustomModel: (urlOrPath) => ipcRenderer.invoke("app:add-custom-model", urlOrPath),
   onEvent: (callback) => {
     const listener = (_event, payload) => callback(payload);
     ipcRenderer.on("agent:event", listener);

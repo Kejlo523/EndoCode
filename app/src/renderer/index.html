@@ -52,6 +52,14 @@
           </svg>
           <span>Skills</span>
         </button>
+        <button class="sidebar-menu-btn" id="modelsBtn" title="Modele">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+            <path d="M1 4h14M1 8h14M1 12h14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+            <rect x="3" y="2" width="10" height="12" rx="1" stroke="currentColor" stroke-width="1.3" />
+          </svg>
+          <span>Modele</span>
+        </button>
+
 
         <div class="workspace-selector">
           <div class="section-label">Workspace</div>
@@ -237,9 +245,9 @@
     </div>
   </div>
 
-  <!-- ── SKILLS PANEL ── -->
+  <!-- ── SKILLS MODAL ── -->
   <div class="modal-overlay hidden" id="skillsModal">
-    <div class="modal-card skills-card">
+    <div class="modal-card">
       <div class="modal-header">
         <svg width="18" height="18" viewBox="0 0 16 16" fill="none">
           <rect x="1" y="1" width="6" height="6" rx="1.5" stroke="#00d4aa" stroke-width="1.3" />
@@ -247,18 +255,43 @@
           <rect x="1" y="9" width="6" height="6" rx="1.5" stroke="#00d4aa" stroke-width="1.3" />
           <rect x="9" y="9" width="6" height="6" rx="1.5" stroke="#00d4aa" stroke-width="1.3" />
         </svg>
-        <span class="modal-title">Skills</span>
+        <span class="modal-title">Zarządzaj Skillami</span>
         <button class="modal-close" id="closeSkills">&times;</button>
       </div>
       <div class="skills-toolbar">
-        <span class="skills-count" id="skillsCount">0 / 10 aktywnych</span>
-        <button class="modal-btn approve" id="installRecommendedSkills">Zainstaluj 10</button>
+        <span class="skills-count" id="skillsCount">0 / 0 aktywnych</span>
+        <button class="modal-btn approve" id="installRecommendedSkills">Instaluj domyślne</button>
       </div>
       <div class="skills-list" id="skillsList">
-        <div class="skills-empty">Ładowanie...</div>
+        <!-- skills cards injected by JS -->
       </div>
     </div>
   </div>
+
+  <!-- ── MODELS PANEL ── -->
+  <div class="modal-overlay hidden" id="modelsModal">
+    <div class="modal-card models-card">
+      <div class="modal-header">
+        <svg width="18" height="18" viewBox="0 0 16 16" fill="none">
+          <path d="M1 4h14M1 8h14M1 12h14" stroke="#00d4aa" stroke-width="1.6" stroke-linecap="round" />
+          <rect x="3" y="2" width="10" height="12" rx="1" stroke="#00d4aa" stroke-width="1.3" />
+        </svg>
+        <span class="modal-title">Biblioteka Modeli</span>
+        <button class="modal-close" id="closeModels">&times;</button>
+      </div>
+      <div class="models-toolbar">
+        <div class="models-import-group">
+          <input type="text" id="hfModelUrl" placeholder="Link do GGUF z HuggingFace..." />
+          <button class="modal-btn approve" id="addHfModel">Dodaj</button>
+        </div>
+        <span class="models-status" id="modelsStatus">Wszystkie systemy gotowe</span>
+      </div>
+      <div class="models-list" id="modelsList">
+        <div class="models-empty">Ładowanie katalogu...</div>
+      </div>
+    </div>
+  </div>
+
 
   <!-- ── SETTINGS MODAL ── -->
   <div class="modal-overlay hidden" id="settingsModal">
@@ -389,7 +422,7 @@
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
 
   <script src="./renderer.js"></script>
 
