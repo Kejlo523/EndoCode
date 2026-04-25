@@ -17,6 +17,8 @@ const MAX_TOOL_URL_LENGTH = 2048;
 const MODEL_JSON_RETRY_LIMIT = 2;
 const MODEL_CALL_RETRY_LIMIT = 1;
 const MODEL_STREAM_IDLE_TIMEOUT_MS = 6 * 60 * 1000;
+const PLAIN_CHAT_MAX_CHARS = 18000;
+const PLAIN_CHAT_REPEAT_CHUNK_LIMIT = 40;
 const SERVER_SHUTDOWN_TIMEOUT_MS = 6000;
 let MAX_MESSAGES = 32;
 
@@ -1703,6 +1705,8 @@ async function callModel(messages, abortSignal, options = {}, step = null) {
     let fullContent = "";
     let thinkingContent = "";
     let inThinking = false;
+    let repeatedChunkCount = 0;
+    let lastChunkNorm = "";
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
@@ -1742,6 +1746,34 @@ async function callModel(messages, abortSignal, options = {}, step = null) {
             }
 
             fullContent += delta.content;
+            if (plainChat) {
+              const chunkNorm = String(delta.content).replace(/\s+/g, " ").trim();
+              if (chunkNorm && chunkNorm.length >= 6) {
+                if (chunkNorm === lastChunkNorm) repeatedChunkCount += 1;
+                else {
+                  repeatedChunkCount = 0;
+                  lastChunkNorm = chunkNorm;
+                }
+                if (repeatedChunkCount >= PLAIN_CHAT_REPEAT_CHUNK_LIMIT) {
+                  emit("status", {
+                    status: "model-action-ready",
+                    detail: "Wykryto petle generacji w trybie czatu. Zatrzymuje odpowiedz kontrolowanie.",
+                    step,
+                  });
+                  try { await reader.cancel(); } catch { /* ignore */ }
+                  break;
+                }
+              }
+              if (fullContent.length >= PLAIN_CHAT_MAX_CHARS) {
+                emit("status", {
+                  status: "model-action-ready",
+                  detail: `Osiagnieto limit dlugosci odpowiedzi w trybie czatu (${PLAIN_CHAT_MAX_CHARS} znakow).`,
+                  step,
+                });
+                try { await reader.cancel(); } catch { /* ignore */ }
+                break;
+              }
+            }
             if (!plainChat) {
               const firstObject = extractFirstJsonObject(fullContent);
               if (firstObject) {
