@@ -431,13 +431,53 @@ function loadModelCatalog() {
     ],
   };
   const catalog = readJsonFile(path.join(BIELIK_HOME, "config", "models.json"), fallback);
+  if (!Array.isArray(catalog.models)) catalog.models = [];
+  for (const preset of loadModelPresets()) {
+    if (!catalog.models.some((model) => model.id === preset.id)) {
+      catalog.models.push(createPresetModelConfig(preset));
+    }
+  }
   // Filter out Claude Opus (API only) as requested
   catalog.models = catalog.models.filter(m => m.id !== "claude-opus-4-5-api");
   return catalog;
 }
 
+function loadModelPresets() {
+  const data = readJsonFile(path.join(BIELIK_HOME, "config", "model-presets.json"), { models: [] });
+  return Array.isArray(data.models) ? data.models : [];
+}
+
+function createPresetModelConfig(preset) {
+  const fileName = safeModelFileName(preset.file || preset.fileName);
+  const runtimeConfig = createRuntimeModelConfig({
+    displayName: preset.displayName,
+    file: fileName,
+    expectedBytes: preset.expectedBytes,
+    category: preset.category,
+    contextTokens: preset.contextTokens,
+    gpuLayers: preset.gpuLayers,
+  });
+  return {
+    id: preset.id || createModelId(fileName, preset.source || "preset"),
+    displayName: preset.displayName || fileName.replace(/\.gguf$/i, "").replace(/[-_.]/g, " "),
+    kind: "local-gguf",
+    serverModel: preset.serverModel || fileName.replace(/\.gguf$/i, "").toLowerCase(),
+    file: `models/${fileName}`,
+    expectedBytes: Number(preset.expectedBytes || 0),
+    source: preset.source,
+    sourceType: preset.sourceType || "huggingface",
+    category: preset.category || runtimeConfig.category,
+    preset: true,
+    description: preset.description || "Preset modelu GGUF.",
+    ...runtimeConfig,
+  };
+}
+
 function saveModelCatalog(catalog) {
-  writeJsonFile(path.join(BIELIK_HOME, "config", "models.json"), catalog);
+  writeJsonFile(path.join(BIELIK_HOME, "config", "models.json"), {
+    ...catalog,
+    models: (catalog.models || []).filter((model) => !model.preset),
+  });
 }
 
 function loadAppSettings() {
@@ -724,6 +764,81 @@ function scoreModelFit({ name, description, fileName, sizeBytes }, profile) {
     quant,
     fitLabel: notes[0] || `Profil: ${profile.target}`,
     fitNotes: notes,
+  };
+}
+
+let cachedModelProfile = null;
+let cachedModelProfileAt = 0;
+
+function getCachedModelProfile() {
+  const now = Date.now();
+  if (!cachedModelProfile || now - cachedModelProfileAt > 60000) {
+    cachedModelProfile = getHardwareModelProfile();
+    cachedModelProfileAt = now;
+  }
+  return cachedModelProfile;
+}
+
+function inferModelCategory({ file, displayName, expectedBytes, category }) {
+  if (category) return category;
+  const paramB = inferParamB(displayName, file);
+  const sizeGB = Number(expectedBytes || 0) / 1073741824;
+  if (paramB >= 24 || sizeGB >= 13) return "large";
+  if (paramB >= 8 || sizeGB >= 5) return "medium";
+  return "small";
+}
+
+function createGpuLayerFallbacks(gpuLayers) {
+  const layers = Number(gpuLayers || 0);
+  if (layers >= 90) return [64, 48, 32];
+  if (layers >= 60) return [48, 32, 16];
+  if (layers >= 32) return [28, 20, 12];
+  if (layers >= 16) return [12, 8, 4];
+  return [];
+}
+
+function createRuntimeModelConfig(model = {}) {
+  const profile = getCachedModelProfile();
+  const expectedBytes = Number(model.expectedBytes || 0);
+  const sizeGB = expectedBytes / 1073741824;
+  const category = inferModelCategory({
+    file: model.file,
+    displayName: model.displayName,
+    expectedBytes,
+    category: model.category,
+  });
+
+  let contextTokens = category === "small" ? 32768 : category === "medium" ? 16384 : 8192;
+  if (sizeGB > 13 && category !== "large") contextTokens = 8192;
+  if (profile.ramGB < 24 && category !== "small") contextTokens = Math.min(contextTokens, 8192);
+  if (Number.isFinite(Number(model.contextTokens)) && Number(model.contextTokens) > 0) {
+    contextTokens = clampContextTokens(model.contextTokens);
+  }
+
+  let gpuLayers = 0;
+  if (profile.hasNvidiaGpu) {
+    if (!sizeGB || sizeGB <= profile.vramGB * 0.72) gpuLayers = 99;
+    else if (sizeGB <= profile.vramGB * 0.95) gpuLayers = 64;
+    else if (sizeGB <= profile.vramGB * 1.2) gpuLayers = 36;
+    else gpuLayers = profile.vramGB >= 10 ? 24 : 12;
+  }
+  if (Number.isFinite(Number(model.gpuLayers)) && Number(model.gpuLayers) >= 0) {
+    gpuLayers = Number(model.gpuLayers);
+  }
+
+  return {
+    category,
+    contextTokens,
+    gpuLayers,
+    gpuLayerFallbacks: createGpuLayerFallbacks(gpuLayers),
+    threads: Math.max(2, Math.min(16, os.cpus().length || 8)),
+    threadsBatch: Math.max(2, Math.min(20, (os.cpus().length || 8) + 4)),
+    batchSize: category === "small" ? 2048 : 1024,
+    ubatchSize: 512,
+    parallel: 1,
+    flashAttention: "on",
+    cacheTypeK: "q8_0",
+    cacheTypeV: "q8_0",
   };
 }
 
@@ -3319,8 +3434,9 @@ function parseModelDownloadInput(input) {
     displayName: displayName || safeFile.replace(/\.gguf$/i, "").replace(/[-_.]/g, " "),
     description: options.description || "",
     expectedBytes: Number(options.expectedBytes || 0),
-    contextTokens: Number(options.contextTokens || 8192),
-    gpuLayers: Number(options.gpuLayers || 35),
+    contextTokens: options.contextTokens == null ? null : Number(options.contextTokens),
+    gpuLayers: options.gpuLayers == null ? null : Number(options.gpuLayers),
+    category: options.category || "",
   };
 }
 
@@ -3330,6 +3446,7 @@ ipcMain.handle("app:add-custom-model", async (_event, input) => {
   const { repo, file, sourceType, downloadUrl } = parsed;
   const id = createModelId(file, repo || sourceType);
   if (catalog.models.find(m => m.id === id)) throw new Error("Ten model jest juz w katalogu.");
+  const runtimeConfig = createRuntimeModelConfig(parsed);
 
   const newModel = {
     id,
@@ -3337,12 +3454,11 @@ ipcMain.handle("app:add-custom-model", async (_event, input) => {
     kind: "local-gguf",
     serverModel: id,
     file: `models/${file}`,
-    contextTokens: parsed.contextTokens,
-    gpuLayers: parsed.gpuLayers,
     expectedBytes: parsed.expectedBytes,
     source: repo || sourceType,
     sourceType,
     downloadUrl,
+    ...runtimeConfig,
     description: parsed.description || `Własny model dodany z ${sourceType === "direct" ? "bezpośredniego linku" : sourceType}.`,
   };
 

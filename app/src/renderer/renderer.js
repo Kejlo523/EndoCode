@@ -758,6 +758,11 @@ function renderModels(models = []) {
     const isDownloaded = status.available;
     const isDownloading = status.downloading;
     const progress = status.progress || 0;
+    const categoryLabel = {
+      small: "Mały",
+      medium: "Średni",
+      large: "Duży",
+    }[model.category] || "";
 
     let badge = "";
     if (model.kind === "cloud-api") badge = '<span class="model-badge cloud">Cloud API</span>';
@@ -795,6 +800,10 @@ function renderModels(models = []) {
           <div class="model-meta-item">
             <span>Rodzaj:</span> <strong>${model.kind === "local-gguf" ? "Lokalny" : "API"}</strong>
           </div>
+          ${categoryLabel ? `
+          <div class="model-meta-item">
+            <span>Rozmiar:</span> <strong>${categoryLabel}</strong>
+          </div>` : ""}
           ${model.contextTokens ? `
           <div class="model-meta-item">
             <span>Kontekst:</span> <strong>${(model.contextTokens / 1024).toFixed(0)}k</strong>
