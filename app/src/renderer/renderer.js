@@ -113,6 +113,11 @@ const modelRenderCacheLibrary = new Map();
 const modelRenderCacheInstalled = new Map();
 const skillRenderCache = new Map();
 const STREAM_RENDER_THROTTLE_MS = 50;
+const liveDurationTrackers = new Map();
+let liveDurationTicker = null;
+let activeRunStartedAtMs = null;
+let currentThinkingSegment = null;
+const activeToolSegments = [];
 
 // ── Helpers ──
 function escapeHtml(value) {
@@ -185,6 +190,63 @@ function shortPath(fullPath) {
   return parts.length > 2 ? `.../${parts.slice(-2).join("/")}` : fullPath;
 }
 
+function parseEventTimeMs(event) {
+  const parsed = Date.parse(event?.at || "");
+  return Number.isFinite(parsed) ? parsed : Date.now();
+}
+
+function formatClockFromIso(isoAt) {
+  const parsed = Date.parse(isoAt || "");
+  const date = Number.isFinite(parsed) ? new Date(parsed) : new Date();
+  return date.toLocaleTimeString("pl-PL", { hour: "2-digit", minute: "2-digit" });
+}
+
+function formatDurationMmSs(durationMs) {
+  const clamped = Math.max(0, Number(durationMs) || 0);
+  const totalSec = Math.floor(clamped / 1000);
+  const mins = Math.floor(totalSec / 60);
+  const secs = totalSec % 60;
+  return `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+}
+
+function renderDurationValue(labelEl, startedAtMs, endedAtMs = null) {
+  if (!labelEl || !Number.isFinite(startedAtMs)) return;
+  const endMs = Number.isFinite(endedAtMs) ? endedAtMs : Date.now();
+  labelEl.textContent = formatDurationMmSs(endMs - startedAtMs);
+}
+
+function ensureDurationTicker() {
+  if (liveDurationTicker) return;
+  liveDurationTicker = setInterval(() => {
+    for (const tracker of liveDurationTrackers.values()) {
+      if (!tracker?.labelEl) continue;
+      if (Number.isFinite(tracker.endedAtMs)) continue;
+      renderDurationValue(tracker.labelEl, tracker.startedAtMs, null);
+    }
+  }, 1000);
+}
+
+function startLiveDuration(key, startedAtMs, labelEl) {
+  if (!key || !labelEl) return;
+  liveDurationTrackers.set(key, { startedAtMs, endedAtMs: null, labelEl });
+  renderDurationValue(labelEl, startedAtMs, null);
+  ensureDurationTicker();
+}
+
+function stopLiveDuration(key, endedAtMs) {
+  const tracker = liveDurationTrackers.get(key);
+  if (!tracker) return;
+  tracker.endedAtMs = Number.isFinite(endedAtMs) ? endedAtMs : Date.now();
+  renderDurationValue(tracker.labelEl, tracker.startedAtMs, tracker.endedAtMs);
+  liveDurationTrackers.delete(key);
+}
+
+function stopAllLiveDurations() {
+  for (const key of Array.from(liveDurationTrackers.keys())) {
+    stopLiveDuration(key, Date.now());
+  }
+}
+
 // ── Busy State ──
 function setBusy(nextBusy) {
   appBusy = nextBusy;
@@ -230,6 +292,7 @@ function smartScroll() {
 function addMessage(role, text, imageBase64 = null) {
   const div = document.createElement("div");
   div.className = `message ${role}`;
+  div.setAttribute("data-raw-text", String(text ?? ""));
   
   if (imageBase64) {
     const img = document.createElement("img");
@@ -273,6 +336,7 @@ function startStreamingAssistantMessage() {
     renderTimer: null,
     lastRenderAt: 0,
   };
+  root.setAttribute("data-raw-text", "");
   smartScroll();
   updateWelcome();
   return streamingAssistantMessage;
@@ -309,6 +373,7 @@ function updateStreamingAssistantMessage(deltaText = "", fullText = null) {
   const state = startStreamingAssistantMessage();
   if (typeof fullText === "string") state.fullText = fullText;
   else state.fullText += String(deltaText ?? "");
+  if (state.root) state.root.setAttribute("data-raw-text", state.fullText);
   renderStreamingAssistantMessage(false);
 }
 
@@ -327,12 +392,13 @@ function finalizeStreamingAssistantMessage(finalText = "", options = {}) {
   if (overwriteText && typeof finalText === "string" && finalText.length > 0) {
     state.fullText = finalText;
   }
+  if (state.root) state.root.setAttribute("data-raw-text", state.fullText);
   renderStreamingAssistantMessage(true);
   streamingAssistantMessage = null;
 }
 
 // ── Inline Events (replaces separate activity panel) ──
-function addInlineEvent(kind, title, body = "", extraHtml = "") {
+function addInlineEvent(kind, title, body = "", extraHtml = "", options = {}) {
   const iconMap = {
     tool: `<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M4 2l8 6-8 6V2z" fill="currentColor"/></svg>`,
     note: `<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.3"/><path d="M8 5v4M8 11v.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>`,
@@ -346,15 +412,44 @@ function addInlineEvent(kind, title, body = "", extraHtml = "") {
   div.setAttribute("data-kind", kind);
   div.setAttribute("data-title", title);
   div.setAttribute("data-body", body);
+  div.setAttribute("data-extra-html", extraHtml || "");
+  div.setAttribute("data-expanded", "false");
+  const eventTime = formatClockFromIso(options.eventAt);
+  const durationHtml = options.showDuration
+    ? `<span class="inline-event-duration">${escapeHtml(options.duration || "00:00")}</span>`
+    : "";
+  const hasDetail = Boolean(body || extraHtml);
+  const detailId = `inline-event-detail-${crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36)}`;
+  const expandToggle = hasDetail ? `<span class="inline-event-expand-toggle">szczegóły</span>` : "";
   div.innerHTML = `
-    <span class="inline-event-icon">${iconMap[kind] || iconMap.note}</span>
+    <span class="inline-event-icon" aria-hidden="true">${iconMap[kind] || iconMap.note}</span>
     <div class="inline-event-body">
-      <div class="inline-event-title">${escapeHtml(title)}</div>
-      ${body ? `<div class="inline-event-detail">${escapeHtml(body)}</div>` : ""}
-      ${extraHtml ? `<div class="inline-event-expand">${extraHtml}</div>` : ""}
+      <button class="inline-event-summary ${hasDetail ? "" : "no-detail"}" type="button" ${hasDetail ? `aria-controls="${detailId}" aria-expanded="false"` : "disabled"}>
+        <span class="inline-event-title">${escapeHtml(title)}</span>
+        ${expandToggle}
+      </button>
+      <div class="inline-event-detail-wrap hidden" id="${detailId}">
+        ${body ? `<div class="inline-event-detail">${escapeHtml(body)}</div>` : ""}
+        ${extraHtml ? `<div class="inline-event-expand">${extraHtml}</div>` : ""}
+      </div>
     </div>
-    <span class="inline-event-time">${new Date().toLocaleTimeString("pl-PL", { hour: "2-digit", minute: "2-digit" })}</span>
+    <div class="inline-event-meta">
+      <span class="inline-event-time">${eventTime}</span>
+      ${durationHtml}
+    </div>
   `;
+  const summaryBtn = div.querySelector(".inline-event-summary");
+  if (hasDetail && summaryBtn) {
+    summaryBtn.addEventListener("click", () => {
+      const detailWrap = div.querySelector(".inline-event-detail-wrap");
+      if (!detailWrap) return;
+      const expanded = !detailWrap.classList.contains("hidden");
+      detailWrap.classList.toggle("hidden", expanded);
+      div.setAttribute("data-expanded", expanded ? "false" : "true");
+      summaryBtn.setAttribute("aria-expanded", expanded ? "false" : "true");
+      smartScroll();
+    });
+  }
   conversation.appendChild(div);
   smartScroll();
   updateWelcome();
@@ -377,21 +472,41 @@ function upsertInlineEvent(activityId, kind, title, body = "") {
   } else {
     el.setAttribute("data-title", title);
     el.setAttribute("data-body", safeBody);
+    const hadDetailsBefore = Boolean(el.querySelector(".inline-event-detail")?.textContent || el.querySelector(".inline-event-expand"));
+    const hasDetailsNow = Boolean(safeBody);
+    const summaryBtn = el.querySelector(".inline-event-summary");
     const titleEl = el.querySelector(".inline-event-title");
     const detailEl = el.querySelector(".inline-event-detail");
     if (titleEl) titleEl.textContent = title;
     if (detailEl) detailEl.textContent = safeBody;
     else if (safeBody) {
-      const bodyEl = el.querySelector(".inline-event-body");
-      if (bodyEl) {
+      const detailWrap = el.querySelector(".inline-event-detail-wrap");
+      if (detailWrap) {
         const div = document.createElement("div");
         div.className = "inline-event-detail";
         div.textContent = safeBody;
-        bodyEl.appendChild(div);
+        detailWrap.prepend(div);
       }
+    }
+    if (summaryBtn) {
+      summaryBtn.disabled = !hasDetailsNow && !hadDetailsBefore;
+      summaryBtn.classList.toggle("no-detail", summaryBtn.disabled);
     }
     smartScroll();
   }
+}
+
+function setInlineEventDuration(el, durationText) {
+  if (!el) return;
+  const meta = el.querySelector(".inline-event-meta");
+  if (!meta) return;
+  let durationEl = el.querySelector(".inline-event-duration");
+  if (!durationEl) {
+    durationEl = document.createElement("span");
+    durationEl.className = "inline-event-duration";
+    meta.appendChild(durationEl);
+  }
+  durationEl.textContent = durationText;
 }
 
 function compactJsonPreview(value) {
@@ -499,7 +614,7 @@ function createThinkingBubble(step = null) {
   bubble.className = "thinking-bubble";
   bubble.innerHTML = `
     <button class="thinking-toggle" type="button">
-      ${stepLabel}Myślenie modelu <span class="thinking-spinner"></span>
+      ${stepLabel}Myślenie modelu <span class="thinking-duration">00:00</span> <span class="thinking-spinner"></span>
     </button>
     <div class="thinking-content"></div>
   `;
@@ -529,8 +644,18 @@ function finalizeThinkingBubble(bubble) {
   if (toggle) {
     const content = bubble.querySelector(".thinking-content");
     const lines = (content?.textContent || "").split("\n").filter(Boolean).length;
-    toggle.innerHTML = `Myślenie modelu · ${lines} linii`;
+    const durationText = bubble.querySelector(".thinking-duration")?.textContent || "00:00";
+    toggle.innerHTML = `Myślenie modelu · ${lines} linii · ${durationText}`;
   }
+}
+
+function addTotalDurationDivider(durationMs) {
+  const divider = document.createElement("div");
+  divider.className = "total-duration-divider";
+  divider.innerHTML = `<span>Czas modelu ${formatDurationMmSs(durationMs)}</span>`;
+  conversation.appendChild(divider);
+  smartScroll();
+  updateWelcome();
 }
 
 // ══════════════ CHAT HISTORY ══════════════
@@ -652,7 +777,7 @@ async function saveChatSession(firstMessage = null) {
       entries.push({
         type: "message",
         role: el.classList.contains("user") ? "user" : "assistant",
-        text: el.textContent,
+        text: el.getAttribute("data-raw-text") ?? el.textContent,
       });
     } else if (el.classList.contains("inline-event")) {
       entries.push({
@@ -660,6 +785,7 @@ async function saveChatSession(firstMessage = null) {
         kind: el.getAttribute("data-kind") || "note",
         title: el.getAttribute("data-title") || "",
         body: el.getAttribute("data-body") || "",
+        extraHtml: el.getAttribute("data-extra-html") || "",
       });
     }
   });
@@ -1524,6 +1650,10 @@ window.endocode.onEvent(async (event) => {
     return;
   }
   if (event.type === "run-start") {
+    activeRunStartedAtMs = parseEventTimeMs(event);
+    stopAllLiveDurations();
+    currentThinkingSegment = null;
+    activeToolSegments.length = 0;
     removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
     if (event.chatMode) {
       addInlineEvent("activity", "Czat", "Jedna odpowiedź tekstowa (z automatycznym lekkim kontekstem internetowym).");
@@ -1535,6 +1665,9 @@ window.endocode.onEvent(async (event) => {
     return;
   }
   if (event.type === "run-end") {
+    stopAllLiveDurations();
+    activeToolSegments.length = 0;
+    currentThinkingSegment = null;
     hideLive();
     currentThinkingBubble = null;
     updateContextInfo();
@@ -1551,7 +1684,12 @@ window.endocode.onEvent(async (event) => {
     return;
   }
   if (event.type === "thinking-start") {
+    const startedAtMs = parseEventTimeMs(event);
     currentThinkingBubble = createThinkingBubble(event.step);
+    const durationEl = currentThinkingBubble.querySelector(".thinking-duration");
+    const segmentKey = `thinking-${event.step ?? "default"}-${event.id || Date.now()}`;
+    if (durationEl) startLiveDuration(segmentKey, startedAtMs, durationEl);
+    currentThinkingSegment = { key: segmentKey, startedAtMs };
     showLive(event.step ? `Krok ${event.step}: Myślenie...` : "Model myśli...");
     return;
   }
@@ -1566,8 +1704,10 @@ window.endocode.onEvent(async (event) => {
 
   if (event.type === "thinking-end") {
     if (currentThinkingBubble) {
+      if (currentThinkingSegment?.key) stopLiveDuration(currentThinkingSegment.key, parseEventTimeMs(event));
       finalizeThinkingBubble(currentThinkingBubble);
       currentThinkingBubble = null;
+      currentThinkingSegment = null;
     }
     return;
   }
@@ -1592,15 +1732,28 @@ window.endocode.onEvent(async (event) => {
     removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
     const label = toolActionLabel(event.tool, event.args);
     const detail = toolActionDetail(event.tool, event.args, event.note || "");
-    addInlineEvent("tool", label, detail);
+    const toolEvent = addInlineEvent("tool", label, detail, "", { eventAt: event.at, showDuration: true, duration: "00:00" });
+    const durationEl = toolEvent.querySelector(".inline-event-duration");
+    const durationKey = `tool-${event.tool || "unknown"}-${event.id || Date.now()}`;
+    if (durationEl) startLiveDuration(durationKey, parseEventTimeMs(event), durationEl);
+    activeToolSegments.push({ key: durationKey, tool: event.tool, el: toolEvent });
     showLive(label, detail);
     return;
   }
   if (event.type === "tool-result") {
+    const matchingIndex = activeToolSegments.findIndex((segment) => segment.tool === event.tool);
+    const segment = matchingIndex >= 0 ? activeToolSegments.splice(matchingIndex, 1)[0] : activeToolSegments.shift();
+    if (segment?.key) stopLiveDuration(segment.key, parseEventTimeMs(event));
     if (!event.ok) {
-      addInlineEvent("error", `Błąd: ${event.tool}`, `${event.error || ""}${event.recoveryHint ? `\nObejście: ${event.recoveryHint}` : ""}`);
+      const errorEl = addInlineEvent("error", `Błąd: ${event.tool}`, `${event.error || ""}${event.recoveryHint ? `\nObejście: ${event.recoveryHint}` : ""}`, "", { eventAt: event.at });
+      if (segment?.el?.querySelector(".inline-event-duration")) {
+        setInlineEventDuration(errorEl, segment.el.querySelector(".inline-event-duration").textContent || "00:00");
+      }
     } else {
-      addInlineEvent("activity", `Zakończono: ${event.tool}`, compactJsonPreview(event.result || {}));
+      const okEl = addInlineEvent("activity", `Zakończono: ${event.tool}`, compactJsonPreview(event.result || {}), "", { eventAt: event.at });
+      if (segment?.el?.querySelector(".inline-event-duration")) {
+        setInlineEventDuration(okEl, segment.el.querySelector(".inline-event-duration").textContent || "00:00");
+      }
     }
     return;
   }
@@ -1641,6 +1794,10 @@ window.endocode.onEvent(async (event) => {
         finalizeStreamingAssistantMessage(event.text || "");
       }
     } else addMessage("assistant", event.text);
+    if (Number.isFinite(activeRunStartedAtMs)) {
+      addTotalDurationDivider(parseEventTimeMs(event) - activeRunStartedAtMs);
+      activeRunStartedAtMs = null;
+    }
     hideLive();
     saveChatSession(firstUserMessage);
   }
