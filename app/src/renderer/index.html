@@ -403,10 +403,10 @@
         <div class="setting-row">
           <div class="setting-info">
             <label class="setting-name">Max Tokens (odpowiedź)</label>
-            <div class="setting-desc">Maksymalna długość pojedynczej odpowiedzi modelu w tokenach.</div>
+            <div class="setting-desc">Maksymalna długość pojedynczej odpowiedzi modelu w tokenach. Górny limit dopasowuje się automatycznie do możliwości tej maszyny.</div>
           </div>
           <div class="setting-control">
-            <input type="range" id="set_maxTokens" min="256" max="131072" step="256" value="1300">
+            <input type="range" id="set_maxTokens" min="256" max="65536" step="256" value="1300">
             <span class="setting-value" id="val_maxTokens">1300</span>
           </div>
         </div>
@@ -460,10 +460,10 @@
         <div class="setting-row">
           <div class="setting-info">
             <label class="setting-name">Context Window (tokeny)</label>
-            <div class="setting-desc">Rozmiar okna kontekstu serwera (do 2,5 mln na suwaku). Większe = dłuższa historia i narzędzia w jednym żądaniu, ale znacznie więcej RAM/VRAM — uruchomienie może się nie udać, jeśli sprzęt lub backend nie udźwigną. Wymaga restartu serwera.</div>
+            <div class="setting-desc">Rozmiar okna kontekstu serwera. Górny limit suwaka jest liczony pod realne możliwości tej maszyny (RAM/VRAM). Większe = dłuższa historia i narzędzia w jednym żądaniu, ale też większe użycie pamięci. Wymaga restartu serwera.</div>
           </div>
           <div class="setting-control">
-            <input type="range" id="set_contextTokens" min="2048" max="2500000" step="2048" value="8192">
+            <input type="range" id="set_contextTokens" min="1024" max="262144" step="2048" value="8192">
             <span class="setting-value" id="val_contextTokens">8192</span>
           </div>
         </div>
@@ -483,7 +483,7 @@
         <div class="setting-row">
           <div class="setting-info">
             <label class="setting-name">Max wiadomości (kompaktowanie)</label>
-            <div class="setting-desc">Po ilu wiadomościach następuje kompaktowanie kontekstu (do 32 tys. na suwaku). Wyższe = dłuższa historia przed skróceniem (większy prompt); niższe = częstsze kompaktowanie.</div>
+            <div class="setting-desc">Po ilu wiadomościach następuje kompaktowanie kontekstu. Górny limit zależy od dostępnego budżetu tokenów tej maszyny.</div>
           </div>
           <div class="setting-control">
             <input type="range" id="set_maxMessages" min="8" max="32768" step="8" value="32">

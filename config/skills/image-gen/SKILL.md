@@ -7,7 +7,7 @@ Local only: yes
 Prompty, assety i lokalne pipeline'y obrazow.
 
 ## Agent Instructions
-Dla obrazow przygotowuj prompty, specyfikacje assetow, SVG/HTML/CSS albo uruchamiaj wylacznie lokalne generatory, jesli istnieja w workspace. Nie zakladaj dostepu do chmurowego image API.
+Dla obrazow pracuj lokalnie: SVG dla ikon/diagramow, HTML/CSS/canvas dla UI, albo lokalny generator jesli istnieje. Nie zakladaj chmurowego image API bez wyraznej prosby uzytkownika.
 
 ## Local Runtime Rule
 Use only local files, local model reasoning and approved local commands. Do not call cloud APIs unless the user explicitly adds such integration later.

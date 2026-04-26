@@ -52,16 +52,71 @@ const SAFE_RUNTIME_LIMITS = {
   parallelMax: 2,
 };
 
-/** Górny limit okna kontekstu (llama.cpp -c); suwak w UI do ~2.5 mln — realnie ogranicza RAM/VRAM. */
 const MIN_CONTEXT_TOKENS = 1024;
-const MAX_CONTEXT_TOKENS = 2_500_000;
+const ABSOLUTE_MAX_CONTEXT_TOKENS = 262_144;
+const MIN_RESPONSE_TOKENS = 256;
+const ABSOLUTE_MAX_RESPONSE_TOKENS = 65_536;
 /** Ile wiadomości w historii agenta przed kompaktowaniem (górny limit suwaka). */
 const MAX_CHAT_MESSAGES_CAP = 32_768;
 
-function clampContextTokens(value) {
+function getTokenRuntimeLimits(profile = getCachedModelProfile()) {
+  const safeProfile = profile && typeof profile === "object" ? profile : {};
+  const ramGB = Number(safeProfile.ramGB || 0);
+  const vramGB = Number(safeProfile.vramGB || 0);
+
+  let ramContextMax = 8_192;
+  if (ramGB >= 128) ramContextMax = 262_144;
+  else if (ramGB >= 64) ramContextMax = 131_072;
+  else if (ramGB >= 32) ramContextMax = 65_536;
+  else if (ramGB >= 24) ramContextMax = 49_152;
+  else if (ramGB >= 16) ramContextMax = 32_768;
+  else if (ramGB >= 12) ramContextMax = 24_576;
+  else if (ramGB >= 8) ramContextMax = 16_384;
+
+  let vramContextMax = 8_192;
+  if (vramGB >= 24) vramContextMax = 131_072;
+  else if (vramGB >= 16) vramContextMax = 98_304;
+  else if (vramGB >= 12) vramContextMax = 65_536;
+  else if (vramGB >= 8) vramContextMax = 49_152;
+  else if (vramGB >= 6) vramContextMax = 32_768;
+  else if (vramGB >= 4) vramContextMax = 24_576;
+
+  const contextMax = clampInt(
+    Math.max(ramContextMax, vramContextMax, MIN_CONTEXT_TOKENS),
+    MIN_CONTEXT_TOKENS,
+    ABSOLUTE_MAX_CONTEXT_TOKENS,
+    8_192,
+  );
+  const contextStep = contextMax >= 65_536 ? 4_096 : 2_048;
+  const maxTokensMax = clampInt(
+    Math.floor(contextMax * 0.5),
+    MIN_RESPONSE_TOKENS,
+    ABSOLUTE_MAX_RESPONSE_TOKENS,
+    1_300,
+  );
+  const maxTokensStep = maxTokensMax >= 8_192 ? 256 : 64;
+  const maxMessagesMax = clampInt(
+    Math.floor(contextMax / 4),
+    64,
+    MAX_CHAT_MESSAGES_CAP,
+    2_048,
+  );
+  const reasoningBudgetMax = maxTokensMax;
+
+  return {
+    profileClass: String(safeProfile.target || "machine"),
+    contextTokens: { min: MIN_CONTEXT_TOKENS, max: contextMax, step: contextStep },
+    maxTokens: { min: MIN_RESPONSE_TOKENS, max: maxTokensMax, step: maxTokensStep },
+    maxMessages: { min: 8, max: maxMessagesMax, step: 8 },
+    reasoningBudget: { min: 0, max: reasoningBudgetMax, step: maxTokensStep },
+  };
+}
+
+function clampContextTokens(value, limits = getTokenRuntimeLimits()) {
+  const maxContextTokens = Number(limits?.contextTokens?.max || MIN_CONTEXT_TOKENS);
   const n = Number(value);
-  if (!Number.isFinite(n)) return 8192;
-  return Math.min(MAX_CONTEXT_TOKENS, Math.max(MIN_CONTEXT_TOKENS, Math.round(n)));
+  if (!Number.isFinite(n)) return Math.min(maxContextTokens, 8192);
+  return Math.min(maxContextTokens, Math.max(MIN_CONTEXT_TOKENS, Math.round(n)));
 }
 
 function clampInt(value, min, max, fallback = min) {
@@ -70,10 +125,25 @@ function clampInt(value, min, max, fallback = min) {
   return Math.min(max, Math.max(min, Math.round(n)));
 }
 
-function clampMaxMessages(value) {
+function clampResponseTokens(value, limits = getTokenRuntimeLimits()) {
+  const maxResponseTokens = Number(limits?.maxTokens?.max || ABSOLUTE_MAX_RESPONSE_TOKENS);
   const n = Number(value);
-  if (!Number.isFinite(n)) return 32;
-  return Math.min(MAX_CHAT_MESSAGES_CAP, Math.max(8, Math.round(n)));
+  if (!Number.isFinite(n)) return Math.min(maxResponseTokens, 1300);
+  return Math.min(maxResponseTokens, Math.max(MIN_RESPONSE_TOKENS, Math.round(n)));
+}
+
+function clampReasoningBudget(value, limits = getTokenRuntimeLimits()) {
+  const maxBudget = Number(limits?.reasoningBudget?.max || ABSOLUTE_MAX_RESPONSE_TOKENS);
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  return Math.min(maxBudget, Math.max(0, Math.round(n)));
+}
+
+function clampMaxMessages(value, limits = getTokenRuntimeLimits()) {
+  const maxMessages = Number(limits?.maxMessages?.max || MAX_CHAT_MESSAGES_CAP);
+  const n = Number(value);
+  if (!Number.isFinite(n)) return Math.min(maxMessages, 32);
+  return Math.min(maxMessages, Math.max(8, Math.round(n)));
 }
 
 /** Zgodne z gałęziami w executeTool — nie zmieniaj nazw bez aktualizacji obu miejsc. */
@@ -5913,16 +5983,18 @@ const MODEL_RUNTIME_WHITELIST = new Set([
 function getEffectiveSettingsForModel(modelId) {
   const model = loadModelCatalog().models.find((entry) => entry.id === modelId) || getModelConfig();
   const selected = getModelSettingsForId(model?.id || modelId);
+  const tokenLimits = getTokenRuntimeLimits();
+  const contextTokens = clampContextTokens(selected.contextTokens ?? model?.contextTokens ?? 8192, tokenLimits);
   return {
     temperature: selected.temperature ?? getReasoningProfile().temperature,
-    maxTokens: selected.maxTokens ?? getReasoningProfile().maxTokens,
+    maxTokens: clampResponseTokens(selected.maxTokens ?? getReasoningProfile().maxTokens, tokenLimits),
     maxSteps: selected.maxSteps ?? getReasoningProfile().maxSteps,
     topP: selected.topP ?? null,
     topK: selected.topK ?? null,
     repeatPenalty: selected.repeatPenalty ?? null,
-    contextTokens: selected.contextTokens ?? model?.contextTokens ?? 8192,
+    contextTokens,
     gpuLayers: selected.gpuLayers ?? model?.gpuLayers ?? 99,
-    maxMessages: selected.maxMessages ?? model?.maxMessages ?? 32,
+    maxMessages: clampMaxMessages(selected.maxMessages ?? model?.maxMessages ?? 32, tokenLimits),
     threads: selected.threads ?? model?.threads ?? null,
     threadsBatch: selected.threadsBatch ?? model?.threadsBatch ?? null,
     batchSize: selected.batchSize ?? model?.batchSize ?? null,
@@ -5932,7 +6004,7 @@ function getEffectiveSettingsForModel(modelId) {
     cacheTypeK: selected.cacheTypeK ?? model?.cacheTypeK ?? null,
     cacheTypeV: selected.cacheTypeV ?? model?.cacheTypeV ?? null,
     reasoning: selected.reasoning ?? model?.reasoning ?? null,
-    reasoningBudget: selected.reasoningBudget ?? model?.reasoningBudget ?? null,
+    reasoningBudget: selected.reasoningBudget == null ? (model?.reasoningBudget ?? null) : clampReasoningBudget(selected.reasoningBudget, tokenLimits),
     extraServerArgs: selected.extraServerArgs ?? model?.extraServerArgs ?? [],
   };
 }
@@ -5943,8 +6015,11 @@ function sanitizeSettingsPatch(rawSettings = {}) {
     if (!MODEL_RUNTIME_WHITELIST.has(key)) continue;
     patch[key] = value;
   }
-  if (patch.contextTokens != null) patch.contextTokens = clampContextTokens(patch.contextTokens);
-  if (patch.maxMessages != null) patch.maxMessages = clampMaxMessages(patch.maxMessages);
+  const tokenLimits = getTokenRuntimeLimits();
+  if (patch.contextTokens != null) patch.contextTokens = clampContextTokens(patch.contextTokens, tokenLimits);
+  if (patch.maxTokens != null) patch.maxTokens = clampResponseTokens(patch.maxTokens, tokenLimits);
+  if (patch.maxMessages != null) patch.maxMessages = clampMaxMessages(patch.maxMessages, tokenLimits);
+  if (patch.reasoningBudget != null) patch.reasoningBudget = clampReasoningBudget(patch.reasoningBudget, tokenLimits);
   if (patch.gpuLayers != null) patch.gpuLayers = clampRuntimeNumber(patch.gpuLayers, 0, 99);
   if (patch.threads != null) patch.threads = clampRuntimeNumber(patch.threads, SAFE_RUNTIME_LIMITS.threadsMin, SAFE_RUNTIME_LIMITS.threadsMax);
   if (patch.threadsBatch != null) patch.threadsBatch = clampRuntimeNumber(patch.threadsBatch, SAFE_RUNTIME_LIMITS.threadsBatchMin, SAFE_RUNTIME_LIMITS.threadsBatchMax);
@@ -5958,9 +6033,11 @@ ipcMain.handle("app:get-model-settings", (_event, modelId) => {
   const targetModelId = String(modelId || selectedModelId);
   const model = loadModelCatalog().models.find((entry) => entry.id === targetModelId);
   if (!model) throw new Error(`Nieznany model: ${targetModelId}`);
+  const tokenLimits = getTokenRuntimeLimits();
   return {
     modelId: targetModelId,
     modelName: model.displayName,
+    _limits: tokenLimits,
     ...getModelSettingsForId(targetModelId),
     _effective: getEffectiveSettingsForModel(targetModelId),
   };

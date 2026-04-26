@@ -1688,6 +1688,23 @@ const SETTINGS_FIELDS = [
   { id: "flashAttention", slider: "set_flashAttention", display: "val_flashAttention", decimals: 0, formatFn: (v) => Number(v) === 1 ? "on" : "off" },
 ];
 
+function applySliderRange(sliderId, range = {}) {
+  const slider = document.getElementById(sliderId);
+  if (!slider) return;
+  const min = Number(range.min);
+  const max = Number(range.max);
+  const step = Number(range.step);
+  if (Number.isFinite(min) && min >= 0) slider.min = String(Math.round(min));
+  if (Number.isFinite(max) && max > 0) slider.max = String(Math.round(max));
+  if (Number.isFinite(step) && step > 0) slider.step = String(Math.round(step));
+}
+
+function applyDynamicTokenLimits(limits = {}) {
+  applySliderRange("set_contextTokens", limits.contextTokens);
+  applySliderRange("set_maxTokens", limits.maxTokens);
+  applySliderRange("set_maxMessages", limits.maxMessages);
+}
+
 // Wire up live value display for all sliders
 for (const field of SETTINGS_FIELDS) {
   const slider = document.getElementById(field.slider);
@@ -1706,6 +1723,7 @@ async function openSettingsModal(modelId = modelSelect.value) {
     currentSettingsModelId = settings.modelId || modelId;
     if (settingsModelName) settingsModelName.textContent = `Model: ${settings.modelName || currentSettingsModelId}`;
     const eff = settings._effective || {};
+    applyDynamicTokenLimits(settings._limits || {});
     // Populate sliders with current values
     setSlider("set_temperature", "val_temperature", settings.temperature ?? eff.temperature, 2);
     setSlider("set_maxTokens", "val_maxTokens", settings.maxTokens ?? eff.maxTokens, 0);

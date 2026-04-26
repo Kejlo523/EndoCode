@@ -7,7 +7,7 @@ Local only: yes
 Tworzenie, edycja i ekstrakcja tresci z plikow Word.
 
 ## Agent Instructions
-Dla DOCX tworz lub modyfikuj pliki lokalnie. Jesli potrzebne biblioteki sa dostepne, uzyj lokalnego skryptu przez run_powershell po zgodzie; w przeciwnym razie przygotuj zrodlo HTML/Markdown i jasne kroki eksportu.
+Dla DOCX preferuj narzedzie create_docx (markdown) po pip install python-docx; alternatywnie skrypt przez run_powershell lub zrodlo HTML/Markdown.
 
 ## Local Runtime Rule
 Use only local files, local model reasoning and approved local commands. Do not call cloud APIs unless the user explicitly adds such integration later.
