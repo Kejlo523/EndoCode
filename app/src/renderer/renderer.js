@@ -447,7 +447,14 @@ function addInlineEvent(kind, title, body = "", extraHtml = "", options = {}) {
       detailWrap.classList.toggle("hidden", expanded);
       div.setAttribute("data-expanded", expanded ? "false" : "true");
       summaryBtn.setAttribute("aria-expanded", expanded ? "false" : "true");
-      smartScroll();
+      if (!expanded) {
+        requestAnimationFrame(() => {
+          detailWrap.scrollTop = 0;
+          div.scrollIntoView({ block: "end", behavior: "smooth" });
+        });
+      } else {
+        smartScroll();
+      }
     });
   }
   conversation.appendChild(div);
