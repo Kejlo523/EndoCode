@@ -18,7 +18,10 @@ const MAX_FILE_BYTES = 220000;
 const MAX_TOOL_URL_LENGTH = 2048;
 const MODEL_JSON_RETRY_LIMIT = 2;
 const MODEL_CALL_RETRY_LIMIT = 1;
-const MODEL_STREAM_IDLE_TIMEOUT_MS = 6 * 60 * 1000;
+const MODEL_STREAM_IDLE_TIMEOUT_MS = 20 * 60 * 1000;
+const SERVER_READY_PING_TIMEOUT_MS = 5000;
+const SERVER_START_TIMEOUT_MIN_MS = 5 * 60 * 1000;
+const SERVER_START_TIMEOUT_MAX_MS = 15 * 60 * 1000;
 const PLAIN_CHAT_MAX_CHARS = 18000;
 const PLAIN_CHAT_REPEAT_CHUNK_LIMIT = 40;
 const SERVER_SHUTDOWN_TIMEOUT_MS = 6000;
@@ -286,6 +289,7 @@ const DEFAULT_MODEL_SETTINGS = {
 };
 let customModelSettingsByModelId = {};
 const chatWebLookupCache = new Map();
+const runtimeRecoveryStateByModelId = new Map();
 
 function emit(type, payload = {}) {
   if (mainWindow && !mainWindow.isDestroyed()) {
@@ -389,6 +393,113 @@ function createModelAbortGuard(parentSignal) {
       if (parentSignal) parentSignal.removeEventListener("abort", onParentAbort);
     },
   };
+}
+
+function clampRuntimeNumber(value, min, max) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  return Math.min(max, Math.max(min, Math.round(n)));
+}
+
+function getServerStartupTimeoutMs(config = {}, contextTokens = 8192) {
+  const sizeGB = Number(config.expectedBytes || 0) / 1073741824;
+  const profile = getCachedModelProfile?.() || {};
+  let timeoutMs = SERVER_START_TIMEOUT_MIN_MS;
+
+  if (sizeGB >= 4) timeoutMs += 60_000;
+  if (sizeGB >= 8) timeoutMs += 120_000;
+  if (sizeGB >= 12) timeoutMs += 120_000;
+  if (String(config.category || "").toLowerCase() === "large") timeoutMs += 120_000;
+
+  if (Number(profile.ramGB || 0) > 0 && Number(profile.ramGB) < 24) timeoutMs += 120_000;
+  if (Number(profile.ramGB || 0) > 0 && Number(profile.ramGB) < 16) timeoutMs += 120_000;
+  if (String(profile.gpuBackendClass || "") === "cpu-only") timeoutMs += 120_000;
+  if (String(profile.gpuBackendClass || "") === "intel-igpu") timeoutMs += 60_000;
+  if (Number(contextTokens || 0) > 32768) timeoutMs += 60_000;
+  if (Number(contextTokens || 0) > 65536) timeoutMs += 60_000;
+
+  return Math.min(SERVER_START_TIMEOUT_MAX_MS, Math.max(SERVER_START_TIMEOUT_MIN_MS, timeoutMs));
+}
+
+function normalizeRuntimePatch(rawPatch = {}) {
+  const patch = {};
+  if (rawPatch.contextTokens != null) patch.contextTokens = clampContextTokens(rawPatch.contextTokens);
+  if (rawPatch.gpuLayers != null) patch.gpuLayers = clampRuntimeNumber(rawPatch.gpuLayers, 0, 99);
+  if (rawPatch.threads != null) patch.threads = clampRuntimeNumber(rawPatch.threads, 1, 128);
+  if (rawPatch.threadsBatch != null) patch.threadsBatch = clampRuntimeNumber(rawPatch.threadsBatch, 1, 256);
+  if (rawPatch.batchSize != null) patch.batchSize = clampRuntimeNumber(rawPatch.batchSize, 32, 4096);
+  if (rawPatch.ubatchSize != null) patch.ubatchSize = clampRuntimeNumber(rawPatch.ubatchSize, 16, 2048);
+  if (rawPatch.parallel != null) patch.parallel = clampRuntimeNumber(rawPatch.parallel, 1, 8);
+  if (rawPatch.flashAttention != null) patch.flashAttention = String(rawPatch.flashAttention);
+  return patch;
+}
+
+function buildRuntimeDegradationSteps(modelId = selectedModelId) {
+  const effective = getEffectiveSettingsForModel(modelId);
+  const c0 = clampContextTokens(effective.contextTokens ?? 8192);
+  const g0 = clampRuntimeNumber(effective.gpuLayers ?? 0, 0, 99) ?? 0;
+  const t0 = clampRuntimeNumber(effective.threads ?? (os.cpus().length || 8), 1, 128) ?? 8;
+  const tb0 = clampRuntimeNumber(effective.threadsBatch ?? (t0 + 4), 1, 256) ?? (t0 + 4);
+  const b0 = clampRuntimeNumber(effective.batchSize ?? 1024, 32, 4096) ?? 1024;
+  const ub0 = clampRuntimeNumber(effective.ubatchSize ?? 512, 16, 2048) ?? 512;
+
+  return [
+    normalizeRuntimePatch({
+      contextTokens: Math.max(8192, Math.floor(c0 * 0.75)),
+      gpuLayers: Math.max(0, Math.floor(g0 * 0.7)),
+      threadsBatch: Math.max(4, Math.min(tb0, t0 + 2)),
+      batchSize: Math.max(512, Math.floor(b0 * 0.75)),
+      ubatchSize: Math.max(128, Math.floor(ub0 * 0.75)),
+    }),
+    normalizeRuntimePatch({
+      contextTokens: Math.max(4096, Math.floor(c0 * 0.5)),
+      gpuLayers: Math.max(0, Math.floor(g0 * 0.45)),
+      threads: Math.max(2, Math.min(t0, 12)),
+      threadsBatch: Math.max(4, Math.min(tb0, 12)),
+      batchSize: Math.max(256, Math.floor(b0 * 0.5)),
+      ubatchSize: Math.max(64, Math.floor(ub0 * 0.5)),
+    }),
+    normalizeRuntimePatch({
+      contextTokens: Math.max(4096, Math.floor(c0 * 0.35)),
+      gpuLayers: 0,
+      threads: Math.max(2, Math.min(t0, 8)),
+      threadsBatch: Math.max(4, Math.min(tb0, 8)),
+      batchSize: 256,
+      ubatchSize: 64,
+      parallel: 1,
+    }),
+  ];
+}
+
+async function tryApplyRuntimeDegradation(error, step = null) {
+  const model = getModelConfig();
+  const modelId = model?.id || selectedModelId;
+  if (!modelId) return false;
+
+  const state = runtimeRecoveryStateByModelId.get(modelId) || {
+    steps: buildRuntimeDegradationSteps(modelId),
+    nextIndex: 0,
+  };
+  if (state.nextIndex >= state.steps.length) return false;
+
+  const patch = state.steps[state.nextIndex];
+  state.nextIndex += 1;
+  runtimeRecoveryStateByModelId.set(modelId, state);
+
+  if (!patch || !Object.keys(patch).length) return false;
+  setModelSettingsForId(modelId, patch);
+  emit("status", {
+    status: "model-runtime-degrade",
+    detail: `Model API 500: zmniejszam obciazenie runtime (proba ${state.nextIndex}/${state.steps.length}) i restartuje model.`,
+    step,
+  });
+  await stopOwnedServer({ force: true });
+  await ensureServer(DEFAULT_PORT);
+  return true;
+}
+
+function resetRuntimeRecoveryState(modelId = selectedModelId) {
+  if (modelId) runtimeRecoveryStateByModelId.delete(modelId);
 }
 
 function pathExists(p) {
@@ -1748,6 +1859,32 @@ function contentToText(content) {
   }
 }
 
+function enforceAlternatingDialogue(messages = []) {
+  const out = [];
+  for (const msg of messages) {
+    const role = String(msg?.role || "user");
+    const content = contentToText(msg?.content || "").trim();
+    if (!content) continue;
+    if (!out.length) {
+      out.push({ role, content });
+      continue;
+    }
+    const prev = out[out.length - 1];
+    if (prev.role === role) {
+      prev.content = `${prev.content}\n\n${content}`;
+    } else {
+      out.push({ role, content });
+    }
+  }
+  if (out.length && out[0].role !== "user") {
+    out[0] = {
+      role: "user",
+      content: `Kontekst rozmowy:\n${out[0].content}`,
+    };
+  }
+  return out;
+}
+
 function buildModelMessages(rawMessages) {
   const messagesIn = Array.isArray(rawMessages) ? rawMessages : [];
   const normalized = messagesIn
@@ -1758,8 +1895,8 @@ function buildModelMessages(rawMessages) {
     .filter((msg) => msg.content.trim().length > 0);
 
   const systemTexts = normalized.filter((msg) => msg.role === "system").map((msg) => msg.content.trim()).filter(Boolean);
-  const nonSystem = normalized.filter((msg) => msg.role !== "system");
-  if (!systemTexts.length) return normalized;
+  const nonSystem = enforceAlternatingDialogue(normalized.filter((msg) => msg.role !== "system"));
+  if (!systemTexts.length) return nonSystem;
 
   const foldedSystem = `Instrukcja systemowa (nadrzedna):\n${systemTexts.join("\n\n")}`;
   const firstUserIndex = nonSystem.findIndex((msg) => msg.role === "user");
@@ -1960,6 +2097,7 @@ function getFallbackModelCandidates(failedModelIds) {
 }
 
 async function switchToFallbackModel(reason, failedModelIds) {
+  const previousModelId = selectedModelId;
   failedModelIds.add(selectedModelId);
   const candidates = getFallbackModelCandidates(failedModelIds);
   for (const fallback of candidates) {
@@ -1967,6 +2105,8 @@ async function switchToFallbackModel(reason, failedModelIds) {
       selectedModelId = fallback.id;
       saveAppSettings();
       if (messages.length) messages[0] = { role: "system", content: createSystemPrompt() };
+      resetRuntimeRecoveryState(previousModelId);
+      resetRuntimeRecoveryState(fallback.id);
       emit("status", {
         status: "model-fallback",
         detail: `Przelaczam na ${fallback.displayName}: ${String(reason || "blad modelu").slice(0, 140)}`,
@@ -2282,7 +2422,7 @@ function appendServerOptionArgs(serverArgs, config) {
 
 async function isServerReady(port = DEFAULT_PORT) {
   try {
-    const res = await fetch(`http://127.0.0.1:${port}/v1/models`, { signal: AbortSignal.timeout(1500) });
+    const res = await fetch(`http://127.0.0.1:${port}/v1/models`, { signal: AbortSignal.timeout(SERVER_READY_PING_TIMEOUT_MS) });
     return res.ok;
   } catch {
     return false;
@@ -2291,7 +2431,7 @@ async function isServerReady(port = DEFAULT_PORT) {
 
 async function getServerModelId(port = DEFAULT_PORT) {
   try {
-    const res = await fetch(`http://127.0.0.1:${port}/v1/models`, { signal: AbortSignal.timeout(1500) });
+    const res = await fetch(`http://127.0.0.1:${port}/v1/models`, { signal: AbortSignal.timeout(SERVER_READY_PING_TIMEOUT_MS) });
     if (!res.ok) return null;
     const body = await res.json();
     return body?.data?.[0]?.id || null;
@@ -2348,7 +2488,9 @@ async function launchServerProcess(config, modelPath, port, contextTokens, gpuLa
     }
   });
 
-  for (let i = 0; i < 180; i += 1) {
+  const startupTimeoutMs = getServerStartupTimeoutMs(config, contextTokens);
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < startupTimeoutMs) {
     if (serverProcess?.exitCode !== null) throw new Error("llama-server zakonczyl prace przed startem API.");
     if (await isServerReady(port)) {
       emit("status", { status: "server-ready", detail: `${config.displayName} gotowy na http://127.0.0.1:${port}` });
@@ -2356,7 +2498,7 @@ async function launchServerProcess(config, modelPath, port, contextTokens, gpuLa
     }
     await sleep(1000);
   }
-  throw new Error("Serwer nie odpowiedzial w ciagu 180 sekund.");
+  throw new Error(`Serwer nie odpowiedzial w ciagu ${Math.round(startupTimeoutMs / 1000)} sekund.`);
 }
 
 async function ensureServer(port = DEFAULT_PORT) {
@@ -2650,18 +2792,47 @@ function isTransientModelError(error) {
   return /fetch failed|ECONNREFUSED|ECONNRESET|socket|terminated|timeout|nie wyslal danych|Model API 5\d\d/i.test(message);
 }
 
+function isModelApi500Error(error) {
+  const message = String(error?.message || error);
+  return /\bModel API 500\b/i.test(message);
+}
+
 async function callModelWithRecovery(messages, abortSignal, failedModelIds, options = {}, step = null) {
-  try {
-    const { content, reasoning } = await callModel(messages, abortSignal, options, step);
-    return { content, reasoning };
-  } catch (error) {
-    if (abortSignal?.aborted || !isTransientModelError(error)) throw error;
-    const retryCount = getTransportRetryCount();
-    if (retryCount <= 0) throw error;
-    emit("status", { status: "model-error-retry", detail: `Blad polaczenia: ${textPreview(error.message, 120)}. Ponawiam...`, step });
-    await sleep(2000);
-    const { content, reasoning } = await callModel(messages, abortSignal, options, step);
-    return { content, reasoning };
+  const retryCount = Math.max(0, Number(getTransportRetryCount() || 0));
+  let retriesLeft = retryCount;
+  while (true) {
+    try {
+      const result = await callModel(messages, abortSignal, options, step);
+      resetRuntimeRecoveryState();
+      return result;
+    } catch (error) {
+      if (abortSignal?.aborted || !isTransientModelError(error)) throw error;
+
+      if (isModelApi500Error(error)) {
+        try {
+          const degraded = await tryApplyRuntimeDegradation(error, step);
+          if (degraded) continue;
+        } catch (degradeError) {
+          emit("status", {
+            status: "model-runtime-degrade-failed",
+            detail: `Nie udalo sie zastosowac fallbacku runtime: ${textPreview(degradeError?.message || degradeError, 120)}`,
+            step,
+          });
+        }
+      }
+
+      if (retriesLeft > 0) {
+        const attempt = retryCount - retriesLeft + 1;
+        retriesLeft -= 1;
+        emit("status", { status: "model-error-retry", detail: `Blad polaczenia: ${textPreview(error.message, 120)}. Ponawiam (${attempt}/${retryCount})...`, step });
+        await sleep(2000);
+        continue;
+      }
+
+      const fallback = failedModelIds ? await switchToFallbackModel(`blad runtime: ${error?.message || "nieznany"}`, failedModelIds) : null;
+      if (fallback) continue;
+      throw error;
+    }
   }
 }
 
@@ -4697,6 +4868,7 @@ ipcMain.handle("app:set-model", async (_event, modelId) => {
   if (!model) throw new Error(`Nieznany model: ${modelId}`);
   if (model.kind !== "local-gguf") throw new Error(`${model.displayName} nie jest lokalnym modelem GGUF.`);
   selectedModelId = modelId;
+  resetRuntimeRecoveryState(modelId);
   if (!customModelSettingsByModelId[modelId]) {
     setModelSettingsForId(modelId, {
       maxMessages: clampMaxMessages(model.maxMessages ?? 32),
@@ -5361,6 +5533,7 @@ ipcMain.handle("app:set-model-settings", async (_event, payload) => {
   if (!model) throw new Error(`Nieznany model: ${targetModelId}`);
   const settings = sanitizeSettingsPatch(payload?.settings || payload || {});
   setModelSettingsForId(targetModelId, settings);
+  resetRuntimeRecoveryState(targetModelId);
   saveAppSettings();
   const requiresRestart = ["contextTokens", "gpuLayers", "threads", "threadsBatch", "batchSize", "ubatchSize", "parallel", "flashAttention", "cacheTypeK", "cacheTypeV", "reasoning", "reasoningBudget", "extraServerArgs"]
     .some((key) => settings[key] !== undefined);
@@ -5374,6 +5547,7 @@ ipcMain.handle("app:set-model-settings", async (_event, payload) => {
 ipcMain.handle("app:reset-model-settings", async (_event, modelId) => {
   const targetModelId = String(modelId || selectedModelId);
   resetModelSettingsForId(targetModelId);
+  resetRuntimeRecoveryState(targetModelId);
   saveAppSettings();
   if (serverOwned && targetModelId === selectedModelId) await stopOwnedServer();
   return { ok: true, modelId: targetModelId, settings: getModelSettingsForId(targetModelId) };
@@ -5397,6 +5571,7 @@ ipcMain.handle("app:set-model-raw-config", async (_event, payload) => {
   }
   const patch = sanitizeSettingsPatch(parsed);
   setModelSettingsForId(targetModelId, patch);
+  resetRuntimeRecoveryState(targetModelId);
   saveAppSettings();
   if (serverOwned && targetModelId === selectedModelId) await stopOwnedServer();
   return { ok: true, modelId: targetModelId, settings: getModelSettingsForId(targetModelId) };
