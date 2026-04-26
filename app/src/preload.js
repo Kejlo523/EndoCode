@@ -33,6 +33,7 @@ contextBridge.exposeInMainWorld("endocode", {
   downloadModel: (modelId) => ipcRenderer.invoke("app:download-model", modelId),
   deleteModel: (modelId) => ipcRenderer.invoke("app:delete-model", modelId),
   addCustomModel: (urlOrPath) => ipcRenderer.invoke("app:add-custom-model", urlOrPath),
+  importLocalModel: (payload) => ipcRenderer.invoke("app:import-local-model", payload),
   searchModels: (options) => ipcRenderer.invoke("app:search-models", options),
   searchHfModels: (options) => ipcRenderer.invoke("app:search-hf-models", options),
   openExternal: (url) => ipcRenderer.invoke("app:open-external", url),

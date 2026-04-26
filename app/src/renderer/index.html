@@ -271,7 +271,10 @@
         <button class="modal-close" id="closeSkills">&times;</button>
       </div>
       <div class="skills-toolbar">
-        <span class="skills-count" id="skillsCount">0 / 0 aktywnych</span>
+        <div class="skills-toolbar-meta">
+          <span class="skills-count" id="skillsCount">0 / 0 aktywnych</span>
+          <span class="skills-subtitle">Lokalne rozszerzenia agenta</span>
+        </div>
         <button class="modal-btn approve" id="installRecommendedSkills">Instaluj domyślne</button>
       </div>
       <div class="skills-list" id="skillsList">
@@ -295,6 +298,7 @@
         <button class="model-tab-btn active" id="tabLibrary">Moja Biblioteka</button>
         <button class="model-tab-btn" id="tabInstalled">Zainstalowane</button>
         <button class="model-tab-btn" id="tabDiscover">Odkrywaj</button>
+        <button class="model-tab-btn" id="tabManual">Dodaj ręcznie</button>
       </div>
 
       <div id="modelsLibraryView">
@@ -303,7 +307,7 @@
             <input type="text" id="hfModelUrl" placeholder="Wklej link .gguf z HF, ModelScope, GitHub lub direct..." />
             <button class="modal-btn approve" id="addHfModel">Dodaj</button>
           </div>
-          <span class="models-status" id="modelsStatus">Wszystkie systemy gotowe</span>
+          <span class="models-status" id="modelsStatus">Status: gotowe</span>
         </div>
         <div class="models-list" id="modelsList">
           <div class="models-empty">Ładowanie katalogu...</div>
@@ -339,6 +343,28 @@
         </div>
         <div class="models-list" id="modelsInstalledList">
           <div class="models-empty">Ładowanie zainstalowanych modeli...</div>
+        </div>
+      </div>
+      <div id="modelsManualView" class="hidden">
+        <div class="models-manual-panel">
+          <div class="models-manual-head">
+            <strong>Import lokalnego pliku GGUF</strong>
+            <span>Wskaż plik `.gguf`/`.guff`, a aplikacja skopiuje go do folderu `models` i doda konfigurację.</span>
+          </div>
+          <div class="models-manual-grid">
+            <label class="models-manual-field">
+              <span>Nazwa modelu (opcjonalnie)</span>
+              <input type="text" id="manualModelName" placeholder="Np. Qwen 7B Local" />
+            </label>
+            <label class="models-manual-field">
+              <span>Opis (opcjonalnie)</span>
+              <input type="text" id="manualModelDescription" placeholder="Krótki opis modelu" />
+            </label>
+          </div>
+          <div class="models-manual-actions">
+            <button class="modal-btn approve" id="pickManualModelBtn">Wybierz plik i importuj</button>
+            <span class="models-status" id="manualImportStatus">Status: oczekiwanie</span>
+          </div>
         </div>
       </div>
     </div>

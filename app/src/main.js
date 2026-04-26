@@ -24,6 +24,9 @@ const SERVER_SHUTDOWN_TIMEOUT_MS = 6000;
 const CHAT_WEB_LOOKUP_TIMEOUT_MS = 2500;
 const CHAT_WEB_LOOKUP_CACHE_TTL_MS = 5 * 60 * 1000;
 const CHAT_WEB_LOOKUP_MAX_ITEMS = 3;
+const CHAT_WEB_PAGE_FETCH_TIMEOUT_MS = 2200;
+const CHAT_WEB_PAGE_FETCH_MAX_SOURCES = 2;
+const CHAT_WEB_PAGE_SNIPPET_CHARS = 320;
 
 /** Górny limit okna kontekstu (llama.cpp -c); suwak w UI do ~2.5 mln — realnie ogranicza RAM/VRAM. */
 const MIN_CONTEXT_TOKENS = 1024;
@@ -246,6 +249,7 @@ let serverOwned = false;
 let runningModelId = null;
 let runInProgress = false;
 let runAbortController = null;
+let lastChatLookupQuery = "";
 let accessLevel = "sandbox"; // "sandbox" or "full"
 let chatHistory = [];
 let currentChatId = null;
@@ -545,6 +549,16 @@ async function syncCatalogWithModelFiles(catalog) {
     }
     const modelPath = path.resolve(BIELIK_HOME, model.file);
     if (await pathExistsAsync(modelPath)) {
+      syncedModels.push(model);
+      continue;
+    }
+    // Keep entries that are valid download candidates (not downloaded yet).
+    const hasDownloadSource = Boolean(
+      String(model.downloadUrl || "").trim() ||
+      String(model.source || "").trim() ||
+      model.preset,
+    );
+    if (hasDownloadSource) {
       syncedModels.push(model);
       continue;
     }
@@ -925,6 +939,92 @@ function createModelId(fileName, source = "") {
   return `${base}-${suffix}`.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80);
 }
 
+async function importLocalModelFromFile(input = {}) {
+  const payload = typeof input === "object" && input !== null ? input : {};
+  let sourcePath = String(payload.filePath || "").trim();
+  if (!sourcePath) {
+    const pick = await dialog.showOpenDialog(mainWindow, {
+      title: "Wybierz plik modelu GGUF",
+      properties: ["openFile"],
+      filters: [
+        { name: "GGUF models", extensions: ["gguf", "guff"] },
+        { name: "All files", extensions: ["*"] },
+      ],
+      defaultPath: path.join(BIELIK_HOME, "models"),
+    });
+    if (pick.canceled || !pick.filePaths?.[0]) return { ok: false, canceled: true };
+    sourcePath = pick.filePaths[0];
+  }
+
+  const ext = path.extname(sourcePath).toLowerCase();
+  if (ext !== ".gguf" && ext !== ".guff") {
+    throw new Error("Wskaż plik .gguf lub .guff.");
+  }
+  await fsp.access(sourcePath, fs.constants.R_OK);
+
+  const srcStat = await fsp.stat(sourcePath);
+  if (!srcStat.isFile()) throw new Error("Wybrana ścieżka nie jest plikiem.");
+  const fileName = safeModelFileName(path.basename(sourcePath).replace(/\.guff$/i, ".gguf"));
+  const modelDir = path.join(BIELIK_HOME, "models");
+  await fsp.mkdir(modelDir, { recursive: true });
+
+  let finalFileName = fileName;
+  let targetPath = path.join(modelDir, finalFileName);
+  let suffix = 1;
+  while (await pathExistsAsync(targetPath)) {
+    const parsed = path.parse(fileName);
+    finalFileName = `${parsed.name}-${suffix}${parsed.ext || ".gguf"}`;
+    targetPath = path.join(modelDir, finalFileName);
+    suffix += 1;
+  }
+  await fsp.copyFile(sourcePath, targetPath);
+
+  const catalog = loadModelCatalog();
+  const displayName = String(payload.displayName || "").trim() || finalFileName.replace(/\.gguf$/i, "").replace(/[-_.]/g, " ");
+  const description = String(payload.description || "").trim() || "Model zaimportowany ręcznie z lokalnego pliku GGUF.";
+  const id = createModelId(finalFileName, "manual");
+  if (catalog.models.some((m) => m.id === id)) {
+    throw new Error("Model o takim ID już istnieje w katalogu.");
+  }
+
+  const runtimeConfig = createRuntimeModelConfig({
+    file: finalFileName,
+    displayName,
+    expectedBytes: srcStat.size,
+    description,
+  });
+
+  const newModel = {
+    id,
+    displayName,
+    description,
+    kind: "local-gguf",
+    serverModel: id,
+    file: `models/${finalFileName}`,
+    expectedBytes: srcStat.size,
+    source: "manual-import",
+    sourceType: "manual",
+    ...runtimeConfig,
+  };
+  catalog.models.push(newModel);
+  saveModelCatalog(catalog);
+  setModelSettingsForId(id, {
+    maxMessages: 32,
+    contextTokens: runtimeConfig.contextTokens,
+    gpuLayers: runtimeConfig.gpuLayers,
+    threads: runtimeConfig.threads,
+    threadsBatch: runtimeConfig.threadsBatch,
+    batchSize: runtimeConfig.batchSize,
+    ubatchSize: runtimeConfig.ubatchSize,
+    parallel: runtimeConfig.parallel,
+    flashAttention: runtimeConfig.flashAttention,
+    cacheTypeK: runtimeConfig.cacheTypeK,
+    cacheTypeV: runtimeConfig.cacheTypeV,
+  });
+  saveAppSettings();
+  return { ok: true, model: newModel };
+}
+
 async function fetchJson(url, options = {}) {
   const res = await fetch(url, {
     ...options,
@@ -949,6 +1049,74 @@ function normalizeWebQuery(text) {
     .slice(0, 180);
 }
 
+function isRepeatPrompt(text) {
+  const q = String(text || "").trim().toLowerCase();
+  if (!q) return false;
+  return /^(jeszcze raz|ponow|ponów|retry|spróbuj ponownie|sprobuj ponownie|again|powtorz|powtórz)$/.test(q);
+}
+
+const WEB_LOOKUP_STOPWORDS_PL = new Set([
+  "ale", "co", "dokladnie", "dokładnie", "na", "tej", "stronie", "jakies", "jakieś", "cokolwiek", "szczegolowo", "szczegółowo",
+  "mi", "powiedz", "powiedzisz", "prosze", "proszę", "czy", "i", "oraz", "to", "ten", "ta", "te", "tam", "tu", "w", "z",
+  "o", "u", "do", "dla", "po", "od", "się", "sie", "jest", "są", "sa", "by", "aby",
+]);
+
+function buildWebLookupCandidates(query, preferredQuery = "") {
+  const normalized = normalizeWebQuery(query);
+  const preferred = normalizeWebQuery(preferredQuery);
+  if (!normalized && !preferred) return [];
+  const cleaned = normalized
+    .replace(/[!?.,;:()[\]{}"'`]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const words = cleaned
+    .split(" ")
+    .map((word) => word.trim())
+    .filter(Boolean)
+    .filter((word) => word.length >= 3)
+    .filter((word) => !WEB_LOOKUP_STOPWORDS_PL.has(word.toLowerCase()))
+    .slice(0, 12);
+
+  const candidates = [];
+  if (preferred) candidates.push(preferred);
+  if (words.length) candidates.push(words.join(" "));
+  if (normalized) candidates.push(normalized);
+  return [...new Set(candidates.map((v) => v.slice(0, 140).trim()).filter(Boolean))];
+}
+
+async function deriveLookupQueryWithModel(userText, history, abortSignal) {
+  const text = normalizeWebQuery(userText);
+  if (!text) return "";
+  if (isRepeatPrompt(text) && lastChatLookupQuery) return lastChatLookupQuery;
+
+  const recent = Array.isArray(history) ? history.slice(-4).map((msg) => `${msg.role}: ${String(msg.content || "").slice(0, 220)}`).join("\n") : "";
+  const promptMessages = [
+    {
+      role: "system",
+      content: [
+        "Jestes parserem zapytan web lookup.",
+        "Zamien wiadomosc uzytkownika na 2-8 slow kluczowych do wyszukiwarki.",
+        "Wyjscie: TYLKO jedna linia tekstu (bez markdown, bez cudzyslowow, bez komentarzy).",
+        "Jesli user pyta o konkretna domene, domena musi zostac w zapytaniu.",
+        "Jesli user pisze 'jeszcze raz' i brak kontekstu, zwroc puste.",
+      ].join("\n"),
+    },
+    ...(recent ? [{ role: "user", content: `Kontekst ostatnich wiadomosci:\n${recent}` }] : []),
+    { role: "user", content: `Wiadomosc uzytkownika:\n${text}\n\nZapytanie web lookup:` },
+  ];
+  try {
+    const failed = new Set();
+    const parsed = await callModelWithRecovery(promptMessages, abortSignal, failed, { plainChat: true, silent: true });
+    const raw = String(parsed?.content || "").split(/\r?\n/)[0] || "";
+    const cleaned = normalizeWebQuery(raw.replace(/^["'`]+|["'`]+$/g, ""));
+    if (!cleaned) return "";
+    return cleaned.slice(0, 140);
+  } catch {
+    const fallback = buildWebLookupCandidates(text)[0] || "";
+    return fallback;
+  }
+}
+
 function shouldUseWebLookup(query) {
   const q = String(query || "").trim();
   if (!q || q.length < 6) return false;
@@ -960,39 +1128,180 @@ function compactWebSnippet(value) {
   return String(value || "").replace(/\s+/g, " ").trim().slice(0, 260);
 }
 
-async function getLightWebContext(query) {
-  const normalized = normalizeWebQuery(query);
-  if (!shouldUseWebLookup(normalized)) return "";
-  const cacheKey = normalized.toLowerCase();
-  const cached = chatWebLookupCache.get(cacheKey);
-  if (cached && (Date.now() - cached.at) < CHAT_WEB_LOOKUP_CACHE_TTL_MS) {
-    return cached.text;
-  }
+function isHttpUrl(value) {
   try {
-    const data = await fetchJson(
-      `https://api.duckduckgo.com/?q=${encodeURIComponent(normalized)}&format=json&no_html=1&skip_disambig=1`,
-      { signal: AbortSignal.timeout(CHAT_WEB_LOOKUP_TIMEOUT_MS) },
-    );
-    const lines = [];
-    const abstract = compactWebSnippet(data?.AbstractText);
-    const heading = compactWebSnippet(data?.Heading);
-    if (abstract) {
-      lines.push(`- ${heading ? `${heading}: ` : ""}${abstract}`);
-    }
-    const topics = Array.isArray(data?.RelatedTopics) ? data.RelatedTopics : [];
-    for (const topic of topics) {
-      if (lines.length >= CHAT_WEB_LOOKUP_MAX_ITEMS) break;
-      const text = compactWebSnippet(topic?.Text || topic?.Name || "");
-      if (!text) continue;
-      lines.push(`- ${text}`);
-    }
-    if (!lines.length) return "";
-    const context = `Kontekst z internetu (ultra-light, moze byc niepelny):\n${lines.join("\n")}`;
-    chatWebLookupCache.set(cacheKey, { at: Date.now(), text: context });
-    return context;
+    const url = new URL(String(value || ""));
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function extractDomainCandidate(text) {
+  const match = String(text || "").toLowerCase().match(/\b([a-z0-9-]+\.[a-z]{2,})(?:\/[^\s]*)?\b/);
+  if (!match) return "";
+  return match[1];
+}
+
+async function fetchLivePageSnippet(url) {
+  if (!isHttpUrl(url)) return "";
+  try {
+    const response = await fetch(url, {
+      redirect: "follow",
+      headers: { "User-Agent": "EndoCode-Desktop-App" },
+      signal: AbortSignal.timeout(CHAT_WEB_PAGE_FETCH_TIMEOUT_MS),
+    });
+    if (!response.ok) return "";
+    const html = await response.text();
+    const visible = stripHtmlToVisibleText(html);
+    return compactWebSnippet(visible).slice(0, CHAT_WEB_PAGE_SNIPPET_CHARS);
   } catch {
     return "";
   }
+}
+
+function collectRelatedTopics(topics = [], out = []) {
+  for (const topic of topics) {
+    if (!topic) continue;
+    if (Array.isArray(topic.Topics)) {
+      collectRelatedTopics(topic.Topics, out);
+      continue;
+    }
+    out.push(topic);
+  }
+  return out;
+}
+
+async function getLightWebContext(query, preferredQuery = "") {
+  const normalized = normalizeWebQuery(query);
+  if (!shouldUseWebLookup(normalized)) {
+    return { context: "", sources: [], visitedUrls: [], fromCache: false, skipped: true, query: normalized };
+  }
+  const cacheKey = normalized.toLowerCase();
+  const cached = chatWebLookupCache.get(cacheKey);
+  if (cached && (Date.now() - cached.at) < CHAT_WEB_LOOKUP_CACHE_TTL_MS) {
+    return { ...cached.value, fromCache: true };
+  }
+  const candidates = buildWebLookupCandidates(normalized, preferredQuery);
+  const domain = extractDomainCandidate(`${preferredQuery} ${normalized}`);
+  const domainUrl = domain ? `https://${domain}` : "";
+  if (domainUrl) {
+    const domainSnippet = await fetchLivePageSnippet(domainUrl);
+    if (domainSnippet) {
+      const directContext = `Kontekst z internetu (ultra-light, moze byc niepelny):
+- Pipeline: domain-first fetch -> extract visible text
+- Zapytanie lookup: ${preferredQuery || normalized}
+- [LIVE:DOMAIN] ${domainSnippet}`;
+      return {
+        context: directContext,
+        sources: [{ title: `Strona ${domain}`, url: domainUrl, snippet: domainSnippet }],
+        visitedUrls: [domainUrl],
+        lookupUrl: "",
+        fromCache: false,
+        skipped: false,
+        query: normalized,
+        lookupQuery: preferredQuery || normalized,
+      };
+    }
+  }
+  let lastResult = null;
+  for (const candidateQuery of candidates) {
+    const lookupUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(candidateQuery)}&format=json&no_html=1&skip_disambig=1`;
+    try {
+      const data = await fetchJson(lookupUrl, { signal: AbortSignal.timeout(CHAT_WEB_LOOKUP_TIMEOUT_MS) });
+      const lines = [];
+      const sources = [];
+      const abstract = compactWebSnippet(data?.AbstractText);
+      const heading = compactWebSnippet(data?.Heading);
+      if (abstract) {
+        lines.push(`- ${heading ? `${heading}: ` : ""}${abstract}`);
+        if (data?.AbstractURL) {
+          sources.push({
+            title: heading || "DuckDuckGo Abstract",
+            url: String(data.AbstractURL),
+            snippet: abstract,
+          });
+        }
+      }
+      const topics = collectRelatedTopics(Array.isArray(data?.RelatedTopics) ? data.RelatedTopics : []);
+      for (const topic of topics) {
+        if (lines.length >= CHAT_WEB_LOOKUP_MAX_ITEMS) break;
+        const text = compactWebSnippet(topic?.Text || topic?.Name || "");
+        if (!text) continue;
+        lines.push(`- ${text}`);
+        if (topic?.FirstURL) {
+          sources.push({
+            title: compactWebSnippet(topic?.Name || text.split("-")[0] || "Related topic"),
+            url: String(topic.FirstURL),
+            snippet: text,
+          });
+        }
+      }
+      const dedupedSources = [];
+      const seen = new Set();
+      for (const source of sources) {
+        const key = `${source.url}|${source.title}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        dedupedSources.push(source);
+      }
+      const candidateUrls = dedupedSources
+        .map((source) => String(source?.url || "").trim())
+        .filter((url) => isHttpUrl(url))
+        .slice(0, CHAT_WEB_PAGE_FETCH_MAX_SOURCES);
+      const liveSnippets = await Promise.all(candidateUrls.map((url) => fetchLivePageSnippet(url)));
+      for (let i = 0; i < candidateUrls.length; i += 1) {
+        const snippet = compactWebSnippet(liveSnippets[i] || "");
+        if (!snippet) continue;
+        lines.push(`- [LIVE:${i + 1}] ${snippet}`);
+      }
+
+      const result = {
+        context: lines.length
+          ? `Kontekst z internetu (ultra-light, moze byc niepelny):
+- Pipeline: interpret query -> lookup -> fetch live page -> extract visible text
+- Zapytanie lookup: ${candidateQuery}
+${lines.join("\n")}`
+          : "",
+        sources: dedupedSources,
+        visitedUrls: candidateUrls,
+        lookupUrl,
+        fromCache: false,
+        skipped: false,
+        query: normalized,
+        lookupQuery: candidateQuery,
+      };
+      lastResult = result;
+      if (result.context) {
+        chatWebLookupCache.set(cacheKey, { at: Date.now(), value: result });
+        return result;
+      }
+    } catch (error) {
+      lastResult = {
+        context: "",
+        sources: [],
+        visitedUrls: [],
+        lookupUrl,
+        fromCache: false,
+        skipped: false,
+        query: normalized,
+        lookupQuery: candidateQuery,
+        error: String(error?.message || error),
+      };
+    }
+  }
+  const fallback = lastResult || {
+    context: "",
+    sources: [],
+    visitedUrls: [],
+    fromCache: false,
+    skipped: false,
+    query: normalized,
+    lookupQuery: normalized,
+    error: "",
+  };
+  chatWebLookupCache.set(cacheKey, { at: Date.now(), value: fallback });
+  return fallback;
 }
 
 function fetchJsonViaHttps(url, timeoutMs = 45000) {
@@ -1826,6 +2135,7 @@ async function killModelServerResources() {
 
 async function callModel(messages, abortSignal, options = {}, step = null) {
   const plainChat = options.plainChat === true;
+  const silent = options.silent === true;
   if (abortSignal?.aborted) throw new Error("Przerwano przez uzytkownika.");
   const abortGuard = createModelAbortGuard(abortSignal);
   const reasoning = getReasoningProfile();
@@ -1889,15 +2199,15 @@ async function callModel(messages, abortSignal, options = {}, step = null) {
             thinkingContent += delta.reasoning_content;
             if (!inThinking) {
               inThinking = true;
-              emit("thinking-start", { step });
+              if (!silent) emit("thinking-start", { step });
             }
-            emit("thinking-delta", { text: delta.reasoning_content, full: thinkingContent, step });
+            if (!silent) emit("thinking-delta", { text: delta.reasoning_content, full: thinkingContent, step });
           }
 
           if (delta.content) {
             if (inThinking) {
               inThinking = false;
-              emit("thinking-end", { full: thinkingContent, step });
+              if (!silent) emit("thinking-end", { full: thinkingContent, step });
             }
 
             fullContent += delta.content;
@@ -1910,7 +2220,7 @@ async function callModel(messages, abortSignal, options = {}, step = null) {
                   lastChunkNorm = chunkNorm;
                 }
                 if (repeatedChunkCount >= PLAIN_CHAT_REPEAT_CHUNK_LIMIT) {
-                  emit("status", {
+                  if (!silent) emit("status", {
                     status: "model-action-ready",
                     detail: "Wykryto petle generacji w trybie czatu. Zatrzymuje odpowiedz kontrolowanie.",
                     step,
@@ -1920,7 +2230,7 @@ async function callModel(messages, abortSignal, options = {}, step = null) {
                 }
               }
               if (fullContent.length >= PLAIN_CHAT_MAX_CHARS) {
-                emit("status", {
+                if (!silent) emit("status", {
                   status: "model-action-ready",
                   detail: `Osiagnieto limit dlugosci odpowiedzi w trybie czatu (${PLAIN_CHAT_MAX_CHARS} znakow).`,
                   step,
@@ -1932,14 +2242,14 @@ async function callModel(messages, abortSignal, options = {}, step = null) {
             if (!plainChat) {
               const firstObject = extractFirstJsonObject(fullContent);
               if (firstObject) {
-                emit("content-delta", { text: firstObject, full: firstObject, plainChat, step });
-                emit("status", { status: "model-action-ready", detail: "Odebrano pierwsza kompletna akcje JSON; ucinam dalsze generowanie.", step });
+                if (!silent) emit("content-delta", { text: firstObject, full: firstObject, plainChat, step });
+                if (!silent) emit("status", { status: "model-action-ready", detail: "Odebrano pierwsza kompletna akcje JSON; ucinam dalsze generowanie.", step });
 
                 try { await reader.cancel(); } catch { /* ignore */ }
                 return { content: firstObject, reasoning: thinkingContent };
               }
             }
-            emit("content-delta", { text: delta.content, full: fullContent, plainChat, step });
+            if (!silent) emit("content-delta", { text: delta.content, full: fullContent, plainChat, step });
           }
         } catch {
           // malformed SSE chunk, skip
@@ -1948,7 +2258,7 @@ async function callModel(messages, abortSignal, options = {}, step = null) {
     }
 
     if (inThinking) {
-      emit("thinking-end", { full: thinkingContent, step });
+      if (!silent) emit("thinking-end", { full: thinkingContent, step });
     }
 
     return { content: fullContent, reasoning: thinkingContent };
@@ -2867,11 +3177,24 @@ function truncateFetchBody(text) {
   };
 }
 
-const CHAT_SYSTEM_PROMPT = `Jestes pomocnym asystentem w trybie CZATU (bez narzedzi, bez plikow w workspace, bez formatu JSON).
+const CHAT_SYSTEM_PROMPT = `Jestes pomocnym asystentem w trybie CZATU (bez akcji narzedziowych, bez plikow w workspace, bez formatu JSON).
 Odpowiadaj zwyklym ciaglym tekstem po polsku — zwiezle i rzeczowo.
-Masz natywna funkcje kontekstu internetowego: jesli jest dolaczony blok "Kontekst z internetu", korzystaj z niego jak z faktow pomocniczych.
-Gdy nie ma takiego bloku, nie udawaj ze cos pobrales z internetu.
+W tym trybie masz NATYWNY, AUTOMATYCZNY dostep do lekkiego kontekstu internetowego.
+Jesli pojawia sie blok "Kontekst z internetu", traktuj go jako aktualne dane pomocnicze i uzyj go w odpowiedzi.
+Ten blok moze zawierac pipeline: lookup + fetch live page + extract visible text.
+Nie pisz, ze "nie masz internetu" lub "nie mozesz sprawdzic online", bo tryb czatu moze dolaczyc internetowy kontekst automatycznie.
+Gdy takiego bloku nie ma, odpowiedz z wiedzy wlasnej i w razie potrzeby zaznacz brak swiezych danych z internetu.
+ZASADA ANTYHALUCYNACJI: nie wymyslaj danych firm, kontaktow, adresow, cen, ofert, numerow telefonu ani emaili. Jesli pytanie dotyczy konkretnej strony/firmy i nie ma zweryfikowanych danych w bloku internetowym, napisz wyraznie: "Brak zweryfikowanych danych z sieci dla tego zapytania."
+Jesli podajesz fakty z bloku internetowego, dodaj na koncu sekcje "Zrodla:" i wypisz URL-e z ktorych pochodza dane.
 Nie wymyslaj wynikow narzedzi ani struktur {"tool":...}. Jesli uzytkownik potrzebuje edycji plikow, skryptow lub sandboxa, napisz krotko zeby wylaczyl tryb „Czat” i uzyl zwyklego agenta.`;
+
+function looksLikeWebsiteFactQuestion(text) {
+  const q = String(text || "").toLowerCase();
+  if (!q) return false;
+  const hasDomain = /\b[a-z0-9-]+\.[a-z]{2,}\b/i.test(q);
+  const hasFactIntent = /(ofert|uslug|usług|kontakt|telefon|email|mail|adres|firma|strona|oferuj|cennik|dane)/i.test(q);
+  return hasDomain || hasFactIntent;
+}
 
 async function executeTool(action) {
   const tool = action.tool;
@@ -3618,10 +3941,65 @@ async function runSimpleChat(userText) {
       ...history,
       { role: "user", content: text },
     ];
-    const webContext = await getLightWebContext(text);
-    if (webContext) {
-      chatMessages.splice(1, 0, { role: "user", content: `Kontekst z internetu:\n${webContext}` });
+    const modelLookupQuery = await deriveLookupQueryWithModel(text, history, signal);
+    emit("chat-web-lookup", {
+      phase: "start",
+      query: text,
+      lookupQuery: modelLookupQuery,
+      detail: "Model interpretuje pytanie i uruchamia web lookup...",
+    });
+    const webLookup = await getLightWebContext(text, modelLookupQuery);
+    if (webLookup?.error) {
+      emit("chat-web-lookup", {
+        phase: "error",
+        query: webLookup.query || text,
+        lookupUrl: webLookup.lookupUrl || "",
+        detail: webLookup.error,
+      });
+    }
+    if (webLookup?.context) {
+      chatMessages.splice(1, 0, { role: "user", content: `Kontekst z internetu:\n${webLookup.context}` });
       emit("status", { status: "model-thinking", detail: "Czat: dolaczono lekki kontekst internetowy." });
+      const sourceUrls = Array.isArray(webLookup.sources)
+        ? webLookup.sources.map((source) => String(source?.url || "").trim()).filter(Boolean).slice(0, 6)
+        : [];
+      if (sourceUrls.length) {
+        chatMessages.splice(2, 0, {
+          role: "user",
+          content: `Zweryfikowane zrodla URL (uzyj tylko ich, nie wymyslaj nowych):\n${sourceUrls.map((url) => `- ${url}`).join("\n")}`,
+        });
+      }
+      emit("chat-web-lookup", {
+        phase: "result",
+        used: true,
+        fromCache: Boolean(webLookup.fromCache),
+        lookupUrl: webLookup.lookupUrl || "",
+        query: webLookup.query || text,
+        lookupQuery: webLookup.lookupQuery || modelLookupQuery || "",
+        sources: Array.isArray(webLookup.sources) ? webLookup.sources.slice(0, 5) : [],
+        visitedUrls: Array.isArray(webLookup.visitedUrls) ? webLookup.visitedUrls.slice(0, 5) : [],
+        detail: "Dołączono kontekst internetowy do odpowiedzi.",
+      });
+      if (webLookup.lookupQuery) lastChatLookupQuery = webLookup.lookupQuery;
+    } else {
+      emit("chat-web-lookup", {
+        phase: "result",
+        used: false,
+        fromCache: Boolean(webLookup?.fromCache),
+        lookupUrl: webLookup?.lookupUrl || "",
+        query: webLookup?.query || text,
+        lookupQuery: webLookup?.lookupQuery || modelLookupQuery || "",
+        sources: Array.isArray(webLookup?.sources) ? webLookup.sources.slice(0, 5) : [],
+        visitedUrls: Array.isArray(webLookup?.visitedUrls) ? webLookup.visitedUrls.slice(0, 5) : [],
+        detail: webLookup?.skipped ? "Pominięto web lookup dla krótkiego/nieadekwatnego zapytania." : "Brak trafnego kontekstu internetowego.",
+      });
+    }
+    if (!webLookup?.context && looksLikeWebsiteFactQuestion(text)) {
+      const guardedReply = "Brak zweryfikowanych danych z sieci dla tego zapytania. Nie mogę rzetelnie podać oferty/kontaktu bez trafnego wyniku web lookup. Podaj proszę dokładny URL lub krótsze zapytanie, a sprawdzę ponownie.";
+      messages.push({ role: "user", content: text });
+      messages.push({ role: "assistant", content: guardedReply });
+      emit("final", { text: guardedReply, chatMode: true });
+      return { ok: true, final: guardedReply, guarded: true };
     }
     const failedModelIds = new Set();
     const rawReply = await callModelWithRecovery(chatMessages, signal, failedModelIds, { plainChat: true });
@@ -3885,8 +4263,12 @@ ipcMain.handle("app:list-models", async () => {
       available: model.kind === "local-gguf" ? status.available : Boolean(model.enabled),
       fileStatus: {
         ...status,
-        downloading: !!downloadInfo,
+        downloading: downloadInfo?.state === "queued" || downloadInfo?.state === "downloading",
         progress: downloadInfo?.progress || 0,
+        state: downloadInfo?.state || (status.available ? "completed" : "idle"),
+        error: downloadInfo?.error || null,
+        downloaded: downloadInfo?.downloaded || 0,
+        total: downloadInfo?.total || 0,
       },
       selected: model.id === selectedModelId,
     };
@@ -4049,6 +4431,7 @@ ipcMain.handle("app:add-custom-model", async (_event, input) => {
   saveAppSettings();
   return { ok: true, model: newModel };
 });
+ipcMain.handle("app:import-local-model", async (_event, payload) => importLocalModelFromFile(payload));
 
 function buildExternalSourceCard(source, query) {
   const search = encodeURIComponent(query || "gguf");
@@ -4233,7 +4616,7 @@ async function searchModelSources(options = {}) {
         name: p.displayName,
         description: p.description || `Model z Twojej listy polecanych. ${fit.fitLabel}`,
         tags: [p.category, ...(p.tags || [])],
-        recommended: true,
+        recommended: fit.recommended,
         recommendation: fit,
         files: [],
         fileName: p.file || p.fileName,
@@ -4295,7 +4678,7 @@ ipcMain.handle("app:open-external", async (_event, url) => {
 });
 
 async function performDownload(url, dest, modelId) {
-  if (activeDownloads.has(modelId)) throw new Error("Pobieranie juz trwa.");
+  if (activeDownloads.get(modelId)?.state === "downloading") throw new Error("Pobieranie juz trwa.");
   
   const destDir = path.dirname(dest);
   if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
@@ -4303,7 +4686,8 @@ async function performDownload(url, dest, modelId) {
   const tempDest = dest + ".downloading";
   const file = fs.createWriteStream(tempDest);
   
-  activeDownloads.set(modelId, { progress: 0 });
+  activeDownloads.set(modelId, { state: "queued", progress: 0, downloaded: 0, total: 0, error: null });
+  emit("agent:event", { type: "model-download-state", modelId, state: "queued", progress: 0, downloaded: 0, total: 0 });
 
   return new Promise((resolve, reject) => {
     function startRequest(requestUrl) {
@@ -4328,13 +4712,15 @@ async function performDownload(url, dest, modelId) {
         const total = parseInt(response.headers["content-length"], 10) || 0;
         let downloaded = 0;
         let lastPercent = -1;
+        activeDownloads.set(modelId, { state: "downloading", progress: 0, downloaded: 0, total, error: null });
+        emit("agent:event", { type: "model-download-state", modelId, state: "downloading", progress: 0, downloaded: 0, total });
 
         response.on("data", (chunk) => {
           downloaded += chunk.length;
           const progress = total > 0 ? Math.round((downloaded / total) * 100) : 0;
           if (progress !== lastPercent) {
             lastPercent = progress;
-            activeDownloads.set(modelId, { progress, downloaded, total });
+            activeDownloads.set(modelId, { state: "downloading", progress, downloaded, total, error: null });
             emit("agent:event", { type: "model-download-progress", modelId, progress, downloaded, total });
           }
         });
@@ -4347,9 +4733,11 @@ async function performDownload(url, dest, modelId) {
              if (fs.existsSync(dest)) fs.unlinkSync(dest);
              fs.renameSync(tempDest, dest);
              activeDownloads.delete(modelId);
+             emit("agent:event", { type: "model-download-state", modelId, state: "completed", progress: 100, downloaded, total });
               resolve();
            } catch (e) {
-              activeDownloads.delete(modelId);
+              activeDownloads.set(modelId, { state: "failed", progress: 0, downloaded: 0, total: 0, error: String(e?.message || e) });
+              emit("agent:event", { type: "model-download-state", modelId, state: "failed", progress: 0, downloaded: 0, total: 0, error: String(e?.message || e) });
               reject(e);
            }
         });
@@ -4357,7 +4745,8 @@ async function performDownload(url, dest, modelId) {
 
       request.on("error", (err) => {
         fs.unlink(tempDest, () => {});
-        activeDownloads.delete(modelId);
+        activeDownloads.set(modelId, { state: "failed", progress: 0, downloaded: 0, total: 0, error: String(err?.message || err) });
+        emit("agent:event", { type: "model-download-state", modelId, state: "failed", progress: 0, downloaded: 0, total: 0, error: String(err?.message || err) });
         reject(err);
       });
     }

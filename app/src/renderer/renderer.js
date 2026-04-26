@@ -109,6 +109,9 @@ let currentSettingsModelId = null;
 let refreshStateInFlight = false;
 let updateSystemInFlight = false;
 let loadModelsInFlight = false;
+const modelRenderCacheLibrary = new Map();
+const modelRenderCacheInstalled = new Map();
+const skillRenderCache = new Map();
 
 // ── Helpers ──
 function escapeHtml(value) {
@@ -758,13 +761,32 @@ function renderReasoningSelect(state) {
 // ══════════════ SKILLS ══════════════
 function renderSkills(skills = []) {
   if (!skillsList) return;
-  const installedCount = skills.filter((skill) => skill.installed).length;
-  if (skillsCount) skillsCount.textContent = `${installedCount} / ${skills.length} aktywnych`;
-  if (!skills.length) {
+  const normalized = skills.map((skill) => ({
+    id: skill.id,
+    name: skill.name,
+    category: skill.category,
+    summary: skill.summary,
+    installed: Boolean(skill.installed),
+    localOnly: skill.localOnly !== false,
+  }));
+  if (!normalized.some((skill) => skill.id === "vision")) {
+    normalized.push({
+      id: "vision",
+      name: "Vision (VLM Support)",
+      category: "Zdolności Agenta",
+      summary: "Włącza obsługę załączników obrazów oraz narzędzie analize_image.",
+      installed: false,
+      localOnly: true,
+    });
+  }
+  normalized.sort((a, b) => Number(b.installed) - Number(a.installed) || a.name.localeCompare(b.name));
+  const installedCount = normalized.filter((skill) => skill.installed).length;
+  if (skillsCount) skillsCount.textContent = `${installedCount} / ${normalized.length} aktywnych`;
+  if (!normalized.length) {
     skillsList.innerHTML = `<div class="skills-empty">Brak lokalnych skilli.</div>`;
     return;
   }
-  skillsList.innerHTML = skills.map((skill) => `
+  skillsList.innerHTML = normalized.map((skill) => `
     <article class="skill-card ${skill.installed ? "installed" : ""}">
       <div class="skill-card-main">
         <div class="skill-card-top">
@@ -772,13 +794,18 @@ function renderSkills(skills = []) {
           <span class="skill-category">${escapeHtml(skill.category)}</span>
         </div>
         <p class="skill-summary">${escapeHtml(skill.summary)}</p>
-        <div class="skill-local">local-only</div>
+        <div class="skill-local">${skill.localOnly ? "local-only" : "online"}</div>
       </div>
-      <button class="skill-install-btn ${skill.installed ? "installed" : ""}" data-skill-id="${escapeHtml(skill.id)}" data-action="${skill.installed ? "uninstall" : "install"}">
-        ${skill.installed ? "Usuń" : "Instaluj"}
-      </button>
+      <div class="skill-actions">
+        <span class="skill-state ${skill.installed ? "installed" : "available"}">${skill.installed ? "Aktywny" : "Dostępny"}</span>
+        <button class="skill-install-btn ${skill.installed ? "installed" : ""}" data-skill-id="${escapeHtml(skill.id)}" data-action="${skill.installed ? "uninstall" : "install"}">
+          ${skill.installed ? "Usuń" : "Instaluj"}
+        </button>
+      </div>
     </article>
   `).join("");
+  skillRenderCache.clear();
+  normalized.forEach((skill) => skillRenderCache.set(skill.id, JSON.stringify(skill)));
 }
 
 async function loadSkills() {
@@ -792,79 +819,136 @@ async function loadSkills() {
 }
 
 // ══════════════ MODELS ══════════════
-function renderModels(models = [], targetEl = modelsList) {
+function normalizeModelUiState(model) {
+  const status = model.fileStatus || {};
+  const progress = Number(status.progress || 0);
+  const bytes = Number(status.expectedBytes || model.expectedBytes || 0);
+  const sizeGB = bytes > 0 ? `${(bytes / 1024 / 1024 / 1024).toFixed(1)} GB` : "?";
+  const categoryLabel = { small: "Mały", medium: "Średni", large: "Duży" }[model.category] || "";
+  const state = status.state || (status.available ? "completed" : "idle");
+  return {
+    ...model,
+    ui: {
+      state,
+      progress,
+      sizeGB,
+      categoryLabel,
+      downloaded: Number(status.downloaded || 0),
+      total: Number(status.total || 0),
+      error: status.error || "",
+      isDownloaded: Boolean(status.available),
+      isDownloading: state === "queued" || state === "downloading",
+      isFailed: state === "failed",
+    },
+  };
+}
+
+function renderModelCard(model) {
+  const { ui } = model;
+  let badge = "";
+  if (model.kind === "cloud-api") badge = '<span class="model-badge cloud">Cloud API</span>';
+  else if (ui.isDownloaded) badge = '<span class="model-badge installed">Pobrany</span>';
+  else if (ui.isDownloading) badge = '<span class="model-badge">Pobieranie...</span>';
+  else if (ui.isFailed) badge = '<span class="model-badge error">Błąd pobierania</span>';
+  else badge = '<span class="model-badge">Gotowy do pobrania</span>';
+
+  const actions = [];
+  if (model.kind !== "cloud-api") {
+    if (ui.isDownloaded) {
+      actions.push(`<button class="model-btn use" onclick="useModel('${escapeAttr(model.id)}')">${model.selected ? "Aktywny" : "Użyj"}</button>`);
+      actions.push(`<button class="model-btn use" onclick="openSettingsModal('${escapeAttr(model.id)}')">Ustawienia</button>`);
+      actions.push(`<button class="model-btn delete" onclick="deleteModel('${escapeAttr(model.id)}')">Usuń</button>`);
+    } else if (ui.isDownloading) {
+      actions.push(`<button class="model-btn download" disabled>${ui.state === "queued" ? "W kolejce..." : `Pobieranie ${ui.progress}%...`}</button>`);
+    } else {
+      const cta = ui.isFailed ? "Ponów pobieranie" : `Pobierz (${ui.sizeGB})`;
+      actions.push(`<button class="model-btn download" onclick="downloadModel('${escapeAttr(model.id)}')">${cta}</button>`);
+    }
+  } else {
+    actions.push(`<button class="model-btn use" onclick="useModel('${escapeAttr(model.id)}')">${model.selected ? "Aktywny" : "Użyj"}</button>`);
+  }
+
+  return `
+    <article class="model-item ${model.selected ? "selected" : ""}" data-model-id="${escapeAttr(model.id)}" data-model-state="${escapeAttr(ui.state)}">
+      <div class="model-info-header">
+        <div class="model-main-info">
+          <span class="model-name">${escapeHtml(model.displayName)}</span>
+          <span class="model-id">${escapeHtml(model.id)}</span>
+        </div>
+        ${badge}
+      </div>
+      <p class="model-desc">${escapeHtml(model.description)}</p>
+      <div class="model-meta">
+        <div class="model-meta-item"><span>Rodzaj:</span> <strong>${model.kind === "local-gguf" ? "Lokalny" : "API"}</strong></div>
+        ${ui.categoryLabel ? `<div class="model-meta-item"><span>Rozmiar:</span> <strong>${ui.categoryLabel}</strong></div>` : ""}
+        ${model.contextTokens ? `<div class="model-meta-item"><span>Kontekst:</span> <strong>${(model.contextTokens / 1024).toFixed(0)}k</strong></div>` : ""}
+      </div>
+      ${ui.isDownloading ? `<div class="download-progress-container"><div class="download-progress-fill" style="width:${ui.progress}%"></div></div>` : ""}
+      ${ui.isFailed && ui.error ? `<div class="model-error">${escapeHtml(ui.error)}</div>` : ""}
+      <div class="model-actions">${actions.join("")}</div>
+    </article>
+  `;
+}
+
+function renderModels(models = [], targetEl = modelsList, cacheMap = modelRenderCacheLibrary) {
   if (!targetEl) return;
   if (!models.length) {
     targetEl.innerHTML = `<div class="models-empty">Brak modeli w katalogu.</div>`;
+    cacheMap.clear();
     return;
   }
+  const normalized = models.map(normalizeModelUiState);
+  const nextIds = new Set(normalized.map((model) => model.id));
+  for (const [id] of cacheMap) {
+    if (!nextIds.has(id)) cacheMap.delete(id);
+  }
+  const html = [];
+  for (const model of normalized) {
+    const signature = JSON.stringify({
+      id: model.id,
+      selected: model.selected,
+      state: model.ui.state,
+      progress: model.ui.progress,
+      available: model.ui.isDownloaded,
+      error: model.ui.error,
+      ctx: model.contextTokens,
+    });
+    cacheMap.set(model.id, signature);
+    html.push(renderModelCard(model));
+  }
+  targetEl.innerHTML = html.join("");
+}
 
-  targetEl.innerHTML = models.map((model) => {
-    const status = model.fileStatus || {};
-    const isDownloaded = status.available;
-    const isDownloading = status.downloading;
-    const progress = status.progress || 0;
-    const categoryLabel = {
-      small: "Mały",
-      medium: "Średni",
-      large: "Duży",
-    }[model.category] || "";
+function patchModelDownloadProgress(modelId, progress, downloaded = 0, total = 0) {
+  const safeId = CSS.escape(String(modelId || ""));
+  const cards = modelsModal ? modelsModal.querySelectorAll(`.model-item[data-model-id="${safeId}"]`) : [];
+  cards.forEach((card) => {
+    card.setAttribute("data-model-state", "downloading");
+    let progressWrap = card.querySelector(".download-progress-container");
+    if (!progressWrap) {
+      progressWrap = document.createElement("div");
+      progressWrap.className = "download-progress-container";
+      progressWrap.innerHTML = `<div class="download-progress-fill" style="width:0%"></div>`;
+      const actions = card.querySelector(".model-actions");
+      if (actions?.parentNode) actions.parentNode.insertBefore(progressWrap, actions);
+    }
+    const fill = progressWrap.querySelector(".download-progress-fill");
+    if (fill) fill.style.width = `${Math.max(0, Math.min(100, Number(progress) || 0))}%`;
 
-    let badge = "";
-    if (model.kind === "cloud-api") badge = '<span class="model-badge cloud">Cloud API</span>';
-    else if (isDownloaded) badge = '<span class="model-badge installed">Pobrany</span>';
-    else if (isDownloading) badge = '<span class="model-badge">Pobieranie...</span>';
-    else badge = '<span class="model-badge">Dostępny GGUF</span>';
-
-    const actions = [];
-    if (model.kind !== "cloud-api") {
-      if (isDownloaded) {
-        actions.push(`<button class="model-btn use" onclick="useModel('${escapeAttr(model.id)}')">${model.selected ? "Aktywny" : "Użyj"}</button>`);
-        actions.push(`<button class="model-btn use" onclick="openSettingsModal('${escapeAttr(model.id)}')">Ustawienia</button>`);
-        actions.push(`<button class="model-btn delete" onclick="deleteModel('${escapeAttr(model.id)}')">Usuń</button>`);
-      } else if (isDownloading) {
-        actions.push(`<button class="model-btn download" disabled>Pobieranie ${progress}%...</button>`);
-      } else {
-        const sizeGB = model.expectedBytes ? (model.expectedBytes / 1024 / 1024 / 1024).toFixed(1) : "?";
-        actions.push(`<button class="model-btn download" onclick="downloadModel('${escapeAttr(model.id)}')">Pobierz (${sizeGB} GB)</button>`);
-      }
-    } else {
-      actions.push(`<button class="model-btn use" onclick="useModel('${escapeAttr(model.id)}')">${model.selected ? "Aktywny" : "Użyj"}</button>`);
+    const actionBtn = card.querySelector(".model-btn.download");
+    if (actionBtn) {
+      actionBtn.disabled = true;
+      actionBtn.textContent = `Pobieranie ${Math.max(0, Math.min(100, Number(progress) || 0))}%...`;
     }
 
-    return `
-      <article class="model-item ${model.selected ? "selected" : ""}">
-        <div class="model-info-header">
-          <div class="model-main-info">
-            <span class="model-name">${escapeHtml(model.displayName)}</span>
-            <span class="model-id">${escapeHtml(model.id)}</span>
-          </div>
-          ${badge}
-        </div>
-        <p class="model-desc">${escapeHtml(model.description)}</p>
-        <div class="model-meta">
-          <div class="model-meta-item">
-            <span>Rodzaj:</span> <strong>${model.kind === "local-gguf" ? "Lokalny" : "API"}</strong>
-          </div>
-          ${categoryLabel ? `
-          <div class="model-meta-item">
-            <span>Rozmiar:</span> <strong>${categoryLabel}</strong>
-          </div>` : ""}
-          ${model.contextTokens ? `
-          <div class="model-meta-item">
-            <span>Kontekst:</span> <strong>${(model.contextTokens / 1024).toFixed(0)}k</strong>
-          </div>` : ""}
-        </div>
-        ${isDownloading ? `
-        <div class="download-progress-container">
-          <div class="download-progress-fill" style="width: ${progress}%"></div>
-        </div>` : ""}
-        <div class="model-actions">
-          ${actions.join("")}
-        </div>
-      </article>
-    `;
-  }).join("");
+    const downloadedMb = (Number(downloaded || 0) / 1024 / 1024).toFixed(0);
+    const totalMb = Number(total || 0) > 0 ? `${(Number(total) / 1024 / 1024).toFixed(0)} MB` : "?? MB";
+    const desc = card.querySelector(".model-desc");
+    if (desc) {
+      if (!desc.dataset.originalText) desc.dataset.originalText = desc.textContent || "";
+      desc.textContent = `Pobieranie: ${downloadedMb} MB / ${totalMb}`;
+    }
+  });
 }
 
 async function loadModels() {
@@ -875,9 +959,9 @@ async function loadModels() {
   if (modelsInstalledList) modelsInstalledList.innerHTML = `<div class="models-empty">Ładowanie...</div>`;
   try {
     const models = await window.endocode.listModels();
-    renderModels(models, modelsList);
+    renderModels(models, modelsList, modelRenderCacheLibrary);
     const installed = models.filter((model) => model.kind === "local-gguf" && model.fileStatus?.available);
-    renderModels(installed, modelsInstalledList);
+    renderModels(installed, modelsInstalledList, modelRenderCacheInstalled);
   } catch (e) {
     modelsList.innerHTML = `<div class="models-empty error">${escapeHtml(e.message || String(e))}</div>`;
     if (modelsInstalledList) modelsInstalledList.innerHTML = `<div class="models-empty error">${escapeHtml(e.message || String(e))}</div>`;
@@ -1229,20 +1313,54 @@ window.endocode.onEvent(async (event) => {
     }
     return;
   }
-  if (event.type === "model-download-progress") {
-    // Throttled refresh for the UI
-    const now = Date.now();
-    if (modelsModal?.classList?.contains("hidden")) return;
-    if (!window._lastModelRefresh || now - window._lastModelRefresh > 900) {
-      window._lastModelRefresh = now;
-      await loadModels();
+  if (event.type === "chat-web-lookup") {
+    const phase = String(event.phase || "");
+    if (phase === "start") {
+      showLive("Web lookup", "Wyszukiwanie i lekka ekstrakcja danych...");
+      const startDetail = `${event.detail || "Rozpoczynam wyszukiwanie."}${event.lookupQuery ? `\nZapytanie modelu: ${event.lookupQuery}` : ""}`;
+      addInlineEvent("activity", "Web lookup", startDetail);
+      return;
     }
+    if (phase === "error") {
+      showLive("Web lookup: błąd", event.detail || "Błąd pobierania kontekstu internetowego.");
+      addInlineEvent("error", "Web lookup", event.detail || "Błąd pobierania kontekstu internetowego.");
+      return;
+    }
+    if (phase === "result") {
+      const sources = Array.isArray(event.sources) ? event.sources : [];
+      const visited = Array.isArray(event.visitedUrls) ? event.visitedUrls : [];
+      const sourceLines = sources
+        .filter((source) => source?.url)
+        .map((source) => `- ${String(source.title || "Źródło")}: ${String(source.url)}`)
+        .join("\n");
+      const visitedLines = visited.map((url) => `- ${String(url)}`).join("\n");
+      const detail = `${event.detail || ""}${event.lookupQuery ? `\nZapytanie po interpretacji: ${event.lookupQuery}` : ""}${event.lookupUrl ? `\nLookup API: ${event.lookupUrl}` : ""}${visitedLines ? `\nOdwiedzone URL:\n${visitedLines}` : ""}${sourceLines ? `\nŹródła użyte w kontekście:\n${sourceLines}` : ""}`.trim();
+      showLive(
+        event.used ? `Web lookup: użyto${event.fromCache ? " (cache)" : ""}` : "Web lookup: brak trafnych danych",
+        (visited[0] || sources[0]?.url || event.lookupQuery || event.lookupUrl || event.detail || "").slice(0, 220),
+      );
+      addInlineEvent("activity", "Web lookup", detail || "Brak wyników web lookup.");
+      return;
+    }
+  }
+  if (event.type === "model-download-progress") {
+    if (modelsModal?.classList?.contains("hidden")) return;
     if (modelsStatus) {
       const downloadedMb = (event.downloaded / 1024 / 1024).toFixed(0);
       const totalMb = event.total > 0 ? ` / ${(event.total / 1024 / 1024).toFixed(0)} MB` : "";
       const progress = event.total > 0 ? `${event.progress}%` : `${downloadedMb} MB`;
       modelsStatus.textContent = `Pobieranie ${event.modelId}: ${progress} (${downloadedMb} MB${totalMb})`;
     }
+    patchModelDownloadProgress(event.modelId, event.progress, event.downloaded, event.total);
+    return;
+  }
+  if (event.type === "model-download-state") {
+    if (event.state === "failed" && modelsStatus) {
+      modelsStatus.textContent = `Błąd pobierania ${event.modelId}: ${event.error || "nieznany błąd"}`;
+    } else if (event.state === "completed" && modelsStatus) {
+      modelsStatus.textContent = `Pobrano model ${event.modelId}.`;
+    }
+    await loadModels();
     return;
   }
   if (event.type === "runtime-install-progress") {
@@ -1265,7 +1383,7 @@ window.endocode.onEvent(async (event) => {
   if (event.type === "run-start") {
     removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
     if (event.chatMode) {
-      addInlineEvent("activity", "Czat", "Jedna odpowiedź tekstowa (bez narzędzi).");
+      addInlineEvent("activity", "Czat", "Jedna odpowiedź tekstowa (z automatycznym lekkim kontekstem internetowym).");
       showLive("Czat…", event.text || "");
     } else {
       addInlineEvent("activity", "Agent startuje", "Rozpoczęto zadanie.");
@@ -1532,37 +1650,32 @@ resetSettings.addEventListener("click", async () => {
 const tabLibrary = document.getElementById("tabLibrary");
 const tabInstalled = document.getElementById("tabInstalled");
 const tabDiscover = document.getElementById("tabDiscover");
+const tabManual = document.getElementById("tabManual");
 const modelsLibraryView = document.getElementById("modelsLibraryView");
 const modelsInstalledView = document.getElementById("modelsInstalledView");
 const modelsDiscoverView = document.getElementById("modelsDiscoverView");
+const modelsManualView = document.getElementById("modelsManualView");
+const pickManualModelBtn = document.getElementById("pickManualModelBtn");
+const manualModelName = document.getElementById("manualModelName");
+const manualModelDescription = document.getElementById("manualModelDescription");
+const manualImportStatus = document.getElementById("manualImportStatus");
 
-if (tabLibrary && tabDiscover && tabInstalled) {
-  tabLibrary.addEventListener("click", () => {
-    tabLibrary.classList.add("active");
-    tabInstalled.classList.remove("active");
-    tabDiscover.classList.remove("active");
-    modelsLibraryView.classList.remove("hidden");
-    modelsInstalledView.classList.add("hidden");
-    modelsDiscoverView.classList.add("hidden");
-  });
+if (tabLibrary && tabDiscover && tabInstalled && tabManual) {
+  const activateTab = (tabName) => {
+    tabLibrary.classList.toggle("active", tabName === "library");
+    tabInstalled.classList.toggle("active", tabName === "installed");
+    tabDiscover.classList.toggle("active", tabName === "discover");
+    tabManual.classList.toggle("active", tabName === "manual");
+    modelsLibraryView.classList.toggle("hidden", tabName !== "library");
+    modelsInstalledView.classList.toggle("hidden", tabName !== "installed");
+    modelsDiscoverView.classList.toggle("hidden", tabName !== "discover");
+    modelsManualView.classList.toggle("hidden", tabName !== "manual");
+  };
 
-  tabInstalled.addEventListener("click", () => {
-    tabInstalled.classList.add("active");
-    tabLibrary.classList.remove("active");
-    tabDiscover.classList.remove("active");
-    modelsInstalledView.classList.remove("hidden");
-    modelsLibraryView.classList.add("hidden");
-    modelsDiscoverView.classList.add("hidden");
-  });
-
-  tabDiscover.addEventListener("click", () => {
-    tabDiscover.classList.add("active");
-    tabInstalled.classList.remove("active");
-    tabLibrary.classList.remove("active");
-    modelsDiscoverView.classList.remove("hidden");
-    modelsInstalledView.classList.add("hidden");
-    modelsLibraryView.classList.add("hidden");
-  });
+  tabLibrary.addEventListener("click", () => activateTab("library"));
+  tabInstalled.addEventListener("click", () => activateTab("installed"));
+  tabDiscover.addEventListener("click", () => activateTab("discover"));
+  tabManual.addEventListener("click", () => activateTab("manual"));
 }
 
 // ── Discovery Logic ──
@@ -1600,6 +1713,34 @@ document.querySelectorAll(".filter-btn").forEach(btn => {
 if (modelSourceSelect) {
   modelSourceSelect.addEventListener("change", () => {
     if (hfSearchBtn) hfSearchBtn.click();
+  });
+}
+
+if (pickManualModelBtn) {
+  pickManualModelBtn.addEventListener("click", async () => {
+    pickManualModelBtn.disabled = true;
+    if (manualImportStatus) manualImportStatus.textContent = "Status: wybieranie pliku...";
+    try {
+      const result = await window.endocode.importLocalModel({
+        displayName: manualModelName?.value?.trim() || "",
+        description: manualModelDescription?.value?.trim() || "",
+      });
+      if (result?.canceled) {
+        if (manualImportStatus) manualImportStatus.textContent = "Status: anulowano";
+        return;
+      }
+      if (manualImportStatus) manualImportStatus.textContent = "Status: zaimportowano model";
+      if (manualModelName) manualModelName.value = "";
+      if (manualModelDescription) manualModelDescription.value = "";
+      await loadModels();
+      addInlineEvent("note", "Modele", `Zaimportowano ${result?.model?.displayName || "model"}.`);
+      if (tabLibrary) tabLibrary.click();
+    } catch (e) {
+      if (manualImportStatus) manualImportStatus.textContent = "Status: błąd importu";
+      addInlineEvent("error", "Import modelu", e.message || String(e));
+    } finally {
+      pickManualModelBtn.disabled = false;
+    }
   });
 }
 

@@ -1139,10 +1139,19 @@ select:focus { border-color: var(--border-focus); }
   padding: 4px 0 14px;
   border-bottom: 1px solid var(--border-subtle);
 }
+.skills-toolbar-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
 .skills-count {
   color: var(--text-secondary);
   font-size: 12px;
   font-family: var(--mono);
+}
+.skills-subtitle {
+  color: var(--text-muted);
+  font-size: 11px;
 }
 .skills-list {
   flex: 1;
@@ -1161,15 +1170,21 @@ select:focus { border-color: var(--border-focus); }
 }
 .skills-empty.error { color: var(--danger); }
 .skill-card {
-  min-height: 128px;
+  min-height: 190px;
   display: flex;
   flex-direction: column;
   justify-content: space-between;
   gap: 12px;
-  padding: 12px;
+  padding: 12px 13px;
   border: 1px solid var(--border-subtle);
-  border-radius: 8px;
+  border-radius: 10px;
   background: var(--surface-2);
+  transition: border-color 0.2s ease, transform 0.2s ease;
+  overflow: visible;
+}
+.skill-card:hover {
+  border-color: var(--accent-subtle);
+  transform: translateY(-1px);
 }
 .skill-card.installed {
   border-color: rgba(0, 212, 170, 0.35);
@@ -1198,6 +1213,10 @@ select:focus { border-color: var(--border-focus); }
   color: var(--text-secondary);
   font-size: 12px;
   line-height: 1.4;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 .skill-local {
   margin-top: 8px;
@@ -1206,9 +1225,24 @@ select:focus { border-color: var(--border-focus); }
   font-size: 10px;
   text-transform: uppercase;
 }
+.skill-actions {
+  margin-top: 6px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-subtle);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.skill-state {
+  font-size: 11px;
+  font-family: var(--mono);
+  color: var(--text-muted);
+}
+.skill-state.installed { color: var(--success); }
+.skill-state.available { color: var(--warning); }
 .skill-install-btn {
-  align-self: flex-end;
-  min-width: 82px;
+  min-width: 88px;
   padding: 6px 10px;
   border: 1px solid var(--accent);
   border-radius: var(--radius-sm);
@@ -1501,8 +1535,10 @@ select:focus { border-color: var(--border-focus); }
 }
 
 .models-status {
-  font-size: 13px;
+  font-size: 12px;
+  font-family: var(--mono);
   color: var(--text-secondary);
+  white-space: nowrap;
 }
 
 .models-list {
@@ -1517,11 +1553,11 @@ select:focus { border-color: var(--border-focus); }
 .model-item {
   background: var(--surface);
   border: 1px solid var(--border-subtle);
-  border-radius: var(--radius);
-  padding: 16px;
+  border-radius: 10px;
+  padding: 14px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 10px;
   transition: border-color 0.2s ease, transform 0.2s ease;
 }
 
@@ -1568,6 +1604,10 @@ select:focus { border-color: var(--border-focus); }
   background: var(--bg-deep);
   color: var(--text-secondary);
 }
+.model-badge.error {
+  background: var(--danger-bg);
+  color: var(--danger);
+}
 
 .model-badge.installed {
   background: var(--success-bg);
@@ -1580,9 +1620,9 @@ select:focus { border-color: var(--border-focus); }
 }
 
 .model-desc {
-  font-size: 13px;
+  font-size: 12px;
   color: var(--text-secondary);
-  line-height: 1.5;
+  line-height: 1.4;
   flex: 1;
 }
 
@@ -1605,6 +1645,7 @@ select:focus { border-color: var(--border-focus); }
   gap: 8px;
   padding-top: 8px;
   border-top: 1px solid var(--border-subtle);
+  flex-wrap: wrap;
 }
 
 .model-btn {
@@ -1653,6 +1694,12 @@ select:focus { border-color: var(--border-focus); }
   overflow: hidden;
   margin-top: 8px;
 }
+.model-error {
+  margin-top: -2px;
+  color: var(--danger);
+  font-size: 11px;
+  font-family: var(--mono);
+}
 
 .download-progress-fill {
   height: 100%;
@@ -1673,7 +1720,7 @@ select:focus { border-color: var(--border-focus); }
   .topbar-controls { flex-wrap: wrap; }
   .skills-list { grid-template-columns: 1fr; }
 }
-#modelsLibraryView, #modelsDiscoverView, #modelsInstalledView {
+#modelsLibraryView, #modelsDiscoverView, #modelsInstalledView, #modelsManualView {
   flex: 1;
   display: flex;
   flex-direction: column;
@@ -1763,4 +1810,66 @@ select:focus { border-color: var(--border-focus); }
 .model-badge.fit {
   background: var(--success-bg);
   color: var(--success);
+}
+
+.models-manual-panel {
+  margin-top: 10px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  background: var(--surface);
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.models-manual-head {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.models-manual-head strong {
+  font-size: 14px;
+  color: var(--text);
+}
+
+.models-manual-head span {
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
+.models-manual-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.models-manual-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.models-manual-field span {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.models-manual-field input {
+  background: var(--bg-deep);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  color: var(--text);
+  font-size: 12px;
+  outline: none;
+}
+
+.models-manual-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
 }

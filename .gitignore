@@ -12,3 +12,6 @@ app/*.log
 config/chat-history.json
 config/endocode-state.json
 config/skills.json
+config/local-codex-state.json
+config/model.json
+config/models.json
