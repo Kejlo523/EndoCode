@@ -2797,6 +2797,11 @@ function isModelApi500Error(error) {
   return /\bModel API 500\b/i.test(message);
 }
 
+function isTemplateConversationError(error) {
+  const message = String(error?.message || error);
+  return /Jinja Exception|Conversation roles must alternate|CallExpression at line/i.test(message);
+}
+
 async function callModelWithRecovery(messages, abortSignal, failedModelIds, options = {}, step = null) {
   const retryCount = Math.max(0, Number(getTransportRetryCount() || 0));
   let retriesLeft = retryCount;
@@ -2807,6 +2812,11 @@ async function callModelWithRecovery(messages, abortSignal, failedModelIds, opti
       return result;
     } catch (error) {
       if (abortSignal?.aborted || !isTransientModelError(error)) throw error;
+      if (isTemplateConversationError(error)) {
+        throw new Error(
+          "Blad formatu rozmowy dla szablonu czatu modelu (Jinja). Zatrzymuje automatyczne restarty runtime, bo to nie jest blad wydajnosci."
+        );
+      }
 
       if (isModelApi500Error(error)) {
         try {
