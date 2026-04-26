@@ -1407,6 +1407,29 @@ function buildWebLookupCandidates(query, preferredQuery = "") {
   return [...new Set(candidates.map((v) => v.slice(0, 140).trim()).filter(Boolean))];
 }
 
+function extractLookupKeywords(text) {
+  return normalizeWebQuery(text)
+    .toLowerCase()
+    .replace(/[!?.,;:()[\]{}"'`]/g, " ")
+    .split(/\s+/)
+    .map((word) => word.trim())
+    .filter(Boolean)
+    .filter((word) => word.length >= 4)
+    .filter((word) => !WEB_LOOKUP_STOPWORDS_PL.has(word));
+}
+
+function isLookupQueryCompatible(userText, candidateQuery) {
+  const userWords = new Set(extractLookupKeywords(userText));
+  const candidateWords = new Set(extractLookupKeywords(candidateQuery));
+  if (!userWords.size || !candidateWords.size) return false;
+  let overlap = 0;
+  for (const word of candidateWords) {
+    if (userWords.has(word)) overlap += 1;
+  }
+  const strongNounHit = [...userWords].some((w) => w.length >= 6 && candidateWords.has(w));
+  return overlap >= 2 || strongNounHit;
+}
+
 async function deriveLookupQueryWithModel(userText, history, abortSignal) {
   const text = normalizeWebQuery(userText);
   if (!text) return "";
@@ -1437,6 +1460,10 @@ async function deriveLookupQueryWithModel(userText, history, abortSignal) {
     if (/^none$/i.test(cleanedRaw)) return "";
     const cleaned = cleanedRaw;
     if (!cleaned) return "";
+    if (!isLookupQueryCompatible(text, cleaned)) {
+      const fallback = buildWebLookupCandidates(text)[0] || "";
+      return fallback;
+    }
     return cleaned.slice(0, 140);
   } catch {
     const fallback = buildWebLookupCandidates(text)[0] || "";
@@ -3762,7 +3789,7 @@ Jesli pojawia sie blok "Kontekst z internetu", traktuj go jako aktualne dane pom
 Ten blok moze zawierac pipeline: lookup + fetch live page + extract visible text.
 Nie pisz, ze "nie masz internetu" lub "nie mozesz sprawdzic online", bo tryb czatu moze dolaczyc internetowy kontekst automatycznie.
 Gdy takiego bloku nie ma, odpowiedz z wiedzy wlasnej i w razie potrzeby zaznacz brak swiezych danych z internetu.
-ZASADA ANTYHALUCYNACJI: nie wymyslaj danych firm, kontaktow, adresow, cen, ofert, numerow telefonu ani emaili. Jesli pytanie dotyczy konkretnej strony/firmy i nie ma zweryfikowanych danych w bloku internetowym, napisz wyraznie: "Brak zweryfikowanych danych z sieci dla tego zapytania."
+ZASADA ANTYHALUCYNACJI: nie wymyslaj danych firm, kontaktow, adresow, cen, ofert, numerow telefonu ani emaili. Gdy dane sa niepelne, podaj najlepsze dostepne informacje z kontekstu internetowego i jasno zaznacz ograniczenia zamiast odmawiac odpowiedzi.
 Jesli podajesz fakty z bloku internetowego, dodaj na koncu sekcje "Zrodla:" i wypisz URL-e z ktorych pochodza dane.
 Nigdy nie pisz fikcyjnych zrodel typu "[zrodlo internetowe]" ani "brak zapisanego zrodla".
 Nie wymyslaj wynikow narzedzi ani struktur {"tool":...}. Jesli uzytkownik potrzebuje edycji plikow, skryptow lub sandboxa, napisz krotko zeby wylaczyl tryb „Czat” i uzyl zwyklego agenta.`;
@@ -4610,7 +4637,7 @@ async function runSimpleChat(userText) {
           ? "Model zdecydował, że potrzebny jest web lookup."
           : "Wymuszono web lookup dla pytania o świeże fakty/daty.",
       });
-      webLookup = await getLightWebContext(text, modelLookupQuery, { strictPreferred: true });
+      webLookup = await getLightWebContext(text, modelLookupQuery, { strictPreferred: false });
       if (webLookup?.error) {
         emit("chat-web-lookup", {
           phase: "error",
@@ -4678,35 +4705,16 @@ async function runSimpleChat(userText) {
         content: fallbackSummaryPrompt || "Web lookup nie zwrocil pelnego kontekstu. Podaj uczciwie, co udalo sie ustalic i czego nie da sie jeszcze potwierdzic.",
       });
     }
-    if (!webLookup?.context && looksLikeWebsiteFactQuestion(text)) {
+    if (!webLookup?.context && (looksLikeWebsiteFactQuestion(text) || looksLikeFreshFactQuestion(text))) {
       const fallbackSummaryPrompt = buildWebLookupFallbackSummary(webLookup, text);
       if (fallbackSummaryPrompt) {
-        const fallbackReply = `Znalazlem czesciowe dane z sieci i wypisuje je ponizej.\n\n${fallbackSummaryPrompt}`;
-        messages.push({ role: "user", content: text });
-        messages.push({ role: "assistant", content: fallbackReply });
-        emit("final", { text: fallbackReply, chatMode: true });
-        return { ok: true, final: fallbackReply, guarded: false };
+        chatMessages.splice(1, 0, { role: "user", content: fallbackSummaryPrompt });
+      } else {
+        chatMessages.splice(1, 0, {
+          role: "user",
+          content: "Nie zatrzymuj odpowiedzi z powodu braku pelnej weryfikacji. Podaj najlepsze dostepne wyniki i zaznacz ograniczenia.",
+        });
       }
-      const guardedReply = "Brak zweryfikowanych danych z sieci dla tego zapytania. Nie mogę rzetelnie podać oferty/kontaktu bez trafnego wyniku web lookup. Podaj proszę dokładny URL lub krótsze zapytanie, a sprawdzę ponownie.";
-      messages.push({ role: "user", content: text });
-      messages.push({ role: "assistant", content: guardedReply });
-      emit("final", { text: guardedReply, chatMode: true });
-      return { ok: true, final: guardedReply, guarded: true };
-    }
-    if (!webLookup?.context && looksLikeFreshFactQuestion(text)) {
-      const fallbackSummaryPrompt = buildWebLookupFallbackSummary(webLookup, text);
-      if (fallbackSummaryPrompt) {
-        const fallbackReply = `Nie mam pelnego potwierdzenia faktow, ale to udalo sie realnie znalezc:\n\n${fallbackSummaryPrompt}`;
-        messages.push({ role: "user", content: text });
-        messages.push({ role: "assistant", content: fallbackReply });
-        emit("final", { text: fallbackReply, chatMode: true });
-        return { ok: true, final: fallbackReply, guarded: false };
-      }
-      const guardedReply = "Brak zweryfikowanych danych z sieci dla tego pytania (aktualny stan na datę). Nie podam faktów bez źródeł. Podaj proszę dokładniejszy zakres lub URL, a spróbuję ponownie.";
-      messages.push({ role: "user", content: text });
-      messages.push({ role: "assistant", content: guardedReply });
-      emit("final", { text: guardedReply, chatMode: true });
-      return { ok: true, final: guardedReply, guarded: true };
     }
     const failedModelIds = new Set();
     let rawReply = await callModelWithRecovery(chatMessages, signal, failedModelIds, { plainChat: true });
@@ -4838,6 +4846,21 @@ function createWindow() {
       nodeIntegration: false,
     },
   });
+
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (isHttpUrl(url)) {
+      void shell.openExternal(url);
+      return { action: "deny" };
+    }
+    return { action: "allow" };
+  });
+
+  mainWindow.webContents.on("will-navigate", (event, url) => {
+    if (!isHttpUrl(url)) return;
+    event.preventDefault();
+    void shell.openExternal(url);
+  });
+
   mainWindow.loadFile(path.join(__dirname, "renderer", "index.html"));
 }
 
