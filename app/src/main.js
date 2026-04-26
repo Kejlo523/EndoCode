@@ -27,11 +27,11 @@ const PLAIN_CHAT_REPEAT_CHUNK_LIMIT = 40;
 const SERVER_SHUTDOWN_TIMEOUT_MS = 6000;
 const CHAT_WEB_LOOKUP_TIMEOUT_MS = 2500;
 const CHAT_WEB_LOOKUP_CACHE_TTL_MS = 5 * 60 * 1000;
-const CHAT_WEB_LOOKUP_MAX_ITEMS = 3;
+const CHAT_WEB_LOOKUP_MAX_ITEMS = 6;
 const CHAT_WEB_PAGE_FETCH_TIMEOUT_MS = 2200;
-const CHAT_WEB_PAGE_FETCH_MAX_SOURCES = 3;
+const CHAT_WEB_PAGE_FETCH_MAX_SOURCES = 8;
 const CHAT_WEB_PAGE_SNIPPET_CHARS = 320;
-const CHAT_WEB_SEARCH_RESULT_LIMIT = 6;
+const CHAT_WEB_SEARCH_RESULT_LIMIT = 12;
 const CHAT_WEB_HTML_SIGNAL_LIMIT = 10;
 const CHAT_ATTACHMENT_MAX_BYTES = 6 * 1024 * 1024;
 const CHAT_ATTACHMENT_TEXT_LIMIT = 12000;
@@ -3110,18 +3110,105 @@ function jsonRepairHintFromError(message) {
   return "Sprawdz czy masz jeden obiekt JSON, zamkniete cudzyslowy i nawiasy, poprawne przecinki.";
 }
 
-function makeJsonRepairPrompt(error, raw) {
+function getJsonLineAndColumnFromIndex(text, index) {
+  const safeText = String(text || "");
+  const pos = Math.max(0, Math.min(Number(index) || 0, safeText.length));
+  let line = 1;
+  let column = 1;
+  for (let i = 0; i < pos; i += 1) {
+    if (safeText[i] === "\n") {
+      line += 1;
+      column = 1;
+    } else {
+      column += 1;
+    }
+  }
+  return { line, column };
+}
+
+function extractJsonErrorLocation(errorMessage, text) {
+  const msg = String(errorMessage || "");
+  const byLineColumn = msg.match(/line\s+(\d+)\s*(?:,|and)?\s*column\s+(\d+)/i);
+  if (byLineColumn) {
+    return { line: Number(byLineColumn[1]), column: Number(byLineColumn[2]) };
+  }
+  const byPosition = msg.match(/position\s+(\d+)/i);
+  if (byPosition) {
+    return getJsonLineAndColumnFromIndex(text, Number(byPosition[1]));
+  }
+  return null;
+}
+
+function buildJsonErrorContext(raw, location, radius = 2) {
+  const lines = String(raw || "").split(/\r?\n/);
+  if (!location?.line || !Number.isFinite(location.line) || location.line < 1) {
+    return String(raw || "").slice(0, 600);
+  }
+  const start = Math.max(1, location.line - radius);
+  const end = Math.min(lines.length, location.line + radius);
+  const out = [];
+  for (let lineNo = start; lineNo <= end; lineNo += 1) {
+    const marker = lineNo === location.line ? ">>" : "  ";
+    out.push(`${marker} ${lineNo}: ${lines[lineNo - 1]}`);
+  }
+  return out.join("\n");
+}
+
+function jsonNormalizedForDrift(raw) {
+  return String(raw || "")
+    .replace(/\s+/g, " ")
+    .replace(/`{3,}json|`{3,}/gi, "")
+    .trim();
+}
+
+function tokenSetForDrift(raw) {
+  const tokens = jsonNormalizedForDrift(raw).match(/[a-zA-Z0-9_./:-]+/g) || [];
+  return new Set(tokens.map((t) => t.toLowerCase()));
+}
+
+function isPatchDriftTooLarge(previousRaw, nextRaw) {
+  const prev = jsonNormalizedForDrift(previousRaw);
+  const next = jsonNormalizedForDrift(nextRaw);
+  if (!prev || !next) return false;
+  const prevLen = prev.length;
+  const nextLen = next.length;
+  const ratio = Math.max(prevLen, nextLen) / Math.max(1, Math.min(prevLen, nextLen));
+  const prevSet = tokenSetForDrift(prev);
+  const nextSet = tokenSetForDrift(next);
+  let intersection = 0;
+  for (const token of prevSet) {
+    if (nextSet.has(token)) intersection += 1;
+  }
+  const union = Math.max(1, prevSet.size + nextSet.size - intersection);
+  const jaccard = intersection / union;
+  if (prevLen >= 100 && ratio > 2.4) return true;
+  if (prevLen >= 80 && jaccard < 0.35) return true;
+  return false;
+}
+
+function makeJsonRepairPrompt(error, raw, options = {}) {
   const errMsg = String(error?.message || error).slice(0, 500);
+  const location = options.location || extractJsonErrorLocation(errMsg, raw);
+  const locationText = location?.line
+    ? `Lokalizacja bledu: linia ${location.line}, kolumna ${location.column || "?"}.`
+    : "Lokalizacja bledu: brak pewnej pozycji (napraw najblizszy uszkodzony fragment).";
+  const context = buildJsonErrorContext(raw, location, 3);
   return `Poprzednia odpowiedz nie byla poprawnym pojedynczym JSON-em (parser ja odrzucil).
 Blad parsera: ${errMsg}
+${locationText}
 Wskazowka: ${jsonRepairHintFromError(errMsg)}
 
-Twoje zadanie: NAPRAW MINIMALNIE skladnie — zachow ten sam "tool" i intencje "args" co w szkicu, jesli to mozliwe. Nie zmieniaj planu na inne narzedzie, chyba ze naprawa jest niemozliwa.
+Twoje zadanie: NAPRAW MINIMALNIE skladnie w istniejacym szkicu JSON — nie pisz odpowiedzi od zera.
+Zachow ten sam "tool" i intencje "args" co w szkicu, jesli to mozliwe. Nie zmieniaj planu na inne narzedzie, chyba ze naprawa jest niemozliwa.
 Jesli naprawa wymaga skrocenia: zwroc poprawny JSON z krotszym args (np. krotszy url albo mniejszy fragment content + dalsza praca w kolejnym kroku przez append).
+Zmodyfikuj tylko uszkodzony fragment i zostaw pozostale pola bez zmian.
 
 Odpowiedz WYLACZNIE jednym poprawnym JSON-em zgodnym z kontraktem systemowym — bez Markdown, bez tekstu przed/po, bez tablicy [...] (tylko obiekt {...}).
 Jesli odzysk jest niemozliwy:
 {"note":"odzysk po bledzie JSON","final":"Nie udalo sie bezpiecznie kontynuowac."}
+
+Kontekst linii wokol bledu:
+${context}
 
 Odrzucona odpowiedz (fragment):
 ${String(raw || "").slice(0, 1600)}`;
@@ -3292,11 +3379,14 @@ function validateModelAction(parsed) {
   return { ok: true, action: { ...parsed, tool: toolName, args: parsed.args !== undefined ? parsed.args : {} } };
 }
 
-function makeActionSchemaRepairPrompt(schemaError, raw) {
+function makeActionSchemaRepairPrompt(schemaError, raw, options = {}) {
+  const location = options.location || extractJsonErrorLocation(String(schemaError || ""), raw);
+  const context = buildJsonErrorContext(raw, location, 3);
   return `Poprzednia odpowiedz miala poprawna skladnie JSON, ale narusza KONTRAKT akcji.
 Blad: ${String(schemaError).slice(0, 500)}
 
 Napraw KONTRAKT przy zachowaniu intencji: ten sam "tool" (jesli byl blisko poprawny) albo popraw nazwe na jedna z listy; uzupelnij "final" albo "tool"+"args".
+Nie tworz nowego JSON od zera — popraw minimalnie istniejacy szkic.
 
 Musisz zwrocic WYLACZNIE jeden obiekt JSON:
 - albo koniec pracy: {"note":"...","final":"odpowiedz po polsku"}
@@ -3314,6 +3404,9 @@ Jesli blad mowi o braku "final" / pustym "final", a uzytkownik pytal o mozliwosc
 Jesli nie wiesz co dalej:
 {"note":"odzysk","final":"Nie udalo sie zwrocic poprawnej akcji — sprobuj ponownie lub zmien zadanie."}
 
+Kontekst linii wokol bledu:
+${context}
+
 Odrzucona odpowiedz (fragment):
 ${String(raw || "").slice(0, 1600)}`;
 }
@@ -3321,6 +3414,7 @@ ${String(raw || "").slice(0, 1600)}`;
 async function getNextActionWithRepair(abortSignal, failedModelIds, step = null) {
   let actionRawReasoning = "";
   let lastError = null;
+  let lastRawJsonCandidate = "";
   const jsonRepairRetryLimit = getJsonRepairRetryLimit();
   while (true) {
     for (let attempt = 0; attempt <= jsonRepairRetryLimit; attempt += 1) {
@@ -3332,12 +3426,38 @@ async function getNextActionWithRepair(abortSignal, failedModelIds, step = null)
       }
       const { content: raw, reasoning } = await callModelWithRecovery(messages, abortSignal, failedModelIds, {}, step);
       if (reasoning) actionRawReasoning = reasoning;
+      if (!lastRawJsonCandidate) lastRawJsonCandidate = String(raw || "");
+      if (attempt > 0 && isPatchDriftTooLarge(lastRawJsonCandidate, raw)) {
+        const driftMsg = "Naprawa JSON zmienila zbyt duza czesc odpowiedzi. Popraw tylko uszkodzony fragment.";
+        lastError = new Error(driftMsg);
+        emit("parse-error", {
+          error: driftMsg,
+          attempt: attempt + 1,
+          maxAttempts: jsonRepairRetryLimit + 1,
+          kind: "json-drift",
+          raw: textPreview(raw, 1200),
+        });
+        if (attempt >= jsonRepairRetryLimit) break;
+        messages.push({
+          role: "assistant",
+          content: JSON.stringify({
+            note: "Odrzucono poprawke: zbyt duzy drift wzgledem poprzedniego szkicu JSON.",
+          }),
+        });
+        messages.push({
+          role: "user",
+          content: `Popraw TYLKO lokalny fragment poprzedniego szkicu JSON. Nie tworz nowego obiektu od zera.\n\nPoprzedni szkic:\n${textPreview(lastRawJsonCandidate, 1600)}`,
+        });
+        continue;
+      }
       emit("model-raw", { raw });
       let parsed;
       try {
         parsed = parseJsonAction(raw);
       } catch (error) {
         lastError = error;
+        const location = extractJsonErrorLocation(error?.message || error, raw);
+        lastRawJsonCandidate = String(raw || "");
         emit("parse-error", {
           error: error.message || String(error),
           attempt: attempt + 1,
@@ -3351,13 +3471,15 @@ async function getNextActionWithRepair(abortSignal, failedModelIds, step = null)
             note: "Poprzednia odpowiedz modelu byla niepoprawnym JSON-em i zostala odrzucona.",
           }),
         });
-        messages.push({ role: "user", content: makeJsonRepairPrompt(error, raw) });
+        messages.push({ role: "user", content: makeJsonRepairPrompt(error, lastRawJsonCandidate, { location }) });
         continue;
       }
 
       const validated = validateModelAction(parsed);
       if (!validated.ok) {
         lastError = new Error(validated.error);
+        const location = extractJsonErrorLocation(validated.error, raw);
+        lastRawJsonCandidate = String(raw || "");
         emit("parse-error", {
           error: validated.error,
           attempt: attempt + 1,
@@ -3376,21 +3498,19 @@ async function getNextActionWithRepair(abortSignal, failedModelIds, step = null)
             note: "Odpowiedz miala poprawny JSON, ale brakowalo 'final' albo dozwolonego 'tool' z prawidlowym 'args'.",
           }),
         });
-        messages.push({ role: "user", content: makeActionSchemaRepairPrompt(validated.error, raw) });
+        messages.push({ role: "user", content: makeActionSchemaRepairPrompt(validated.error, lastRawJsonCandidate, { location }) });
         continue;
       }
 
       return { action: validated.action, reasoning: actionRawReasoning };
 
     }
-    const fallback = failedModelIds
-      ? await switchToFallbackModel(`niepoprawny JSON lub kontrakt: ${lastError?.message || "blad"}`, failedModelIds)
-      : null;
-    if (!fallback) break;
-    messages.push({
-      role: "user",
-      content: `Aktualny model zostal przelaczony na ${fallback.displayName}. Kontynuuj od ostatniego bezpiecznego kroku i zwroc poprawny JSON.`,
+    emit("status", {
+      status: "model-json-retry",
+      detail: "Naprawa JSON nie powiodla sie w limicie prob. Nie przelaczam modelu — ten sam model musi poprawic JSON.",
+      step,
     });
+    break;
   }
   throw new Error(`Model zwrocil niepoprawny JSON lub kontrakt akcji po kilku probach: ${lastError?.message || "nieznany blad"}`);
 }

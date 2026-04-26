@@ -108,9 +108,11 @@ let currentSettingsModelId = null;
 let refreshStateInFlight = false;
 let updateSystemInFlight = false;
 let loadModelsInFlight = false;
+let streamingAssistantMessage = null;
 const modelRenderCacheLibrary = new Map();
 const modelRenderCacheInstalled = new Map();
 const skillRenderCache = new Map();
+const STREAM_RENDER_THROTTLE_MS = 50;
 
 // ── Helpers ──
 function escapeHtml(value) {
@@ -253,6 +255,80 @@ function addMessage(role, text, imageBase64 = null) {
   conversation.appendChild(div);
   smartScroll();
   updateWelcome();
+}
+
+function startStreamingAssistantMessage() {
+  if (streamingAssistantMessage?.root?.isConnected) return streamingAssistantMessage;
+  const root = document.createElement("div");
+  root.className = "message assistant";
+  const content = document.createElement("div");
+  content.className = "message-content";
+  root.appendChild(content);
+  conversation.appendChild(root);
+  streamingAssistantMessage = {
+    root,
+    content,
+    fullText: "",
+    renderedText: "",
+    renderTimer: null,
+    lastRenderAt: 0,
+  };
+  smartScroll();
+  updateWelcome();
+  return streamingAssistantMessage;
+}
+
+function renderStreamingAssistantMessage(force = false) {
+  const state = streamingAssistantMessage;
+  if (!state?.content) return;
+  if (!force && state.renderedText === state.fullText) return;
+
+  const now = Date.now();
+  const elapsed = now - state.lastRenderAt;
+  if (!force && elapsed < STREAM_RENDER_THROTTLE_MS) {
+    if (state.renderTimer) return;
+    state.renderTimer = setTimeout(() => {
+      if (!streamingAssistantMessage) return;
+      streamingAssistantMessage.renderTimer = null;
+      renderStreamingAssistantMessage(true);
+    }, STREAM_RENDER_THROTTLE_MS - elapsed);
+    return;
+  }
+
+  if (state.renderTimer) {
+    clearTimeout(state.renderTimer);
+    state.renderTimer = null;
+  }
+  state.content.innerHTML = formatMessage(state.fullText);
+  state.renderedText = state.fullText;
+  state.lastRenderAt = Date.now();
+  smartScroll();
+}
+
+function updateStreamingAssistantMessage(deltaText = "", fullText = null) {
+  const state = startStreamingAssistantMessage();
+  if (typeof fullText === "string") state.fullText = fullText;
+  else state.fullText += String(deltaText ?? "");
+  renderStreamingAssistantMessage(false);
+}
+
+function hasStreamingAssistantContent() {
+  const fullText = String(streamingAssistantMessage?.fullText || "").trim();
+  return fullText.length > 0;
+}
+
+function finalizeStreamingAssistantMessage(finalText = "", options = {}) {
+  const overwriteText = options?.overwriteText !== false;
+  const state = streamingAssistantMessage;
+  if (!state?.content) {
+    if (overwriteText) addMessage("assistant", finalText || "");
+    return;
+  }
+  if (overwriteText && typeof finalText === "string" && finalText.length > 0) {
+    state.fullText = finalText;
+  }
+  renderStreamingAssistantMessage(true);
+  streamingAssistantMessage = null;
 }
 
 // ── Inline Events (replaces separate activity panel) ──
@@ -1497,13 +1573,15 @@ window.endocode.onEvent(async (event) => {
   }
   if (event.type === "content-delta") {
     const full = event.full || "";
-    const text = event.text || "";
     const preview = full.trim().slice(0, 50000);
     
     const writingLabel = event.plainChat ? "Odpowiedź" : "Model wybiera akcję";
     const livePhrase = event.plainChat ? "Pisze…" : "Planuje akcję...";
 
-    if (preview) {
+    if (event.plainChat) {
+      removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
+      updateStreamingAssistantMessage(event.text || "", full);
+    } else if (preview) {
       upsertInlineEvent(MODEL_WRITING_ACTIVITY_ID, "activity", writingLabel, preview);
     }
     showLive(livePhrase, preview.slice(-500));
@@ -1554,7 +1632,15 @@ window.endocode.onEvent(async (event) => {
   if (event.type === "final") {
     removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
     if (event.note) addInlineEvent("note", "Podsumowanie", event.note);
-    addMessage("assistant", event.text);
+    if (event.chatMode) {
+      const isStopFinal = String(event.text || "").trim() === "Przerwano.";
+      if (isStopFinal && hasStreamingAssistantContent()) {
+        finalizeStreamingAssistantMessage("", { overwriteText: false });
+        addInlineEvent("note", "Czat", "Generowanie przerwane. Zachowano dotychczasową treść odpowiedzi.");
+      } else {
+        finalizeStreamingAssistantMessage(event.text || "");
+      }
+    } else addMessage("assistant", event.text);
     hideLive();
     saveChatSession(firstUserMessage);
   }
