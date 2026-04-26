@@ -9,6 +9,7 @@ const { pipeline } = require("node:stream/promises");
 const { Readable } = require("node:stream");
 const https = require("node:https");
 const { jsonrepair } = require("jsonrepair");
+const JSZip = require("jszip");
 const { createTelemetryMonitor } = require("./main/telemetry");
 
 const DEFAULT_PORT = 8088;
@@ -28,6 +29,9 @@ const CHAT_WEB_PAGE_FETCH_TIMEOUT_MS = 2200;
 const CHAT_WEB_PAGE_FETCH_MAX_SOURCES = 3;
 const CHAT_WEB_PAGE_SNIPPET_CHARS = 320;
 const CHAT_WEB_SEARCH_RESULT_LIMIT = 6;
+const CHAT_WEB_HTML_SIGNAL_LIMIT = 10;
+const CHAT_ATTACHMENT_MAX_BYTES = 6 * 1024 * 1024;
+const CHAT_ATTACHMENT_TEXT_LIMIT = 12000;
 
 /** Górny limit okna kontekstu (llama.cpp -c); suwak w UI do ~2.5 mln — realnie ogranicza RAM/VRAM. */
 const MIN_CONTEXT_TOKENS = 1024;
@@ -1050,6 +1054,213 @@ function normalizeWebQuery(text) {
     .slice(0, 180);
 }
 
+function truncateAttachmentText(text, limit = CHAT_ATTACHMENT_TEXT_LIMIT) {
+  const value = String(text || "").replace(/\0/g, "").trim();
+  if (value.length <= limit) return value;
+  return `${value.slice(0, limit)}\n...[skrócono załącznik]`;
+}
+
+function decodeBase64Attachment(dataBase64) {
+  const raw = String(dataBase64 || "");
+  return Buffer.from(raw, "base64");
+}
+
+function xmlToVisibleText(xml = "") {
+  return String(xml || "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&#39;/g, "'")
+    .replace(/&quot;/g, "\"")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function extractPdfTextLight(buffer) {
+  const raw = buffer.toString("latin1");
+  const chunks = [];
+  const regex = /\(([^()]{2,240})\)\s*Tj/g;
+  let match;
+  while ((match = regex.exec(raw))) {
+    const text = match[1]
+      .replace(/\\\(/g, "(")
+      .replace(/\\\)/g, ")")
+      .replace(/\\n/g, " ")
+      .replace(/\\r/g, " ");
+    if (/[a-zA-Z0-9ąćęłńóśźżĄĆĘŁŃÓŚŹŻ]/.test(text)) chunks.push(text);
+    if (chunks.length >= 400) break;
+  }
+  return truncateAttachmentText(chunks.join(" "));
+}
+
+function commandExists(cmd) {
+  const probe = process.platform === "win32" ? "where" : "which";
+  const r = spawnSync(probe, [cmd], { encoding: "utf8", windowsHide: true, timeout: 5000 });
+  return r.status === 0 && !r.error;
+}
+
+function runCommandOutput(cmd, args, options = {}) {
+  const r = spawnSync(cmd, args, {
+    encoding: "utf8",
+    windowsHide: true,
+    timeout: options.timeout || 20000,
+    cwd: options.cwd,
+    env: process.env,
+    maxBuffer: 20 * 1024 * 1024,
+  });
+  if (r.error || r.status !== 0) return "";
+  return String(r.stdout || "").trim();
+}
+
+function extractPdfTextViaPoppler(buffer) {
+  if (!commandExists("pdftotext")) return "";
+  const tempPath = path.join(os.tmpdir(), `endocode-pdf-${Date.now()}-${Math.random().toString(36).slice(2)}.pdf`);
+  try {
+    fs.writeFileSync(tempPath, buffer);
+    const out = runCommandOutput("pdftotext", ["-q", "-enc", "UTF-8", tempPath, "-"], { timeout: 25000 });
+    return truncateAttachmentText(out);
+  } catch {
+    return "";
+  } finally {
+    try { fs.unlinkSync(tempPath); } catch { /* ignore */ }
+  }
+}
+
+function extractPdfTextViaOcr(buffer) {
+  if (!commandExists("pdftoppm") || !commandExists("tesseract")) return "";
+  const tempDir = path.join(os.tmpdir(), `endocode-ocr-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  const tempPdf = path.join(tempDir, "input.pdf");
+  try {
+    fs.mkdirSync(tempDir, { recursive: true });
+    fs.writeFileSync(tempPdf, buffer);
+    const prefix = path.join(tempDir, "page");
+    const convert = spawnSync("pdftoppm", ["-f", "1", "-l", "3", "-png", tempPdf, prefix], {
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: 45000,
+      cwd: tempDir,
+      env: process.env,
+    });
+    if (convert.error || convert.status !== 0) return "";
+    const files = fs.readdirSync(tempDir)
+      .filter((name) => /^page-\d+\.png$/i.test(name))
+      .sort()
+      .slice(0, 3);
+    const parts = [];
+    for (const file of files) {
+      const full = path.join(tempDir, file);
+      const out = runCommandOutput("tesseract", [full, "stdout", "-l", "eng+pol"], { timeout: 30000 });
+      if (out) parts.push(out);
+    }
+    return truncateAttachmentText(parts.join("\n"));
+  } catch {
+    return "";
+  } finally {
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+}
+
+async function extractPdfTextEnhanced(buffer) {
+  const light = extractPdfTextLight(buffer);
+  if (light && light.length >= 220) return light;
+  const poppler = extractPdfTextViaPoppler(buffer);
+  if (poppler && poppler.length >= 220) return poppler;
+  const ocr = extractPdfTextViaOcr(buffer);
+  if (ocr) return ocr;
+  return light || poppler || "";
+}
+
+async function extractTextFromZipOffice(buffer, ext) {
+  const zip = await JSZip.loadAsync(buffer);
+  if (ext === ".docx") {
+    const doc = zip.file("word/document.xml");
+    if (!doc) return "";
+    const xml = await doc.async("string");
+    return truncateAttachmentText(xmlToVisibleText(xml));
+  }
+  if (ext === ".pptx") {
+    const slideNames = Object.keys(zip.files)
+      .filter((name) => /^ppt\/slides\/slide\d+\.xml$/i.test(name))
+      .sort((a, b) => {
+        const ai = Number((a.match(/slide(\d+)\.xml/i) || [0, 0])[1]);
+        const bi = Number((b.match(/slide(\d+)\.xml/i) || [0, 0])[1]);
+        return ai - bi;
+      })
+      .slice(0, 20);
+    const parts = [];
+    for (const name of slideNames) {
+      const xml = await zip.file(name).async("string");
+      const text = xmlToVisibleText(xml);
+      if (text) parts.push(text);
+    }
+    return truncateAttachmentText(parts.join("\n"));
+  }
+  if (ext === ".xlsx") {
+    const sharedStringsXml = zip.file("xl/sharedStrings.xml") ? await zip.file("xl/sharedStrings.xml").async("string") : "";
+    const shared = [];
+    if (sharedStringsXml) {
+      const regex = /<t[^>]*>([\s\S]*?)<\/t>/g;
+      let match;
+      while ((match = regex.exec(sharedStringsXml))) shared.push(xmlToVisibleText(match[1]));
+    }
+    const sheetNames = Object.keys(zip.files)
+      .filter((name) => /^xl\/worksheets\/sheet\d+\.xml$/i.test(name))
+      .sort()
+      .slice(0, 10);
+    const values = [];
+    for (const sheetName of sheetNames) {
+      const xml = await zip.file(sheetName).async("string");
+      const cellRegex = /<c\b([^>]*)>([\s\S]*?)<\/c>/g;
+      let c;
+      while ((c = cellRegex.exec(xml))) {
+        const attrs = c[1] || "";
+        const body = c[2] || "";
+        const vMatch = body.match(/<v>([\s\S]*?)<\/v>/);
+        if (!vMatch) continue;
+        let val = xmlToVisibleText(vMatch[1]);
+        if (/t="s"/.test(attrs)) {
+          const idx = Number(val);
+          if (Number.isFinite(idx) && shared[idx] != null) val = shared[idx];
+        }
+        if (val) values.push(val);
+        if (values.length >= 3000) break;
+      }
+      if (values.length >= 3000) break;
+    }
+    return truncateAttachmentText(values.join("\n"));
+  }
+  return "";
+}
+
+async function extractAttachmentText(attachment) {
+  const name = String(attachment?.name || "attachment");
+  const mimeType = String(attachment?.mimeType || "application/octet-stream");
+  const size = Number(attachment?.size || 0);
+  const dataBase64 = String(attachment?.dataBase64 || "");
+  if (!dataBase64) return { ok: false, reason: "Brak danych pliku." };
+  if (size > CHAT_ATTACHMENT_MAX_BYTES) {
+    return { ok: false, reason: `Plik jest za duży (${Math.round(size / 1024 / 1024)} MB). Limit: ${Math.round(CHAT_ATTACHMENT_MAX_BYTES / 1024 / 1024)} MB.` };
+  }
+  const ext = path.extname(name).toLowerCase();
+  const buffer = decodeBase64Attachment(dataBase64);
+  let text = "";
+  if (ext === ".txt" || ext === ".csv" || ext === ".md" || ext === ".log" || ext === ".json") {
+    text = truncateAttachmentText(buffer.toString("utf8"));
+  } else if (ext === ".pdf") {
+    text = await extractPdfTextEnhanced(buffer);
+  } else if (ext === ".docx" || ext === ".pptx" || ext === ".xlsx") {
+    text = await extractTextFromZipOffice(buffer, ext);
+  } else if (mimeType.startsWith("text/")) {
+    text = truncateAttachmentText(buffer.toString("utf8"));
+  } else {
+    return { ok: false, reason: `Nieobsługiwany format ${ext || mimeType} w trybie lekkim.` };
+  }
+  if (!text) return { ok: false, reason: "Nie udało się wyciągnąć czytelnego tekstu z pliku." };
+  return { ok: true, name, ext, mimeType, size, text };
+}
+
 function isRepeatPrompt(text) {
   const q = String(text || "").trim().toLowerCase();
   if (!q) return false;
@@ -1165,6 +1376,93 @@ async function fetchLivePageSnippet(url) {
   }
 }
 
+function extractHtmlSignals(html = "") {
+  const text = String(html || "");
+  if (!text) return [];
+  const signals = [];
+  const seen = new Set();
+
+  const titleMatch = text.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  if (titleMatch?.[1]) {
+    const title = compactWebSnippet(xmlToVisibleText(titleMatch[1]));
+    if (title) {
+      signals.push(`title: ${title}`);
+      seen.add(`title:${title.toLowerCase()}`);
+    }
+  }
+  const metaDescMatch = text.match(/<meta[^>]+name=["']description["'][^>]+content=["']([\s\S]*?)["'][^>]*>/i);
+  if (metaDescMatch?.[1]) {
+    const desc = compactWebSnippet(xmlToVisibleText(metaDescMatch[1]));
+    if (desc) {
+      const key = `desc:${desc.toLowerCase()}`;
+      if (!seen.has(key)) {
+        signals.push(`meta-description: ${desc}`);
+        seen.add(key);
+      }
+    }
+  }
+
+  const headingRegex = /<h([1-3])[^>]*>([\s\S]*?)<\/h\1>/gi;
+  let h;
+  while ((h = headingRegex.exec(text))) {
+    const heading = compactWebSnippet(xmlToVisibleText(h[2]));
+    if (!heading) continue;
+    const key = `h:${heading.toLowerCase()}`;
+    if (seen.has(key)) continue;
+    signals.push(`heading: ${heading}`);
+    seen.add(key);
+    if (signals.length >= CHAT_WEB_HTML_SIGNAL_LIMIT) return signals.slice(0, CHAT_WEB_HTML_SIGNAL_LIMIT);
+  }
+
+  const paragraphRegex = /<(p|li)[^>]*>([\s\S]*?)<\/\1>/gi;
+  let p;
+  while ((p = paragraphRegex.exec(text))) {
+    const para = compactWebSnippet(xmlToVisibleText(p[2]));
+    if (!para || para.length < 30) continue;
+    const key = `p:${para.toLowerCase()}`;
+    if (seen.has(key)) continue;
+    signals.push(`${p[1] === "li" ? "list" : "paragraph"}: ${para}`);
+    seen.add(key);
+    if (signals.length >= CHAT_WEB_HTML_SIGNAL_LIMIT) return signals.slice(0, CHAT_WEB_HTML_SIGNAL_LIMIT);
+  }
+
+  const keywordRegex = /(właściciel|wlasciciel|owner|kontakt|contact|o nas|about|regulamin|terms|privacy|impressum|krs|nip|regon|sp\.\s*z\s*o\.o|email|e-mail|telefon|tel\.)/ig;
+  let match;
+  while ((match = keywordRegex.exec(text))) {
+    const start = Math.max(0, match.index - 220);
+    const end = Math.min(text.length, match.index + 260);
+    const chunk = text.slice(start, end);
+    const visible = compactWebSnippet(stripHtmlToVisibleText(chunk));
+    if (!visible) continue;
+    const key = visible.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    signals.push(`focus: ${visible}`);
+    if (signals.length >= CHAT_WEB_HTML_SIGNAL_LIMIT) break;
+  }
+
+  return signals.slice(0, CHAT_WEB_HTML_SIGNAL_LIMIT);
+}
+
+async function fetchLivePageInsights(url) {
+  if (!isHttpUrl(url)) return { summary: "", signals: [] };
+  try {
+    const response = await fetch(url, {
+      redirect: "follow",
+      headers: { "User-Agent": "EndoCode-Desktop-App" },
+      signal: AbortSignal.timeout(CHAT_WEB_PAGE_FETCH_TIMEOUT_MS),
+    });
+    if (!response.ok) return { summary: "", signals: [] };
+    const html = await response.text();
+    const visible = stripHtmlToVisibleText(html);
+    const summary = compactWebSnippet(visible).slice(0, CHAT_WEB_PAGE_SNIPPET_CHARS);
+    const signals = extractHtmlSignals(html);
+    return { summary, signals };
+  } catch {
+    return { summary: "", signals: [] };
+  }
+}
+
 function decodeDuckDuckGoRedirectUrl(rawHref = "") {
   const href = String(rawHref || "").trim();
   if (!href) return "";
@@ -1244,15 +1542,17 @@ async function getLightWebContext(query, preferredQuery = "", options = {}) {
   const domain = extractDomainCandidate(`${preferredQuery} ${normalized}`);
   const domainUrl = domain ? `https://${domain}` : "";
   if (domainUrl) {
-    const domainSnippet = await fetchLivePageSnippet(domainUrl);
-    if (domainSnippet) {
+    const domainInfo = await fetchLivePageInsights(domainUrl);
+    if (domainInfo.summary || (domainInfo.signals && domainInfo.signals.length)) {
+      const signalLines = (domainInfo.signals || []).slice(0, CHAT_WEB_HTML_SIGNAL_LIMIT).map((line) => `- [HTML] ${line}`);
       const directContext = `Kontekst z internetu (ultra-light, moze byc niepelny):
-- Pipeline: domain-first fetch -> extract visible text
+- Pipeline: domain-first fetch -> extract visible text + general html digest
 - Zapytanie lookup: ${preferredQuery || normalized}
-- [LIVE:DOMAIN] ${domainSnippet}`;
+- [LIVE:DOMAIN] ${domainInfo.summary || "Brak krótkiego streszczenia strony"}
+${signalLines.join("\n")}`;
       return {
         context: directContext,
-        sources: [{ title: `Strona ${domain}`, url: domainUrl, snippet: domainSnippet }],
+        sources: [{ title: `Strona ${domain}`, url: domainUrl, snippet: domainInfo.summary || domainInfo.signals?.[0] || "" }],
         visitedUrls: [domainUrl],
         lookupUrl: "",
         fromCache: false,
@@ -1310,16 +1610,19 @@ async function getLightWebContext(query, preferredQuery = "", options = {}) {
       if (!candidateUrls.length) {
         candidateUrls = (await searchWebLinks(candidateQuery)).slice(0, CHAT_WEB_PAGE_FETCH_MAX_SOURCES);
       }
-      const liveSnippets = await Promise.all(candidateUrls.map((url) => fetchLivePageSnippet(url)));
+      const liveInsights = await Promise.all(candidateUrls.map((url) => fetchLivePageInsights(url)));
       for (let i = 0; i < candidateUrls.length; i += 1) {
-        const snippet = compactWebSnippet(liveSnippets[i] || "");
-        if (!snippet) continue;
-        lines.push(`- [LIVE:${i + 1}] ${snippet}`);
+        const insight = liveInsights[i] || { summary: "", signals: [] };
+        const snippet = compactWebSnippet(insight.summary || "");
+        const signals = Array.isArray(insight.signals) ? insight.signals.slice(0, 3) : [];
+        if (!snippet && !signals.length) continue;
+        lines.push(`- [LIVE:${i + 1}] ${snippet || "Brak krótkiego streszczenia."}`);
+        for (const signal of signals) lines.push(`- [HTML:${i + 1}] ${signal}`);
         if (!dedupedSources.some((source) => source.url === candidateUrls[i])) {
           dedupedSources.push({
             title: `Web result ${i + 1}`,
             url: candidateUrls[i],
-            snippet,
+            snippet: snippet || signals[0] || "",
           });
         }
       }
@@ -1327,7 +1630,7 @@ async function getLightWebContext(query, preferredQuery = "", options = {}) {
       const result = {
         context: lines.length
           ? `Kontekst z internetu (ultra-light, moze byc niepelny):
-- Pipeline: interpret query -> lookup -> fetch live page -> extract visible text
+- Pipeline: interpret query -> lookup -> fetch live page -> extract visible text + general html digest
 - Zapytanie lookup: ${candidateQuery}
 ${lines.join("\n")}`
           : "",
@@ -3294,6 +3597,30 @@ function looksLikeNeedsWebInReply(text) {
   return /(musz[eę]\s*(sprawdzic|sprawdzić|wyszukac|wyszukać)|sprawdze|sprawdz[eę]\s+w\s+internecie|poszukam|zaraz\s+sprawdz[eę]|brak\s+pewnych\s+danych|nie\s+mam\s+aktualnych\s+danych)/i.test(s);
 }
 
+function stripSourceSectionsFromHistory(text) {
+  const raw = String(text || "");
+  if (!raw) return "";
+  const lines = raw.split(/\r?\n/);
+  const out = [];
+  let skipUrlBlock = false;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (/^zrodla\s*:|^źródła\s*:|^zweryfikowane zrodla url/i.test(trimmed)) {
+      skipUrlBlock = true;
+      continue;
+    }
+    if (skipUrlBlock) {
+      if (/^https?:\/\//i.test(trimmed) || /^-\s*https?:\/\//i.test(trimmed) || /^-\s*[a-z0-9.-]+\.[a-z]{2,}/i.test(trimmed)) {
+        continue;
+      }
+      if (!trimmed) continue;
+      skipUrlBlock = false;
+    }
+    out.push(line);
+  }
+  return out.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
 async function executeTool(action) {
   const tool = action.tool;
   if (typeof tool !== "string" || !tool.trim() || !ALLOWED_TOOLS.has(tool)) {
@@ -4010,8 +4337,12 @@ async function runSimpleChat(userText) {
   try {
     await validateCurrentWorkspaceRoot();
     await ensureServer(DEFAULT_PORT);
-    const text = String(userText ?? "").trim();
-    if (!text) throw new Error("Pusta wiadomosc.");
+    const chatPayload = typeof userText === "object" && userText !== null
+      ? userText
+      : { text: userText };
+    const text = String(chatPayload?.text ?? "").trim();
+    const attachment = chatPayload?.attachment && typeof chatPayload.attachment === "object" ? chatPayload.attachment : null;
+    if (!text && !attachment) throw new Error("Pusta wiadomosc.");
     emit("run-start", { text, chatMode: true });
     emit("status", { status: "model-thinking", detail: `${getModelConfig().displayName} — tryb czatu` });
     const isAgentControlMessage = (msg) => {
@@ -4033,12 +4364,32 @@ async function runSimpleChat(userText) {
     const history = messages
       .filter((msg) => (msg.role === "user" || msg.role === "assistant") && !isAgentControlMessage(msg))
       .slice(-12)
-      .map((msg) => ({ role: msg.role, content: String(msg.content || "").slice(0, 3000) }));
+      .map((msg) => ({
+        role: msg.role,
+        content: stripSourceSectionsFromHistory(String(msg.content || "")).slice(0, 3000),
+      }));
     const chatMessages = [
       { role: "system", content: CHAT_SYSTEM_PROMPT },
       ...history,
       { role: "user", content: text },
     ];
+    if (attachment) {
+      emit("status", { status: "model-thinking", detail: "Czat: analizuję załączony plik..." });
+      const extracted = await extractAttachmentText(attachment);
+      if (extracted.ok) {
+        chatMessages.splice(1, 0, {
+          role: "user",
+          content: `Załącznik użytkownika (${extracted.name}, ${Math.max(1, Math.round(extracted.size / 1024))} KB). Wyciągnięty tekst:\n${extracted.text}`,
+        });
+        emit("status", { status: "model-thinking", detail: `Czat: dołączono tekst z pliku ${extracted.name}.` });
+      } else {
+        chatMessages.splice(1, 0, {
+          role: "user",
+          content: `Załącznik użytkownika (${String(attachment.name || "plik")}) nie został odczytany: ${extracted.reason}`,
+        });
+        emit("status", { status: "model-thinking", detail: `Czat: ${extracted.reason}` });
+      }
+    }
     const modelLookupQueryRaw = await deriveLookupQueryWithModel(text, history, signal);
     const forceLookup = looksLikeFreshFactQuestion(text);
     const modelLookupQuery = modelLookupQueryRaw || (forceLookup ? buildForcedLookupQuery(text) : "");
@@ -4084,6 +4435,10 @@ async function runSimpleChat(userText) {
         chatMessages.splice(2, 0, {
           role: "user",
           content: `Zweryfikowane zrodla URL (uzyj tylko ich, nie wymyslaj nowych):\n${sourceUrls.map((url) => `- ${url}`).join("\n")}`,
+        });
+        chatMessages.splice(3, 0, {
+          role: "user",
+          content: "W tej odpowiedzi wolno cytowac tylko powyzsze URL-e z biezacej tury. Ignoruj jakiekolwiek starsze zrodla z historii.",
         });
       }
       emit("chat-web-lookup", {

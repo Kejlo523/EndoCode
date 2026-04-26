@@ -189,9 +189,10 @@
         <form class="composer" id="composer">
           <div class="attachment-preview hidden" id="attachmentPreview">
              <img src="" id="attachmentImage" alt="Załącznik">
+             <div class="attachment-file-meta hidden" id="attachmentFileMeta"></div>
              <button type="button" class="attachment-remove" id="attachmentRemove" title="Usuń załącznik">&times;</button>
           </div>
-          <textarea id="prompt" rows="1" placeholder="Opisz zadanie lub zadaj pytanie (Ctrl+V wkleja obraz)..." autocomplete="off"></textarea>
+          <textarea id="prompt" rows="1" placeholder="Opisz zadanie lub zadaj pytanie (Ctrl+V wkleja obraz lub plik)..." autocomplete="off"></textarea>
           <div class="composer-actions">
             <div class="composer-meta">
               <span class="composer-workspace" id="composerWorkspace">
@@ -214,8 +215,8 @@
               </label>
             </div>
             <div class="composer-buttons">
-              <input type="file" id="fileInput" accept="image/*" class="hidden" style="display:none;">
-              <button id="attachBtn" type="button" class="attach-btn" title="Załącz obraz">
+              <input type="file" id="fileInput" class="hidden" style="display:none;">
+              <button id="attachBtn" type="button" class="attach-btn" title="Załącz plik">
                 <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
                   <path d="M14.5 8.5v3a2.5 2.5 0 01-5 0v-6a1.5 1.5 0 013 0v5a.5.5 0 01-1 0v-5a.5.5 0 00-1 0v6a1.5 1.5 0 003 0v-3h1.5z" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
                 </svg>

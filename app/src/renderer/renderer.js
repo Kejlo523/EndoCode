@@ -29,21 +29,20 @@ const attachBtn = document.getElementById("attachBtn");
 const fileInput = document.getElementById("fileInput");
 const attachmentPreview = document.getElementById("attachmentPreview");
 const attachmentImage = document.getElementById("attachmentImage");
+const attachmentFileMeta = document.getElementById("attachmentFileMeta");
 const attachmentRemove = document.getElementById("attachmentRemove");
 let currentAttachmentBase64 = null;
+let currentAttachmentFile = null;
 let visionEnabled = false;
 
 async function checkVisionSkill() {
   try {
     const skills = await window.endocode.listSkills();
     visionEnabled = skills.some(s => s.id === "vision" && s.installed);
-    if (visionEnabled) {
-      attachBtn.classList.remove("hidden");
-      attachBtn.title = "Załącz obraz (obsługiwane przez Vision VLM)";
-    } else {
-      attachBtn.classList.add("hidden");
-      attachBtn.title = "Zainstaluj skill Vision, aby móc załączać obrazy";
-    }
+    attachBtn.classList.remove("hidden");
+    attachBtn.title = visionEnabled
+      ? "Załącz plik (obrazy działają też w trybie agenta)"
+      : "Załącz plik (obrazy w agencie wymagają skill Vision)";
   } catch (e) {
     console.error("Błąd podczas sprawdzania skilla vision:", e);
   }
@@ -1190,40 +1189,95 @@ promptEl.addEventListener("input", () => {
 // ── Attachments ──
 function setAttachment(base64DataUrl) {
   currentAttachmentBase64 = base64DataUrl;
+  currentAttachmentFile = null;
   attachmentImage.src = base64DataUrl;
+  attachmentImage.classList.remove("hidden");
+  if (attachmentFileMeta) {
+    attachmentFileMeta.textContent = "Obraz";
+    attachmentFileMeta.classList.add("hidden");
+  }
   attachmentPreview.classList.remove("hidden");
 }
-function clearAttachment() {
+
+function setFileAttachment(file, dataBase64) {
+  currentAttachmentFile = {
+    name: file?.name || "plik",
+    mimeType: file?.type || "application/octet-stream",
+    size: Number(file?.size || 0),
+    dataBase64: dataBase64 || "",
+  };
   currentAttachmentBase64 = null;
   attachmentImage.src = "";
+  attachmentImage.classList.add("hidden");
+  if (attachmentFileMeta) {
+    const kb = Math.max(1, Math.round(currentAttachmentFile.size / 1024));
+    attachmentFileMeta.textContent = `${currentAttachmentFile.name} (${kb} KB)`;
+    attachmentFileMeta.classList.remove("hidden");
+  }
+  attachmentPreview.classList.remove("hidden");
+}
+
+function clearAttachment() {
+  currentAttachmentBase64 = null;
+  currentAttachmentFile = null;
+  attachmentImage.src = "";
+  attachmentImage.classList.remove("hidden");
+  if (attachmentFileMeta) {
+    attachmentFileMeta.textContent = "";
+    attachmentFileMeta.classList.add("hidden");
+  }
   attachmentPreview.classList.add("hidden");
   fileInput.value = "";
 }
 attachmentRemove.addEventListener("click", clearAttachment);
 attachBtn.addEventListener("click", () => {
-  if (!visionEnabled) return;
   fileInput.click();
 });
-fileInput.addEventListener("change", (e) => {
-  if (!visionEnabled) return;
-  const file = e.target.files[0];
-  if (file && (file.type === "image/png" || file.type === "image/jpeg" || file.type === "image/webp")) {
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
     const reader = new FileReader();
-    reader.onload = (e) => setAttachment(e.target.result);
+    reader.onload = (evt) => {
+      const raw = String(evt?.target?.result || "");
+      const idx = raw.indexOf(",");
+      resolve(idx >= 0 ? raw.slice(idx + 1) : "");
+    };
+    reader.onerror = () => reject(new Error("Nie udało się odczytać pliku."));
     reader.readAsDataURL(file);
+  });
+}
+
+fileInput.addEventListener("change", (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const isImage = /^image\//i.test(file.type || "");
+  if (isImage) {
+    const reader = new FileReader();
+    reader.onload = (evt) => setAttachment(evt.target.result);
+    reader.readAsDataURL(file);
+    return;
   }
+  fileToBase64(file).then((base64) => setFileAttachment(file, base64)).catch((err) => {
+    addInlineEvent("error", "Załącznik", err.message || String(err));
+  });
 });
 promptEl.addEventListener("paste", (e) => {
-  if (!visionEnabled) return;
   const items = (e.clipboardData || e.originalEvent?.clipboardData)?.items;
   if (!items) return;
   for (const item of items) {
-    if (item.type.indexOf("image") === 0) {
+    if (item.kind === "file") {
       e.preventDefault();
       const file = item.getAsFile();
-      const reader = new FileReader();
-      reader.onload = (ev) => setAttachment(ev.target.result);
-      reader.readAsDataURL(file);
+      if (!file) continue;
+      if (/^image\//i.test(file.type || "")) {
+        const reader = new FileReader();
+        reader.onload = (ev) => setAttachment(ev.target.result);
+        reader.readAsDataURL(file);
+      } else {
+        fileToBase64(file).then((base64) => setFileAttachment(file, base64)).catch((err) => {
+          addInlineEvent("error", "Załącznik", err.message || String(err));
+        });
+      }
       break;
     }
   }
@@ -1235,24 +1289,37 @@ let firstUserMessage = null;
 composer.addEventListener("submit", async (event) => {
   event.preventDefault();
   const text = promptEl.value.trim();
-  if (!text && !currentAttachmentBase64) return;
+  if (!text && !currentAttachmentBase64 && !currentAttachmentFile) return;
   promptEl.value = "";
   promptEl.style.height = "auto";
 
   const attachedBase64 = currentAttachmentBase64;
+  const attachedFile = currentAttachmentFile ? { ...currentAttachmentFile } : null;
   clearAttachment();
 
-  if (!firstUserMessage) firstUserMessage = text || "Obraz";
-  addMessage("user", text || "[Wysłano obraz]", attachedBase64);
-  chatTitle.textContent = (text || "Obraz").length > 40 ? (text || "Obraz").slice(0, 40) + "..." : (text || "Obraz");
+  const messagePreview = text || (attachedFile ? `[Załączono plik: ${attachedFile.name}]` : "Obraz");
+  if (!firstUserMessage) firstUserMessage = messagePreview;
+  addMessage("user", messagePreview, attachedBase64);
+  chatTitle.textContent = messagePreview.length > 40 ? messagePreview.slice(0, 40) + "..." : messagePreview;
   setBusy(true);
 
   try {
-    const useChatMode = Boolean(chatModeToggle?.checked) && !attachedBase64;
+    const useChatMode = Boolean(chatModeToggle?.checked);
     if (useChatMode) {
-      await window.endocode.sendChat(text);
+      await window.endocode.sendChat({
+        text,
+        attachment: attachedFile || (attachedBase64 ? {
+          name: "image.png",
+          mimeType: "image/png",
+          size: 0,
+          dataBase64: attachedBase64.split(",")[1] || attachedBase64,
+        } : null),
+      });
     } else {
       const payload = attachedBase64 ? { text, imageBase64: attachedBase64.split(",")[1] } : text;
+      if (attachedFile && !attachedBase64) {
+        addInlineEvent("note", "Załącznik", "Pliki tekstowe/dokumenty działają w trybie Czat. W trybie agenta użyj Czat lub załącz obraz z Vision.");
+      }
       await window.endocode.send(payload);
     }
   } catch (e) {
