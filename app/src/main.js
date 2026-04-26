@@ -25,8 +25,9 @@ const CHAT_WEB_LOOKUP_TIMEOUT_MS = 2500;
 const CHAT_WEB_LOOKUP_CACHE_TTL_MS = 5 * 60 * 1000;
 const CHAT_WEB_LOOKUP_MAX_ITEMS = 3;
 const CHAT_WEB_PAGE_FETCH_TIMEOUT_MS = 2200;
-const CHAT_WEB_PAGE_FETCH_MAX_SOURCES = 2;
+const CHAT_WEB_PAGE_FETCH_MAX_SOURCES = 3;
 const CHAT_WEB_PAGE_SNIPPET_CHARS = 320;
+const CHAT_WEB_SEARCH_RESULT_LIMIT = 6;
 
 /** Górny limit okna kontekstu (llama.cpp -c); suwak w UI do ~2.5 mln — realnie ogranicza RAM/VRAM. */
 const MIN_CONTEXT_TOKENS = 1024;
@@ -1164,6 +1165,55 @@ async function fetchLivePageSnippet(url) {
   }
 }
 
+function decodeDuckDuckGoRedirectUrl(rawHref = "") {
+  const href = String(rawHref || "").trim();
+  if (!href) return "";
+  try {
+    const absolute = href.startsWith("http") ? href : `https://duckduckgo.com${href}`;
+    const u = new URL(absolute);
+    const uddg = u.searchParams.get("uddg");
+    if (uddg && isHttpUrl(uddg)) return uddg;
+    if (isHttpUrl(absolute)) return absolute;
+  } catch {
+    if (isHttpUrl(href)) return href;
+  }
+  return "";
+}
+
+function extractDuckDuckGoHtmlLinks(html) {
+  const text = String(html || "");
+  const results = [];
+  const seen = new Set();
+  const regex = /<a[^>]+class="[^"]*(?:result__a|result-link)[^"]*"[^>]+href="([^"]+)"/gi;
+  let match;
+  while ((match = regex.exec(text))) {
+    const url = decodeDuckDuckGoRedirectUrl(match[1] || "");
+    if (!url || seen.has(url)) continue;
+    seen.add(url);
+    results.push(url);
+    if (results.length >= CHAT_WEB_SEARCH_RESULT_LIMIT) break;
+  }
+  return results;
+}
+
+async function searchWebLinks(query) {
+  const q = normalizeWebQuery(query);
+  if (!q) return [];
+  const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}`;
+  try {
+    const response = await fetch(url, {
+      redirect: "follow",
+      headers: { "User-Agent": "EndoCode-Desktop-App" },
+      signal: AbortSignal.timeout(CHAT_WEB_LOOKUP_TIMEOUT_MS),
+    });
+    if (!response.ok) return [];
+    const html = await response.text();
+    return extractDuckDuckGoHtmlLinks(html);
+  } catch {
+    return [];
+  }
+}
+
 function collectRelatedTopics(topics = [], out = []) {
   for (const topic of topics) {
     if (!topic) continue;
@@ -1253,15 +1303,25 @@ async function getLightWebContext(query, preferredQuery = "", options = {}) {
         seen.add(key);
         dedupedSources.push(source);
       }
-      const candidateUrls = dedupedSources
+      let candidateUrls = dedupedSources
         .map((source) => String(source?.url || "").trim())
         .filter((url) => isHttpUrl(url))
         .slice(0, CHAT_WEB_PAGE_FETCH_MAX_SOURCES);
+      if (!candidateUrls.length) {
+        candidateUrls = (await searchWebLinks(candidateQuery)).slice(0, CHAT_WEB_PAGE_FETCH_MAX_SOURCES);
+      }
       const liveSnippets = await Promise.all(candidateUrls.map((url) => fetchLivePageSnippet(url)));
       for (let i = 0; i < candidateUrls.length; i += 1) {
         const snippet = compactWebSnippet(liveSnippets[i] || "");
         if (!snippet) continue;
         lines.push(`- [LIVE:${i + 1}] ${snippet}`);
+        if (!dedupedSources.some((source) => source.url === candidateUrls[i])) {
+          dedupedSources.push({
+            title: `Web result ${i + 1}`,
+            url: candidateUrls[i],
+            snippet,
+          });
+        }
       }
 
       const result = {
@@ -3194,6 +3254,7 @@ Nie pisz, ze "nie masz internetu" lub "nie mozesz sprawdzic online", bo tryb cza
 Gdy takiego bloku nie ma, odpowiedz z wiedzy wlasnej i w razie potrzeby zaznacz brak swiezych danych z internetu.
 ZASADA ANTYHALUCYNACJI: nie wymyslaj danych firm, kontaktow, adresow, cen, ofert, numerow telefonu ani emaili. Jesli pytanie dotyczy konkretnej strony/firmy i nie ma zweryfikowanych danych w bloku internetowym, napisz wyraznie: "Brak zweryfikowanych danych z sieci dla tego zapytania."
 Jesli podajesz fakty z bloku internetowego, dodaj na koncu sekcje "Zrodla:" i wypisz URL-e z ktorych pochodza dane.
+Nigdy nie pisz fikcyjnych zrodel typu "[zrodlo internetowe]" ani "brak zapisanego zrodla".
 Nie wymyslaj wynikow narzedzi ani struktur {"tool":...}. Jesli uzytkownik potrzebuje edycji plikow, skryptow lub sandboxa, napisz krotko zeby wylaczyl tryb „Czat” i uzyl zwyklego agenta.`;
 
 function looksLikeWebsiteFactQuestion(text) {
@@ -3202,6 +3263,35 @@ function looksLikeWebsiteFactQuestion(text) {
   const hasDomain = /\b[a-z0-9-]+\.[a-z]{2,}\b/i.test(q);
   const hasFactIntent = /(ofert|uslug|usług|kontakt|telefon|email|mail|adres|firma|strona|oferuj|cennik|dane)/i.test(q);
   return hasDomain || hasFactIntent;
+}
+
+function looksLikeFreshFactQuestion(text) {
+  const q = String(text || "").toLowerCase();
+  if (!q) return false;
+  const asksCurrent = /(na dzien|na dzień|dzis|dzisiaj|aktualn|stan na|latest|today|w tym roku)/i.test(q);
+  const hasDate = /\b(20\d{2}|[0-3]?\d[./-][01]?\d[./-]20\d{2})\b/i.test(q);
+  const topicNeedsFacts = /(cbdc|nbp|bank centralny|inflacj|stopy procentowe|regulacj|prawo|raport|komunikat|decyzj)/i.test(q);
+  return (asksCurrent || hasDate) && topicNeedsFacts;
+}
+
+function buildForcedLookupQuery(text) {
+  const normalized = normalizeWebQuery(text);
+  const domain = extractDomainCandidate(normalized);
+  if (domain) return `${domain} informacje`;
+  const words = normalized
+    .replace(/[!?.,;:()[\]{}"'`]/g, " ")
+    .split(/\s+/)
+    .map((w) => w.trim())
+    .filter(Boolean)
+    .filter((w) => w.length >= 3)
+    .slice(0, 8);
+  return words.join(" ").slice(0, 120);
+}
+
+function looksLikeNeedsWebInReply(text) {
+  const s = String(text || "").toLowerCase();
+  if (!s) return false;
+  return /(musz[eę]\s*(sprawdzic|sprawdzić|wyszukac|wyszukać)|sprawdze|sprawdz[eę]\s+w\s+internecie|poszukam|zaraz\s+sprawdz[eę]|brak\s+pewnych\s+danych|nie\s+mam\s+aktualnych\s+danych)/i.test(s);
 }
 
 async function executeTool(action) {
@@ -3949,14 +4039,18 @@ async function runSimpleChat(userText) {
       ...history,
       { role: "user", content: text },
     ];
-    const modelLookupQuery = await deriveLookupQueryWithModel(text, history, signal);
+    const modelLookupQueryRaw = await deriveLookupQueryWithModel(text, history, signal);
+    const forceLookup = looksLikeFreshFactQuestion(text);
+    const modelLookupQuery = modelLookupQueryRaw || (forceLookup ? buildForcedLookupQuery(text) : "");
     let webLookup = null;
     if (modelLookupQuery) {
       emit("chat-web-lookup", {
         phase: "start",
         query: text,
         lookupQuery: modelLookupQuery,
-        detail: "Model zdecydował, że potrzebny jest web lookup.",
+        detail: modelLookupQueryRaw
+          ? "Model zdecydował, że potrzebny jest web lookup."
+          : "Wymuszono web lookup dla pytania o świeże fakty/daty.",
       });
       webLookup = await getLightWebContext(text, modelLookupQuery, { strictPreferred: true });
       if (webLookup?.error) {
@@ -4016,6 +4110,10 @@ async function runSimpleChat(userText) {
         visitedUrls: Array.isArray(webLookup?.visitedUrls) ? webLookup.visitedUrls.slice(0, 5) : [],
         detail: webLookup?.skipped ? "Pominięto web lookup dla krótkiego/nieadekwatnego zapytania." : "Brak trafnego kontekstu internetowego.",
       });
+      chatMessages.splice(1, 0, {
+        role: "user",
+        content: "Web lookup nie zwrocil zweryfikowanych danych. Nie podawaj sekcji Zrodla ani twierdzen, ze cos znaleziono w sieci.",
+      });
     }
     if (!webLookup?.context && looksLikeWebsiteFactQuestion(text)) {
       const guardedReply = "Brak zweryfikowanych danych z sieci dla tego zapytania. Nie mogę rzetelnie podać oferty/kontaktu bez trafnego wyniku web lookup. Podaj proszę dokładny URL lub krótsze zapytanie, a sprawdzę ponownie.";
@@ -4024,15 +4122,82 @@ async function runSimpleChat(userText) {
       emit("final", { text: guardedReply, chatMode: true });
       return { ok: true, final: guardedReply, guarded: true };
     }
+    if (!webLookup?.context && looksLikeFreshFactQuestion(text)) {
+      const guardedReply = "Brak zweryfikowanych danych z sieci dla tego pytania (aktualny stan na datę). Nie podam faktów bez źródeł. Podaj proszę dokładniejszy zakres lub URL, a spróbuję ponownie.";
+      messages.push({ role: "user", content: text });
+      messages.push({ role: "assistant", content: guardedReply });
+      emit("final", { text: guardedReply, chatMode: true });
+      return { ok: true, final: guardedReply, guarded: true };
+    }
     const failedModelIds = new Set();
-    const rawReply = await callModelWithRecovery(chatMessages, signal, failedModelIds, { plainChat: true });
+    let rawReply = await callModelWithRecovery(chatMessages, signal, failedModelIds, { plainChat: true });
     const replySource =
       typeof rawReply === "string"
         ? rawReply
         : rawReply && typeof rawReply === "object" && "content" in rawReply
           ? rawReply.content
           : rawReply;
-    const reply = String(replySource ?? "").trim();
+    let reply = String(replySource ?? "").trim();
+
+    const shouldRetryWithWeb =
+      !webLookup?.context &&
+      !modelLookupQuery &&
+      looksLikeNeedsWebInReply(reply);
+    if (shouldRetryWithWeb) {
+      const forcedQuery = buildForcedLookupQuery(text);
+      if (forcedQuery) {
+        emit("chat-web-lookup", {
+          phase: "start",
+          query: text,
+          lookupQuery: forcedQuery,
+          detail: "Auto-web: model zasugerował potrzebę sprawdzenia, uruchamiam lookup.",
+        });
+        const forcedLookup = await getLightWebContext(text, forcedQuery, { strictPreferred: true });
+        if (forcedLookup?.context) {
+          chatMessages.splice(1, 0, { role: "user", content: `Kontekst z internetu:\n${forcedLookup.context}` });
+          const src = Array.isArray(forcedLookup.sources)
+            ? forcedLookup.sources.map((source) => String(source?.url || "").trim()).filter(Boolean).slice(0, 6)
+            : [];
+          if (src.length) {
+            chatMessages.splice(2, 0, {
+              role: "user",
+              content: `Zweryfikowane zrodla URL (uzyj tylko ich, nie wymyslaj nowych):\n${src.map((url) => `- ${url}`).join("\n")}`,
+            });
+          }
+          emit("chat-web-lookup", {
+            phase: "result",
+            used: true,
+            fromCache: Boolean(forcedLookup.fromCache),
+            lookupUrl: forcedLookup.lookupUrl || "",
+            query: forcedLookup.query || text,
+            lookupQuery: forcedLookup.lookupQuery || forcedQuery,
+            sources: Array.isArray(forcedLookup.sources) ? forcedLookup.sources.slice(0, 5) : [],
+            visitedUrls: Array.isArray(forcedLookup.visitedUrls) ? forcedLookup.visitedUrls.slice(0, 5) : [],
+            detail: "Auto-web: dołączono kontekst internetowy i ponawiam odpowiedź.",
+          });
+          const second = await callModelWithRecovery(chatMessages, signal, failedModelIds, { plainChat: true });
+          const secondSource =
+            typeof second === "string"
+              ? second
+              : second && typeof second === "object" && "content" in second
+                ? second.content
+                : second;
+          reply = String(secondSource ?? "").trim();
+        } else {
+          emit("chat-web-lookup", {
+            phase: "result",
+            used: false,
+            fromCache: Boolean(forcedLookup?.fromCache),
+            lookupUrl: forcedLookup?.lookupUrl || "",
+            query: forcedLookup?.query || text,
+            lookupQuery: forcedLookup?.lookupQuery || forcedQuery,
+            sources: Array.isArray(forcedLookup?.sources) ? forcedLookup.sources.slice(0, 5) : [],
+            visitedUrls: Array.isArray(forcedLookup?.visitedUrls) ? forcedLookup.visitedUrls.slice(0, 5) : [],
+            detail: "Auto-web: brak trafnych danych przy ponownej próbie lookup.",
+          });
+        }
+      }
+    }
     messages.push({ role: "user", content: text });
     messages.push({ role: "assistant", content: reply });
     emit("final", { text: reply, chatMode: true });
