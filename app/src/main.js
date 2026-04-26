@@ -35,6 +35,20 @@ const CHAT_WEB_SEARCH_RESULT_LIMIT = 6;
 const CHAT_WEB_HTML_SIGNAL_LIMIT = 10;
 const CHAT_ATTACHMENT_MAX_BYTES = 6 * 1024 * 1024;
 const CHAT_ATTACHMENT_TEXT_LIMIT = 12000;
+const SAFE_RUNTIME_LIMITS = {
+  contextMin: 4096,
+  contextMax: 32768,
+  threadsMin: 2,
+  threadsMax: 16,
+  threadsBatchMin: 2,
+  threadsBatchMax: 20,
+  batchMin: 256,
+  batchMax: 1536,
+  ubatchMin: 64,
+  ubatchMax: 512,
+  parallelMin: 1,
+  parallelMax: 2,
+};
 
 /** Górny limit okna kontekstu (llama.cpp -c); suwak w UI do ~2.5 mln — realnie ogranicza RAM/VRAM. */
 const MIN_CONTEXT_TOKENS = 1024;
@@ -46,6 +60,12 @@ function clampContextTokens(value) {
   const n = Number(value);
   if (!Number.isFinite(n)) return 8192;
   return Math.min(MAX_CONTEXT_TOKENS, Math.max(MIN_CONTEXT_TOKENS, Math.round(n)));
+}
+
+function clampInt(value, min, max, fallback = min) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, Math.round(n)));
 }
 
 function clampMaxMessages(value) {
@@ -602,7 +622,73 @@ function loadModelCatalog() {
 
 function loadModelPresets() {
   const data = readJsonFile(path.join(BIELIK_HOME, "config", "model-presets.json"), { models: [] });
-  return Array.isArray(data.models) ? data.models : [];
+  if (!Array.isArray(data.models)) return [];
+  return data.models
+    .filter((preset) => preset && typeof preset === "object")
+    .filter((preset) => Boolean(preset.id) && Boolean(preset.file || preset.fileName))
+    .map((preset) => ({ ...preset }));
+}
+
+function applyRuntimeSafetyGuards(rawConfig = {}, modelMeta = {}) {
+  const profile = getCachedModelProfile();
+  const sizeGB = Number(modelMeta.expectedBytes || 0) / 1073741824;
+  const category = String(modelMeta.category || rawConfig.category || "").toLowerCase();
+
+  const config = { ...rawConfig };
+  config.contextTokens = clampContextTokens(clampInt(
+    config.contextTokens ?? 8192,
+    SAFE_RUNTIME_LIMITS.contextMin,
+    SAFE_RUNTIME_LIMITS.contextMax,
+    8192,
+  ));
+  if (category !== "small" || sizeGB >= 6) config.contextTokens = Math.min(config.contextTokens, 16384);
+  if (sizeGB >= 10 || category === "large") config.contextTokens = Math.min(config.contextTokens, 8192);
+  if (Number(profile?.ramGB || 0) > 0 && Number(profile.ramGB) < 24) config.contextTokens = Math.min(config.contextTokens, 8192);
+
+  config.threads = clampInt(
+    config.threads ?? (os.cpus().length || 8),
+    SAFE_RUNTIME_LIMITS.threadsMin,
+    SAFE_RUNTIME_LIMITS.threadsMax,
+    8,
+  );
+  config.threadsBatch = clampInt(
+    config.threadsBatch ?? (config.threads + 2),
+    SAFE_RUNTIME_LIMITS.threadsBatchMin,
+    SAFE_RUNTIME_LIMITS.threadsBatchMax,
+    config.threads + 2,
+  );
+  if (config.threadsBatch < config.threads) config.threadsBatch = config.threads;
+
+  config.batchSize = clampInt(
+    config.batchSize ?? 1024,
+    SAFE_RUNTIME_LIMITS.batchMin,
+    SAFE_RUNTIME_LIMITS.batchMax,
+    1024,
+  );
+  config.ubatchSize = clampInt(
+    config.ubatchSize ?? 256,
+    SAFE_RUNTIME_LIMITS.ubatchMin,
+    SAFE_RUNTIME_LIMITS.ubatchMax,
+    256,
+  );
+  if (config.ubatchSize > config.batchSize) config.ubatchSize = Math.min(config.batchSize, SAFE_RUNTIME_LIMITS.ubatchMax);
+  config.parallel = clampInt(
+    config.parallel ?? 1,
+    SAFE_RUNTIME_LIMITS.parallelMin,
+    SAFE_RUNTIME_LIMITS.parallelMax,
+    1,
+  );
+
+  config.gpuLayers = clampInt(config.gpuLayers ?? 0, 0, 99, 0);
+  if (Number(profile?.vramGB || 0) <= 0 || String(profile?.gpuBackendClass || "") === "cpu-only") {
+    config.gpuLayers = 0;
+  }
+  config.gpuLayerFallbacks = createGpuLayerFallbacks(config.gpuLayers, profile?.gpuBackendClass || "cpu-only");
+
+  config.flashAttention = String(config.flashAttention ?? "on");
+  config.cacheTypeK = config.cacheTypeK || "q8_0";
+  config.cacheTypeV = config.cacheTypeV || "q8_0";
+  return config;
 }
 
 function createPresetModelConfig(preset) {
@@ -615,6 +701,23 @@ function createPresetModelConfig(preset) {
     contextTokens: preset.contextTokens,
     gpuLayers: preset.gpuLayers,
   });
+  const mergedRuntime = {
+    ...runtimeConfig,
+    contextTokens: preset.contextTokens ?? runtimeConfig.contextTokens,
+    gpuLayers: preset.gpuLayers ?? runtimeConfig.gpuLayers,
+    threads: preset.threads ?? runtimeConfig.threads,
+    threadsBatch: preset.threadsBatch ?? runtimeConfig.threadsBatch,
+    batchSize: preset.batchSize ?? runtimeConfig.batchSize,
+    ubatchSize: preset.ubatchSize ?? runtimeConfig.ubatchSize,
+    parallel: preset.parallel ?? runtimeConfig.parallel,
+    flashAttention: preset.flashAttention ?? runtimeConfig.flashAttention,
+    cacheTypeK: preset.cacheTypeK ?? runtimeConfig.cacheTypeK,
+    cacheTypeV: preset.cacheTypeV ?? runtimeConfig.cacheTypeV,
+  };
+  const safeRuntime = applyRuntimeSafetyGuards(mergedRuntime, {
+    expectedBytes: preset.expectedBytes,
+    category: preset.category || runtimeConfig.category,
+  });
   return {
     id: preset.id || createModelId(fileName, preset.source || "preset"),
     displayName: preset.displayName || fileName.replace(/\.gguf$/i, "").replace(/[-_.]/g, " "),
@@ -624,10 +727,10 @@ function createPresetModelConfig(preset) {
     expectedBytes: Number(preset.expectedBytes || 0),
     source: preset.source,
     sourceType: preset.sourceType || "huggingface",
-    category: preset.category || runtimeConfig.category,
+    category: preset.category || safeRuntime.category || runtimeConfig.category,
     preset: true,
     description: preset.description || "Preset modelu GGUF.",
-    ...runtimeConfig,
+    ...safeRuntime,
   };
 }
 
@@ -989,7 +1092,7 @@ function createRuntimeModelConfig(model = {}) {
     gpuLayers = Number(model.gpuLayers);
   }
 
-  return {
+  return applyRuntimeSafetyGuards({
     category,
     contextTokens,
     gpuLayers,
@@ -1002,7 +1105,7 @@ function createRuntimeModelConfig(model = {}) {
     flashAttention: "on",
     cacheTypeK: "q8_0",
     cacheTypeV: "q8_0",
-  };
+  }, { expectedBytes, category });
 }
 
 function normalizeGgufFile(file, profile, context = {}) {
@@ -4438,6 +4541,41 @@ function compactMessages() {
   });
 }
 
+function formatChatFacingError(error, options = {}) {
+  const mode = options.mode === "agent" ? "agent" : "chat";
+  const modelName = options.modelName || getModelConfig()?.displayName || "model";
+  const raw = String(error?.message || error || "").trim();
+  const detail = textPreview(raw, 180);
+  if (!raw) {
+    return mode === "agent"
+      ? "Zadanie zatrzymane: wystapil nieznany blad runtime."
+      : "Nie udalo sie wygenerowac odpowiedzi. Sprobuj ponownie za chwile.";
+  }
+  if (/image input is not supported/i.test(raw)) {
+    return "Uzywany model jest klasycznym LLM bez obslugi obrazow. Przelacz na model Vision (VLM) albo wyslij samo polecenie tekstowe.";
+  }
+  if (/llama-server zakonczyl prace przed startem API|Serwer nie odpowiedzial/i.test(raw)) {
+    return `Nie udalo sie uruchomic runtime dla ${modelName}. Zmniejsz ustawienia modelu (kontekst/GPU layers) albo wybierz lzejszy model.`;
+  }
+  if (/Model API 5\d\d/i.test(raw)) {
+    return `Runtime modelu ${modelName} zwrocil blad API (${detail}). Sprobuj ponownie lub przelacz na lzejszy model.`;
+  }
+  if (/timeout|nie wyslal danych/i.test(raw)) {
+    return `Model ${modelName} nie odpowiedzial na czas. Sprobuj ponownie albo zmniejsz ustawienia runtime.`;
+  }
+  if (/Jinja Exception|Conversation roles must alternate/i.test(raw)) {
+    return `Model ${modelName} odrzucil format rozmowy (template chat). Sprobuj ponownie po wyczyszczeniu czatu lub zmianie modelu.`;
+  }
+  if (/Port \d+ zajmuje inny model/i.test(raw)) {
+    return `Port runtime jest zajety przez inny model. Uzyj kill switcha serwera i ponow probe.`;
+  }
+  if (/Nie znaleziono runtime\/llama-server\.exe/i.test(raw)) {
+    return "Brakuje runtime llama.cpp. Zainstaluj runtime w ustawieniach aplikacji.";
+  }
+  if (mode === "agent") return `Zadanie zatrzymane: ${detail}`;
+  return `Nie udalo sie wygenerowac odpowiedzi: ${detail}`;
+}
+
 async function runAgent(userText) {
   if (runInProgress) throw new Error("Agent juz pracuje.");
   runInProgress = true;
@@ -4546,10 +4684,10 @@ async function runAgent(userText) {
       emit("final", { text: "Przerwano zadanie." });
       return { ok: false, aborted: true };
     }
-    let message = `Zatrzymalem zadanie kontrolowanie: ${error.message || String(error)}`;
-    if (/image input is not supported/i.test(message)) {
-      message = "Używany model to klasyczny LLM (brak obsługi obrazów). Użyj modelu z rodziny Vision (VLM) albo przesyłaj wyłącznie komendy tekstowe.";
-    }
+    const message = formatChatFacingError(error, {
+      mode: "agent",
+      modelName: getModelConfig()?.displayName,
+    });
     emit("final", { text: message });
     messages.push({
       role: "assistant",
@@ -4794,7 +4932,10 @@ async function runSimpleChat(userText) {
       emit("final", { text: "Przerwano.", chatMode: true });
       return { ok: false, aborted: true };
     }
-    const message = error?.message || String(error);
+    const message = formatChatFacingError(error, {
+      mode: "chat",
+      modelName: getModelConfig()?.displayName,
+    });
     emit("final", { text: message, chatMode: true });
     return { ok: false, error: message };
   } finally {
@@ -5588,6 +5729,12 @@ function sanitizeSettingsPatch(rawSettings = {}) {
   }
   if (patch.contextTokens != null) patch.contextTokens = clampContextTokens(patch.contextTokens);
   if (patch.maxMessages != null) patch.maxMessages = clampMaxMessages(patch.maxMessages);
+  if (patch.gpuLayers != null) patch.gpuLayers = clampRuntimeNumber(patch.gpuLayers, 0, 99);
+  if (patch.threads != null) patch.threads = clampRuntimeNumber(patch.threads, SAFE_RUNTIME_LIMITS.threadsMin, SAFE_RUNTIME_LIMITS.threadsMax);
+  if (patch.threadsBatch != null) patch.threadsBatch = clampRuntimeNumber(patch.threadsBatch, SAFE_RUNTIME_LIMITS.threadsBatchMin, SAFE_RUNTIME_LIMITS.threadsBatchMax);
+  if (patch.batchSize != null) patch.batchSize = clampRuntimeNumber(patch.batchSize, SAFE_RUNTIME_LIMITS.batchMin, SAFE_RUNTIME_LIMITS.batchMax);
+  if (patch.ubatchSize != null) patch.ubatchSize = clampRuntimeNumber(patch.ubatchSize, SAFE_RUNTIME_LIMITS.ubatchMin, SAFE_RUNTIME_LIMITS.ubatchMax);
+  if (patch.parallel != null) patch.parallel = clampRuntimeNumber(patch.parallel, SAFE_RUNTIME_LIMITS.parallelMin, SAFE_RUNTIME_LIMITS.parallelMax);
   return patch;
 }
 
