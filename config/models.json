@@ -2,15 +2,19 @@
   "defaultModelId": "zen4-coder-pro-iq2s",
   "models": [
     {
-      "id": "zen4-coder-pro-iq2s",
-      "displayName": "Zen4 Coder Pro i1 IQ2_S",
+      "id": "qwen3-4b-q4-k-m-maziyarpanahi-qwen3-4b-gguf",
+      "displayName": "Qwen3 4B Q4_K_M",
       "kind": "local-gguf",
-      "serverModel": "zen4-coder-pro.i1-IQ2_S",
-      "file": "models/zen4-coder-pro.i1-IQ2_S.gguf",
-      "expectedBytes": 23641442464,
-      "contextTokens": 24576,
-      "gpuLayers": 24,
-      "gpuLayerFallbacks": [20, 16, 12],
+      "serverModel": "qwen3-4b-q4-k-m-maziyarpanahi-qwen3-4b-gguf",
+      "file": "models/Qwen3-4B.Q4_K_M.gguf",
+      "expectedBytes": 2497280672,
+      "source": "MaziyarPanahi/Qwen3-4B-GGUF",
+      "sourceType": "huggingface",
+      "downloadUrl": "https://huggingface.co/MaziyarPanahi/Qwen3-4B-GGUF/resolve/main/Qwen3-4B.Q4_K_M.gguf",
+      "category": "small",
+      "contextTokens": 32768,
+      "gpuLayers": 0,
+      "gpuLayerFallbacks": [],
       "threads": 16,
       "threadsBatch": 20,
       "batchSize": 2048,
@@ -19,69 +23,7 @@
       "flashAttention": "on",
       "cacheTypeK": "q8_0",
       "cacheTypeV": "q8_0",
-      "source": "mradermacher/zen4-coder-pro-i1-GGUF",
-      "description": "Domyslny mocny lokalny coder 80B/Qwen3Next w quancie IQ2_S. Config pod RTX 3060 12 GB + i7-13700K + 32 GB RAM: hybryda GPU/CPU, flash-attn, q8 KV cache i bezpieczny kontekst 24K."
-    },
-    {
-      "id": "qwen25-coder-14b-q4km",
-      "displayName": "Qwen2.5-Coder 14B Q4_K_M",
-      "kind": "local-gguf",
-      "serverModel": "qwen2.5-coder-14b-instruct-q4_k_m",
-      "file": "models/qwen2.5-coder-14b-instruct-q4_k_m.gguf",
-      "expectedBytes": 8988110272,
-      "contextTokens": 8192,
-      "gpuLayers": 99,
-      "source": "Qwen/Qwen2.5-Coder-14B-Instruct-GGUF",
-      "description": "Najlepszy domyslny balans szybkosci i jakosci na RTX 3060 12 GB."
-    },
-    {
-      "id": "bielik-minitron-7b-q5km",
-      "displayName": "Bielik Minitron 7B v3 Q5_K_M",
-      "kind": "local-gguf",
-      "serverModel": "minitron-Bielik-7B-v3.0-Instruct-GGUF.Q5_K_M",
-      "file": "models/minitron-Bielik-7B-v3.0-Instruct-GGUF.Q5_K_M.gguf",
-      "expectedBytes": 5293952032,
-      "contextTokens": 8192,
-      "gpuLayers": 99,
-      "source": "speakleash/Bielik-Minitron-7B-v3.0-Instruct-GGUF",
-      "description": "Lekki lokalny model zapasowy, dobry do szybkich prob i odzysku po awarii ciezszych modeli."
-    },
-    {
-      "id": "qwen3-coder-30b-a3b-q4km",
-      "displayName": "Qwen3-Coder 30B-A3B Q4_K_M",
-      "kind": "local-gguf",
-      "serverModel": "qwen3-coder-30b-a3b-instruct-q4_k_m",
-      "file": "models/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf",
-      "expectedBytes": 18556689568,
-      "contextTokens": 8192,
-      "gpuLayers": 28,
-      "source": "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
-      "description": "Mocniejszy model agentowy. Bedzie wolniejszy, bo czesc wag siedzi w RAM/CPU."
-    },
-    {
-      "id": "qwen36-35b-a3b-mxfp4",
-      "displayName": "Qwen3.6 35B-A3B MXFP4",
-      "kind": "local-gguf",
-      "serverModel": "qwen3.6-35b-a3b-mxfp4",
-      "file": "models/Qwen3.6-35B-A3B-MXFP4_MOE.gguf",
-      "expectedBytes": 21706144736,
-      "contextTokens": 8192,
-      "gpuLayers": 18,
-
-      "source": "unsloth/Qwen3.6-35B-A3B-GGUF",
-      "description": "Najnowszy mocny Qwen MoE z repo Unsloth. Ciezszy od Qwen3-Coder 30B, ale nadal do sprobowania na 32 GB RAM."
-    },
-    {
-      "id": "deepseek-coder-v2-lite-q4km",
-      "displayName": "DeepSeek-Coder V2 Lite Q4_K_M",
-      "kind": "local-gguf",
-      "serverModel": "deepseek-coder-v2-lite-instruct-q4_k_m",
-      "file": "models/DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf",
-      "expectedBytes": 10364416768,
-      "contextTokens": 8192,
-      "gpuLayers": 28,
-      "source": "bartowski/DeepSeek-Coder-V2-Lite-Instruct-GGUF",
-      "description": "Alternatywny coder MoE. Dobry do kodu, ale mniej nowy niz Qwen3."
+      "description": "Maly Qwen3 z dobrym balansem jakosci i predkosci."
     }
   ]
 }

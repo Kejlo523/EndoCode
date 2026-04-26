@@ -64,6 +64,7 @@ const modelsBtn = document.getElementById("modelsBtn");
 const modelsModal = document.getElementById("modelsModal");
 const closeModels = document.getElementById("closeModels");
 const modelsList = document.getElementById("modelsList");
+const modelsInstalledList = document.getElementById("modelsInstalledList");
 const modelsStatus = document.getElementById("modelsStatus");
 const hfModelUrl = document.getElementById("hfModelUrl");
 const addHfModel = document.getElementById("addHfModel");
@@ -92,6 +93,8 @@ const settingsModal = document.getElementById("settingsModal");
 const closeSettings = document.getElementById("closeSettings");
 const applySettings = document.getElementById("applySettings");
 const resetSettings = document.getElementById("resetSettings");
+const settingsModelName = document.getElementById("settingsModelName");
+const rawModelJson = document.getElementById("rawModelJson");
 
 // ── State ──
 let pendingApprovalId = null;
@@ -102,6 +105,10 @@ let currentWorkspaceRoot = "";
 let chatSessions = [];
 let activeChatId = null;
 let runtimeInstallInProgress = false;
+let currentSettingsModelId = null;
+let refreshStateInFlight = false;
+let updateSystemInFlight = false;
+let loadModelsInFlight = false;
 
 // ── Helpers ──
 function escapeHtml(value) {
@@ -597,16 +604,20 @@ async function saveChatSession(firstMessage = null) {
 
 // ══════════════ SYSTEM MONITOR ══════════════
 async function updateSystemMonitor() {
+  if (document.hidden) return;
+  if (updateSystemInFlight) return;
+  updateSystemInFlight = true;
   try {
     const info = await window.endocode.getSystemInfo();
     cpuBar.style.width = `${info.cpu}%`;
     cpuValue.textContent = `${info.cpu}%`;
     if (info.gpu >= 0) {
       gpuBar.style.width = `${info.gpu}%`;
-      gpuValue.textContent = `${info.gpu}%`;
+      const vendor = info.gpuVendor && info.gpuVendor !== "unknown" ? ` ${String(info.gpuVendor).toUpperCase()}` : "";
+      gpuValue.textContent = `${info.gpu}%${vendor}`;
     } else {
       gpuBar.style.width = "0%";
-      gpuValue.textContent = "N/A";
+      gpuValue.textContent = info.gpuVendor && info.gpuVendor !== "unknown" ? String(info.gpuVendor).toUpperCase() : "N/A";
     }
     ramBar.style.width = `${info.ramPercent}%`;
     ramValue.textContent = `${info.ramUsedGB}G`;
@@ -618,6 +629,7 @@ async function updateSystemMonitor() {
       vramValue.textContent = "N/A";
     }
   } catch { /* ignore */ }
+  finally { updateSystemInFlight = false; }
 }
 
 // ══════════════ CONTEXT INFO ══════════════
@@ -694,19 +706,39 @@ function applyStateToUi(state) {
 }
 
 async function refreshState() {
-  const state = await window.endocode.getState();
-  applyStateToUi(state);
-  return state;
+  if (document.hidden) return null;
+  if (refreshStateInFlight) return null;
+  refreshStateInFlight = true;
+  try {
+    const state = await window.endocode.getState();
+    applyStateToUi(state);
+    return state;
+  } finally {
+    refreshStateInFlight = false;
+  }
 }
 
 function renderModelSelect(state) {
   modelSelect.innerHTML = "";
-  for (const model of state.models || []) {
+  const availableModels = (state.models || []).filter((model) => model.available);
+
+  if (availableModels.length === 0) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "Brak pobranych modeli";
+    option.disabled = true;
+    option.selected = true;
+    modelSelect.appendChild(option);
+    modelSelect.disabled = true;
+    return;
+  }
+
+  modelSelect.disabled = false;
+  for (const model of availableModels) {
     const option = document.createElement("option");
     option.value = model.id;
-    const progress = model.fileStatus?.expectedBytes ? Math.round((model.fileStatus.progress || 0) * 100) : 0;
-    option.textContent = `${model.displayName}${model.available ? "" : ` (${progress}%)`}`;
-    option.disabled = !model.available;
+    option.textContent = model.displayName;
+    option.disabled = false;
     option.selected = model.id === state.selectedModelId;
     modelSelect.appendChild(option);
   }
@@ -760,14 +792,14 @@ async function loadSkills() {
 }
 
 // ══════════════ MODELS ══════════════
-function renderModels(models = []) {
-  if (!modelsList) return;
+function renderModels(models = [], targetEl = modelsList) {
+  if (!targetEl) return;
   if (!models.length) {
-    modelsList.innerHTML = `<div class="models-empty">Brak modeli w katalogu.</div>`;
+    targetEl.innerHTML = `<div class="models-empty">Brak modeli w katalogu.</div>`;
     return;
   }
 
-  modelsList.innerHTML = models.map((model) => {
+  targetEl.innerHTML = models.map((model) => {
     const status = model.fileStatus || {};
     const isDownloaded = status.available;
     const isDownloading = status.downloading;
@@ -788,7 +820,7 @@ function renderModels(models = []) {
     if (model.kind !== "cloud-api") {
       if (isDownloaded) {
         actions.push(`<button class="model-btn use" onclick="useModel('${escapeAttr(model.id)}')">${model.selected ? "Aktywny" : "Użyj"}</button>`);
-        actions.push(`<button class="model-btn use" onclick="openSettingsModal()">Ustawienia</button>`);
+        actions.push(`<button class="model-btn use" onclick="openSettingsModal('${escapeAttr(model.id)}')">Ustawienia</button>`);
         actions.push(`<button class="model-btn delete" onclick="deleteModel('${escapeAttr(model.id)}')">Usuń</button>`);
       } else if (isDownloading) {
         actions.push(`<button class="model-btn download" disabled>Pobieranie ${progress}%...</button>`);
@@ -837,12 +869,20 @@ function renderModels(models = []) {
 
 async function loadModels() {
   if (!modelsList) return;
+  if (loadModelsInFlight) return;
+  loadModelsInFlight = true;
   modelsList.innerHTML = `<div class="models-empty">Ładowanie...</div>`;
+  if (modelsInstalledList) modelsInstalledList.innerHTML = `<div class="models-empty">Ładowanie...</div>`;
   try {
-    renderModels(await window.endocode.listModels());
+    const models = await window.endocode.listModels();
+    renderModels(models, modelsList);
+    const installed = models.filter((model) => model.kind === "local-gguf" && model.fileStatus?.available);
+    renderModels(installed, modelsInstalledList);
   } catch (e) {
     modelsList.innerHTML = `<div class="models-empty error">${escapeHtml(e.message || String(e))}</div>`;
+    if (modelsInstalledList) modelsInstalledList.innerHTML = `<div class="models-empty error">${escapeHtml(e.message || String(e))}</div>`;
   }
+  finally { loadModelsInFlight = false; }
 }
 
 window.useModel = async (modelId) => {
@@ -1192,9 +1232,10 @@ window.endocode.onEvent(async (event) => {
   if (event.type === "model-download-progress") {
     // Throttled refresh for the UI
     const now = Date.now();
-    if (!window._lastModelRefresh || now - window._lastModelRefresh > 500) {
+    if (modelsModal?.classList?.contains("hidden")) return;
+    if (!window._lastModelRefresh || now - window._lastModelRefresh > 900) {
       window._lastModelRefresh = now;
-      renderModels(await window.endocode.listModels());
+      await loadModels();
     }
     if (modelsStatus) {
       const downloadedMb = (event.downloaded / 1024 / 1024).toFixed(0);
@@ -1347,9 +1388,9 @@ async function init() {
 init();
 
 // Polling
-setInterval(() => { if (!appBusy) refreshState(); }, 8000);
-setInterval(updateSystemMonitor, 2500);
-setInterval(() => { if (appBusy) updateContextInfo(); }, 3000);
+setInterval(() => { if (!appBusy) refreshState(); }, 12000);
+setInterval(updateSystemMonitor, 4500);
+setInterval(() => { if (appBusy && !document.hidden) updateContextInfo(); }, 4500);
 
 // ══════════════ SETTINGS MODAL ══════════════
 const SETTINGS_FIELDS = [
@@ -1368,6 +1409,12 @@ const SETTINGS_FIELDS = [
   },
   { id: "gpuLayers", slider: "set_gpuLayers", display: "val_gpuLayers", decimals: 0 },
   { id: "maxMessages", slider: "set_maxMessages", display: "val_maxMessages", decimals: 0 },
+  { id: "threads", slider: "set_threads", display: "val_threads", decimals: 0 },
+  { id: "threadsBatch", slider: "set_threadsBatch", display: "val_threadsBatch", decimals: 0 },
+  { id: "batchSize", slider: "set_batchSize", display: "val_batchSize", decimals: 0 },
+  { id: "ubatchSize", slider: "set_ubatchSize", display: "val_ubatchSize", decimals: 0 },
+  { id: "parallel", slider: "set_parallel", display: "val_parallel", decimals: 0 },
+  { id: "flashAttention", slider: "set_flashAttention", display: "val_flashAttention", decimals: 0, formatFn: (v) => Number(v) === 1 ? "on" : "off" },
 ];
 
 // Wire up live value display for all sliders
@@ -1382,9 +1429,11 @@ for (const field of SETTINGS_FIELDS) {
   }
 }
 
-async function openSettingsModal() {
+async function openSettingsModal(modelId = modelSelect.value) {
   try {
-    const settings = await window.endocode.getModelSettings();
+    const settings = await window.endocode.getModelSettings(modelId);
+    currentSettingsModelId = settings.modelId || modelId;
+    if (settingsModelName) settingsModelName.textContent = `Model: ${settings.modelName || currentSettingsModelId}`;
     const eff = settings._effective || {};
     // Populate sliders with current values
     setSlider("set_temperature", "val_temperature", settings.temperature ?? eff.temperature, 2);
@@ -1401,7 +1450,17 @@ async function openSettingsModal() {
       (v) => Number(v).toLocaleString("pl-PL"),
     );
     setSlider("set_gpuLayers", "val_gpuLayers", settings.gpuLayers ?? eff.gpuLayers, 0);
-    setSlider("set_maxMessages", "val_maxMessages", settings.maxMessages ?? 32, 0);
+    setSlider("set_maxMessages", "val_maxMessages", settings.maxMessages ?? eff.maxMessages ?? 32, 0);
+    setSlider("set_threads", "val_threads", settings.threads ?? eff.threads ?? 8, 0);
+    setSlider("set_threadsBatch", "val_threadsBatch", settings.threadsBatch ?? eff.threadsBatch ?? 12, 0);
+    setSlider("set_batchSize", "val_batchSize", settings.batchSize ?? eff.batchSize ?? 1024, 0);
+    setSlider("set_ubatchSize", "val_ubatchSize", settings.ubatchSize ?? eff.ubatchSize ?? 512, 0);
+    setSlider("set_parallel", "val_parallel", settings.parallel ?? eff.parallel ?? 1, 0);
+    setSlider("set_flashAttention", "val_flashAttention", (settings.flashAttention ?? eff.flashAttention ?? "on") === "on" ? 1 : 0, 0, (v) => Number(v) === 1 ? "on" : "off");
+    if (rawModelJson) {
+      const raw = await window.endocode.getModelRawConfig(currentSettingsModelId);
+      rawModelJson.value = raw.rawJson || "{}";
+    }
   } catch { /* ignore */ }
   settingsModal.classList.remove("hidden");
 }
@@ -1433,6 +1492,12 @@ function collectSettingsFromUI() {
     contextTokens: parseInt(document.getElementById("set_contextTokens").value, 10),
     gpuLayers: parseInt(document.getElementById("set_gpuLayers").value, 10),
     maxMessages: parseInt(document.getElementById("set_maxMessages").value, 10),
+    threads: parseInt(document.getElementById("set_threads").value, 10),
+    threadsBatch: parseInt(document.getElementById("set_threadsBatch").value, 10),
+    batchSize: parseInt(document.getElementById("set_batchSize").value, 10),
+    ubatchSize: parseInt(document.getElementById("set_ubatchSize").value, 10),
+    parallel: parseInt(document.getElementById("set_parallel").value, 10),
+    flashAttention: Number(document.getElementById("set_flashAttention").value) === 1 ? "on" : "off",
   };
 }
 
@@ -1442,7 +1507,10 @@ closeSettings.addEventListener("click", () => settingsModal.classList.add("hidde
 applySettings.addEventListener("click", async () => {
   const values = collectSettingsFromUI();
   try {
-    await window.endocode.setModelSettings(values);
+    if (rawModelJson?.value?.trim()) {
+      await window.endocode.setModelRawConfig({ modelId: currentSettingsModelId, rawJson: rawModelJson.value });
+    }
+    await window.endocode.setModelSettings({ modelId: currentSettingsModelId, settings: values });
     addInlineEvent("note", "Ustawienia", "Zastosowano nowe ustawienia modelu.");
     settingsModal.classList.add("hidden");
     await updateContextInfo(); // refresh indicator with new maxMessages
@@ -1453,31 +1521,46 @@ applySettings.addEventListener("click", async () => {
 
 resetSettings.addEventListener("click", async () => {
   try {
-    await window.endocode.resetModelSettings();
+    await window.endocode.resetModelSettings(currentSettingsModelId);
     addInlineEvent("note", "Ustawienia", "Przywrócono domyślne ustawienia.");
-    await openSettingsModal(); // refresh sliders
+    await openSettingsModal(currentSettingsModelId); // refresh sliders
   } catch (e) {
     addInlineEvent("error", "Ustawienia", e.message || String(e));
   }
 });
 // ── Tabs Switching ──
 const tabLibrary = document.getElementById("tabLibrary");
+const tabInstalled = document.getElementById("tabInstalled");
 const tabDiscover = document.getElementById("tabDiscover");
 const modelsLibraryView = document.getElementById("modelsLibraryView");
+const modelsInstalledView = document.getElementById("modelsInstalledView");
 const modelsDiscoverView = document.getElementById("modelsDiscoverView");
 
-if (tabLibrary && tabDiscover) {
+if (tabLibrary && tabDiscover && tabInstalled) {
   tabLibrary.addEventListener("click", () => {
     tabLibrary.classList.add("active");
+    tabInstalled.classList.remove("active");
     tabDiscover.classList.remove("active");
     modelsLibraryView.classList.remove("hidden");
+    modelsInstalledView.classList.add("hidden");
+    modelsDiscoverView.classList.add("hidden");
+  });
+
+  tabInstalled.addEventListener("click", () => {
+    tabInstalled.classList.add("active");
+    tabLibrary.classList.remove("active");
+    tabDiscover.classList.remove("active");
+    modelsInstalledView.classList.remove("hidden");
+    modelsLibraryView.classList.add("hidden");
     modelsDiscoverView.classList.add("hidden");
   });
 
   tabDiscover.addEventListener("click", () => {
     tabDiscover.classList.add("active");
+    tabInstalled.classList.remove("active");
     tabLibrary.classList.remove("active");
     modelsDiscoverView.classList.remove("hidden");
+    modelsInstalledView.classList.add("hidden");
     modelsLibraryView.classList.add("hidden");
   });
 }

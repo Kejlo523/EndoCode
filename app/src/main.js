@@ -9,6 +9,7 @@ const { pipeline } = require("node:stream/promises");
 const { Readable } = require("node:stream");
 const https = require("node:https");
 const { jsonrepair } = require("jsonrepair");
+const { createTelemetryMonitor } = require("./main/telemetry");
 
 const DEFAULT_PORT = 8088;
 const MAX_FILE_BYTES = 220000;
@@ -20,7 +21,9 @@ const MODEL_STREAM_IDLE_TIMEOUT_MS = 6 * 60 * 1000;
 const PLAIN_CHAT_MAX_CHARS = 18000;
 const PLAIN_CHAT_REPEAT_CHUNK_LIMIT = 40;
 const SERVER_SHUTDOWN_TIMEOUT_MS = 6000;
-let MAX_MESSAGES = 32;
+const CHAT_WEB_LOOKUP_TIMEOUT_MS = 2500;
+const CHAT_WEB_LOOKUP_CACHE_TTL_MS = 5 * 60 * 1000;
+const CHAT_WEB_LOOKUP_MAX_ITEMS = 3;
 
 /** Górny limit okna kontekstu (llama.cpp -c); suwak w UI do ~2.5 mln — realnie ogranicza RAM/VRAM. */
 const MIN_CONTEXT_TOKENS = 1024;
@@ -66,15 +69,15 @@ function allowedToolNamesList() {
 const REASONING_LEVELS = {
   low: {
     label: "Szybko",
-    maxSteps: 8,
-    maxTokens: 1400,
-    temperature: 0.1,
-    instruction: "Dzialaj szybko: zrob minimalne rozpoznanie, wykonaj najprostszy bezpieczny krok i sprawdz rezultat.",
+    maxSteps: 4,
+    maxTokens: 700,
+    temperature: 0.05,
+    instruction: "Dzialaj maksymalnie szybko: minimum krokow i minimum tekstu. Preferuj najszybsza bezpieczna akcje i final jak najszybciej.",
   },
   medium: {
     label: "Normalnie",
-    maxSteps: 14,
-    maxTokens: 1900,
+    maxSteps: 10,
+    maxTokens: 1300,
     temperature: 0.2,
     instruction: "Zrob krotki plan, przeczytaj istotne pliki, pracuj malymi krokami i uruchom waska weryfikacje.",
   },
@@ -247,15 +250,10 @@ let accessLevel = "sandbox"; // "sandbox" or "full"
 let chatHistory = [];
 let currentChatId = null;
 const VISION_PORT = 11435;
-let previousCpuInfo = os.cpus();
-let nvidiaSmiAvailable = null;
-const GPU_PROBE_INTERVAL_MS = 15000;
-let lastGpuProbeAt = 0;
-let gpuProbeCache = { gpuPercent: -1, vramUsedMB: -1, vramTotalMB: -1 };
+const telemetryMonitor = createTelemetryMonitor();
 
 let activeDownloads = new Map();
-// Custom model settings (overrides per-reasoning defaults when set)
-let customModelSettings = {
+const DEFAULT_MODEL_SETTINGS = {
   temperature: null,     // null = use reasoning profile default
   maxTokens: null,
   maxSteps: null,        // null = use reasoning profile, 0 = unlimited
@@ -264,7 +262,21 @@ let customModelSettings = {
   repeatPenalty: null,
   contextTokens: null,   // override for model context window
   gpuLayers: null,       // override for GPU offload layers
+  maxMessages: null,     // override for compaction threshold
+  threads: null,
+  threadsBatch: null,
+  batchSize: null,
+  ubatchSize: null,
+  parallel: null,
+  flashAttention: null,
+  cacheTypeK: null,
+  cacheTypeV: null,
+  reasoning: null,
+  reasoningBudget: null,
+  extraServerArgs: null,
 };
+let customModelSettingsByModelId = {};
+const chatWebLookupCache = new Map();
 
 function emit(type, payload = {}) {
   if (mainWindow && !mainWindow.isDestroyed()) {
@@ -421,7 +433,24 @@ function writeJsonFile(filePath, value) {
   fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 }
 
+const PERF_WARN_MS = 120;
+function logPerf(label, startedAt) {
+  const elapsed = Date.now() - startedAt;
+  if (elapsed >= PERF_WARN_MS) {
+    console.warn(`[perf] ${label} ${elapsed}ms`);
+  }
+}
+
+let modelCatalogCache = null;
+let modelCatalogCacheAt = 0;
+const MODEL_CATALOG_CACHE_TTL_MS = 1200;
+
 function loadModelCatalog() {
+  const cacheAge = Date.now() - modelCatalogCacheAt;
+  if (modelCatalogCache && cacheAge >= 0 && cacheAge < MODEL_CATALOG_CACHE_TTL_MS) {
+    return JSON.parse(JSON.stringify(modelCatalogCache));
+  }
+  const startedAt = Date.now();
   const fallback = {
     defaultModelId: "qwen25-coder-14b-q4km",
     models: [
@@ -445,6 +474,9 @@ function loadModelCatalog() {
   }
   // Filter out Claude Opus (API only) as requested
   catalog.models = catalog.models.filter(m => m.id !== "claude-opus-4-5-api");
+  modelCatalogCache = catalog;
+  modelCatalogCacheAt = Date.now();
+  logPerf("loadModelCatalog", startedAt);
   return catalog;
 }
 
@@ -484,6 +516,54 @@ function saveModelCatalog(catalog) {
     ...catalog,
     models: (catalog.models || []).filter((model) => !model.preset),
   });
+  modelCatalogCache = null;
+  modelCatalogCacheAt = 0;
+}
+
+async function pathExistsAsync(targetPath) {
+  try {
+    await fsp.access(targetPath, fs.constants.F_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function syncCatalogWithModelFiles(catalog) {
+  if (!catalog || !Array.isArray(catalog.models)) return { removedModelIds: [] };
+  const removedModelIds = [];
+  const syncedModels = [];
+
+  for (const model of catalog.models) {
+    if (model.kind !== "local-gguf" || !model.file) {
+      syncedModels.push(model);
+      continue;
+    }
+    if (activeDownloads.has(model.id)) {
+      syncedModels.push(model);
+      continue;
+    }
+    const modelPath = path.resolve(BIELIK_HOME, model.file);
+    if (await pathExistsAsync(modelPath)) {
+      syncedModels.push(model);
+      continue;
+    }
+    removedModelIds.push(model.id);
+  }
+
+  if (removedModelIds.length > 0) {
+    catalog.models = syncedModels;
+    if (removedModelIds.includes(selectedModelId)) {
+      selectedModelId = catalog.defaultModelId;
+      if (!catalog.models.some((model) => model.id === selectedModelId)) {
+        selectedModelId = catalog.models[0]?.id || selectedModelId;
+      }
+      saveAppSettings();
+    }
+    saveModelCatalog(catalog);
+  }
+
+  return { removedModelIds };
 }
 
 function loadAppSettings() {
@@ -495,8 +575,7 @@ function saveAppSettings() {
     selectedModelId,
     reasoningLevel: selectedReasoning,
     accessLevel,
-    customModelSettings,
-    maxMessages: MAX_MESSAGES,
+    customModelSettingsByModelId,
     workspaceRoot,
   });
 }
@@ -634,130 +713,15 @@ async function installRecommendedSkills() {
 }
 
 function probeGpuInfo() {
-  let gpuPercent = -1;
-  let vramUsedMB = -1;
-  let vramTotalMB = -1;
-  if (nvidiaSmiAvailable !== false) {
-    try {
-      const out = execSync("nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits", { timeout: 2000, windowsHide: true }).toString().trim();
-      const firstRow = out.split(/\r?\n/).find((line) => line.trim()) || "";
-      const parts = firstRow.split(",").map((s) => s.trim());
-      gpuPercent = parseInt(parts[0], 10) || 0;
-      vramUsedMB = parseInt(parts[1], 10) || 0;
-      vramTotalMB = parseInt(parts[2], 10) || 0;
-      nvidiaSmiAvailable = true;
-    } catch {
-      nvidiaSmiAvailable = false;
-    }
-  }
-
-  if (nvidiaSmiAvailable === false && process.platform === "win32") {
-    try {
-      const gpuOut = execSync(
-        "powershell -NoProfile -ExecutionPolicy Bypass -Command \"$cards = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Select-Object Name,AdapterRAM; $cards | ConvertTo-Json -Compress\"",
-        { timeout: 4000, windowsHide: true },
-      ).toString().trim();
-      if (gpuOut) {
-        const parsed = JSON.parse(gpuOut);
-        const cards = Array.isArray(parsed) ? parsed : [parsed];
-        const maxVram = cards
-          .map((card) => Number(card?.AdapterRAM || 0))
-          .filter((value) => Number.isFinite(value) && value > 0)
-          .sort((a, b) => b - a)[0];
-        if (maxVram) vramTotalMB = Math.round(maxVram / (1024 * 1024));
-      }
-    } catch { /* ignore WMI fallback errors */ }
-    if (gpuPercent < 0) {
-      try {
-        const gpuWmiOut = execSync(
-          "powershell -NoProfile -ExecutionPolicy Bypass -Command \"$g = Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine -ErrorAction SilentlyContinue; if ($g) { [math]::Round((($g | Measure-Object -Property UtilizationPercentage -Average).Average),0) }\"",
-          { timeout: 4000, windowsHide: true },
-        ).toString().trim();
-        const value = Number.parseFloat(gpuWmiOut);
-        if (Number.isFinite(value)) gpuPercent = Math.max(0, Math.min(100, Math.round(value)));
-      } catch { /* ignore WMI perf fallback errors */ }
-    }
-    if (gpuPercent < 0) {
-      try {
-        const gpuCounterOut = execSync(
-          "powershell -NoProfile -ExecutionPolicy Bypass -Command \"$s = Get-Counter '\\GPU Engine(*)\\Utilization Percentage' -ErrorAction SilentlyContinue; if ($s -and $s.CounterSamples) { [math]::Round((($s.CounterSamples | Measure-Object -Property CookedValue -Average).Average), 0) }\"",
-          { timeout: 4000, windowsHide: true },
-        ).toString().trim();
-        const value = Number.parseFloat(gpuCounterOut);
-        if (Number.isFinite(value)) gpuPercent = Math.max(0, Math.min(100, Math.round(value)));
-      } catch { /* ignore perf counter fallback errors */ }
-    }
-  }
-
-  return { gpuPercent, vramUsedMB, vramTotalMB };
+  return telemetryMonitor.probeGpuInfo();
 }
 
 function getSystemInfo() {
-  const cpus = os.cpus();
-  let cpuPercent = 0;
-  if (previousCpuInfo && previousCpuInfo.length === cpus.length) {
-    let totalIdle = 0, totalTick = 0;
-    for (let i = 0; i < cpus.length; i++) {
-      const prev = previousCpuInfo[i].times;
-      const curr = cpus[i].times;
-      const idle = curr.idle - prev.idle;
-      const total = (curr.user - prev.user) + (curr.nice - prev.nice) + (curr.sys - prev.sys) + (curr.irq - prev.irq) + idle;
-      totalIdle += idle;
-      totalTick += total;
-    }
-    cpuPercent = totalTick > 0 ? Math.round(((totalTick - totalIdle) / totalTick) * 100) : 0;
-  }
-  previousCpuInfo = cpus;
-
-  const totalMem = os.totalmem();
-  const freeMem = os.freemem();
-  const usedMem = totalMem - freeMem;
-  const ramPercent = Math.round((usedMem / totalMem) * 100);
-
-  const now = Date.now();
-  if (now - lastGpuProbeAt >= GPU_PROBE_INTERVAL_MS || lastGpuProbeAt === 0) {
-    gpuProbeCache = probeGpuInfo();
-    lastGpuProbeAt = now;
-  }
-
-  return {
-    cpu: cpuPercent,
-    gpu: gpuProbeCache.gpuPercent,
-    ramPercent,
-    ramUsedGB: (usedMem / 1073741824).toFixed(1),
-    ramTotalGB: (totalMem / 1073741824).toFixed(1),
-    vramUsedMB: gpuProbeCache.vramUsedMB,
-    vramTotalMB: gpuProbeCache.vramTotalMB,
-    vramPercent: gpuProbeCache.vramTotalMB > 0 ? Math.round((gpuProbeCache.vramUsedMB / gpuProbeCache.vramTotalMB) * 100) : -1,
-  };
+  return telemetryMonitor.getSystemInfo();
 }
 
 function getHardwareModelProfile() {
-  const info = getSystemInfo();
-  const ramGB = Number(info.ramTotalGB) || Math.round(os.totalmem() / 1073741824);
-  const vramGB = info.vramTotalMB > 0 ? info.vramTotalMB / 1024 : 0;
-  let target = "1B-3B Q4";
-  let maxParamB = 3;
-  if (vramGB >= 20 || ramGB >= 64) {
-    target = "14B-30B Q4";
-    maxParamB = 30;
-  } else if (vramGB >= 11 || ramGB >= 32) {
-    target = "7B-14B Q4/Q5";
-    maxParamB = 14;
-  } else if (vramGB >= 6 || ramGB >= 16) {
-    target = "3B-8B Q4/Q5";
-    maxParamB = 8;
-  }
-  return {
-    ...info,
-    ramGB,
-    vramGB,
-    target,
-    maxParamB,
-    memoryBudgetGB: Math.max(2, ramGB * 0.55),
-    fastBudgetGB: vramGB > 0 ? Math.max(1, vramGB * 0.85) : 0,
-    hasNvidiaGpu: vramGB > 0,
-  };
+  return telemetryMonitor.getHardwareModelProfile();
 }
 
 function inferParamB(...values) {
@@ -827,16 +791,8 @@ function scoreModelFit({ name, description, fileName, sizeBytes }, profile) {
   };
 }
 
-let cachedModelProfile = null;
-let cachedModelProfileAt = 0;
-
 function getCachedModelProfile() {
-  const now = Date.now();
-  if (!cachedModelProfile || now - cachedModelProfileAt > 60000) {
-    cachedModelProfile = getHardwareModelProfile();
-    cachedModelProfileAt = now;
-  }
-  return cachedModelProfile;
+  return telemetryMonitor.getCachedModelProfile();
 }
 
 function inferModelCategory({ file, displayName, expectedBytes, category }) {
@@ -848,13 +804,24 @@ function inferModelCategory({ file, displayName, expectedBytes, category }) {
   return "small";
 }
 
-function createGpuLayerFallbacks(gpuLayers) {
+function createGpuLayerFallbacks(gpuLayers, gpuBackendClass = "cpu-only") {
   const layers = Number(gpuLayers || 0);
+  if (gpuBackendClass === "intel-igpu") {
+    if (layers >= 20) return [12, 8, 4, 0];
+    if (layers >= 8) return [4, 0];
+    return [0];
+  }
+  if (gpuBackendClass === "amd") {
+    if (layers >= 80) return [48, 32, 20, 12];
+    if (layers >= 40) return [28, 20, 12, 8];
+    if (layers >= 16) return [12, 8, 4, 0];
+    return [4, 0];
+  }
   if (layers >= 90) return [64, 48, 32];
   if (layers >= 60) return [48, 32, 16];
   if (layers >= 32) return [28, 20, 12];
   if (layers >= 16) return [12, 8, 4];
-  return [];
+  return [0];
 }
 
 function createRuntimeModelConfig(model = {}) {
@@ -876,11 +843,17 @@ function createRuntimeModelConfig(model = {}) {
   }
 
   let gpuLayers = 0;
-  if (profile.hasNvidiaGpu) {
+  if (profile.gpuBackendClass === "nvidia") {
     if (!sizeGB || sizeGB <= profile.vramGB * 0.72) gpuLayers = 99;
     else if (sizeGB <= profile.vramGB * 0.95) gpuLayers = 64;
     else if (sizeGB <= profile.vramGB * 1.2) gpuLayers = 36;
     else gpuLayers = profile.vramGB >= 10 ? 24 : 12;
+  } else if (profile.gpuBackendClass === "amd") {
+    if (!sizeGB || sizeGB <= profile.vramGB * 0.7) gpuLayers = 64;
+    else if (sizeGB <= profile.vramGB * 1.0) gpuLayers = 32;
+    else gpuLayers = profile.vramGB >= 8 ? 16 : 8;
+  } else if (profile.gpuBackendClass === "intel-igpu") {
+    gpuLayers = profile.vramGB >= 4 ? 8 : 0;
   }
   if (Number.isFinite(Number(model.gpuLayers)) && Number(model.gpuLayers) >= 0) {
     gpuLayers = Number(model.gpuLayers);
@@ -890,7 +863,7 @@ function createRuntimeModelConfig(model = {}) {
     category,
     contextTokens,
     gpuLayers,
-    gpuLayerFallbacks: createGpuLayerFallbacks(gpuLayers),
+    gpuLayerFallbacks: createGpuLayerFallbacks(gpuLayers, profile.gpuBackendClass),
     threads: Math.max(2, Math.min(16, os.cpus().length || 8)),
     threadsBatch: Math.max(2, Math.min(20, (os.cpus().length || 8) + 4)),
     batchSize: category === "small" ? 2048 : 1024,
@@ -969,6 +942,59 @@ async function fetchJson(url, options = {}) {
   return res.json();
 }
 
+function normalizeWebQuery(text) {
+  return String(text || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 180);
+}
+
+function shouldUseWebLookup(query) {
+  const q = String(query || "").trim();
+  if (!q || q.length < 6) return false;
+  if (/^https?:\/\//i.test(q)) return false;
+  return true;
+}
+
+function compactWebSnippet(value) {
+  return String(value || "").replace(/\s+/g, " ").trim().slice(0, 260);
+}
+
+async function getLightWebContext(query) {
+  const normalized = normalizeWebQuery(query);
+  if (!shouldUseWebLookup(normalized)) return "";
+  const cacheKey = normalized.toLowerCase();
+  const cached = chatWebLookupCache.get(cacheKey);
+  if (cached && (Date.now() - cached.at) < CHAT_WEB_LOOKUP_CACHE_TTL_MS) {
+    return cached.text;
+  }
+  try {
+    const data = await fetchJson(
+      `https://api.duckduckgo.com/?q=${encodeURIComponent(normalized)}&format=json&no_html=1&skip_disambig=1`,
+      { signal: AbortSignal.timeout(CHAT_WEB_LOOKUP_TIMEOUT_MS) },
+    );
+    const lines = [];
+    const abstract = compactWebSnippet(data?.AbstractText);
+    const heading = compactWebSnippet(data?.Heading);
+    if (abstract) {
+      lines.push(`- ${heading ? `${heading}: ` : ""}${abstract}`);
+    }
+    const topics = Array.isArray(data?.RelatedTopics) ? data.RelatedTopics : [];
+    for (const topic of topics) {
+      if (lines.length >= CHAT_WEB_LOOKUP_MAX_ITEMS) break;
+      const text = compactWebSnippet(topic?.Text || topic?.Name || "");
+      if (!text) continue;
+      lines.push(`- ${text}`);
+    }
+    if (!lines.length) return "";
+    const context = `Kontekst z internetu (ultra-light, moze byc niepelny):\n${lines.join("\n")}`;
+    chatWebLookupCache.set(cacheKey, { at: Date.now(), text: context });
+    return context;
+  } catch {
+    return "";
+  }
+}
+
 function fetchJsonViaHttps(url, timeoutMs = 45000) {
   return new Promise((resolve, reject) => {
     const request = https.get(url, {
@@ -1032,16 +1058,56 @@ function estimateTokens(msgs) {
   return Math.ceil(chars / 3.5) + msgs.length * 4;
 }
 
+function contentToText(content) {
+  if (typeof content === "string") return content;
+  if (content == null) return "";
+  try {
+    return JSON.stringify(content);
+  } catch {
+    return String(content);
+  }
+}
+
+function buildModelMessages(rawMessages) {
+  const messagesIn = Array.isArray(rawMessages) ? rawMessages : [];
+  const normalized = messagesIn
+    .map((msg) => ({
+      role: String(msg?.role || "user"),
+      content: contentToText(msg?.content || ""),
+    }))
+    .filter((msg) => msg.content.trim().length > 0);
+
+  const systemTexts = normalized.filter((msg) => msg.role === "system").map((msg) => msg.content.trim()).filter(Boolean);
+  const nonSystem = normalized.filter((msg) => msg.role !== "system");
+  if (!systemTexts.length) return normalized;
+
+  const foldedSystem = `Instrukcja systemowa (nadrzedna):\n${systemTexts.join("\n\n")}`;
+  const firstUserIndex = nonSystem.findIndex((msg) => msg.role === "user");
+  if (firstUserIndex >= 0) {
+    nonSystem[firstUserIndex] = {
+      role: "user",
+      content: `${foldedSystem}\n\nWiadomosc uzytkownika:\n${nonSystem[firstUserIndex].content}`,
+    };
+  } else {
+    nonSystem.unshift({ role: "user", content: foldedSystem });
+  }
+  // Keep the original first system message too (for models that support it).
+  return [{ role: "system", content: systemTexts[0] }, ...nonSystem];
+}
+
 function getContextInfo() {
   const tokens = estimateTokens(messages);
-  const contextTokensLimit = clampContextTokens(customModelSettings.contextTokens ?? getModelConfig().contextTokens ?? 8192);
-  const isNearCompaction = messages.length > MAX_MESSAGES - 4 || tokens > contextTokensLimit * 0.8;
+  const model = getModelConfig();
+  const modelSettings = getModelSettingsForId(model?.id || selectedModelId);
+  const contextTokensLimit = clampContextTokens(modelSettings.contextTokens ?? model?.contextTokens ?? 8192);
+  const maxMessages = getActiveMaxMessages();
+  const isNearCompaction = messages.length > maxMessages - 4 || tokens > contextTokensLimit * 0.8;
   return {
     messageCount: messages.length,
-    maxMessages: MAX_MESSAGES,
+    maxMessages,
     estimatedTokens: tokens,
     maxTokens: contextTokensLimit,
-    willCompactAt: MAX_MESSAGES,
+    willCompactAt: maxMessages,
     isNearCompaction,
   };
 }
@@ -1057,8 +1123,38 @@ function getModelConfig() {
     catalog.models[0];
 }
 
+function getModelSettingsForId(modelId = selectedModelId) {
+  const raw = customModelSettingsByModelId?.[modelId] || {};
+  return { ...DEFAULT_MODEL_SETTINGS, ...raw };
+}
+
+function setModelSettingsForId(modelId, patch = {}) {
+  const base = getModelSettingsForId(modelId);
+  customModelSettingsByModelId[modelId] = { ...base, ...patch };
+}
+
+function resetModelSettingsForId(modelId) {
+  customModelSettingsByModelId[modelId] = { ...DEFAULT_MODEL_SETTINGS };
+}
+
+function getActiveMaxMessages() {
+  const model = getModelConfig();
+  const selected = getModelSettingsForId(model?.id || selectedModelId);
+  return clampMaxMessages(selected.maxMessages ?? model?.maxMessages ?? 32);
+}
+
 function getReasoningProfile() {
   return REASONING_LEVELS[selectedReasoning] || REASONING_LEVELS.medium;
+}
+
+function getJsonRepairRetryLimit() {
+  if (selectedReasoning === "low") return 0;
+  if (selectedReasoning === "medium") return 1;
+  return MODEL_JSON_RETRY_LIMIT;
+}
+
+function getTransportRetryCount() {
+  return selectedReasoning === "low" ? 0 : MODEL_CALL_RETRY_LIMIT;
 }
 
 function readInstructionFile(filePath) {
@@ -1285,6 +1381,7 @@ async function validateCurrentWorkspaceRoot() {
 
 function getRuntimeServerExe() {
   const runtimeDir = path.join(BIELIK_HOME, "runtime");
+  const expectedFile = process.platform === "win32" ? "llama-server.exe" : "llama-server";
   const stack = [runtimeDir];
   while (stack.length) {
     const dir = stack.pop();
@@ -1292,21 +1389,39 @@ function getRuntimeServerExe() {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) stack.push(full);
-      if (entry.isFile() && entry.name.toLowerCase() === "llama-server.exe") return full;
+      if (entry.isFile() && entry.name.toLowerCase() === expectedFile) return full;
     }
   }
   return null;
 }
 
-function rankRuntimeAssets(assets, preferCuda) {
+function detectInstallTarget() {
+  const platform = process.platform;
+  const gpuInfo = probeGpuInfo();
+  const gpuVendor = String(gpuInfo?.gpuVendor || "unknown").toLowerCase();
+  let runtimePreference = ["cpu"];
+  if (platform === "linux") {
+    if (gpuVendor === "nvidia") runtimePreference = ["cuda", "vulkan", "cpu"];
+    else if (gpuVendor === "amd") runtimePreference = ["rocm", "vulkan", "cpu"];
+    else runtimePreference = ["vulkan", "cpu"];
+  } else {
+    if (gpuVendor === "nvidia") runtimePreference = ["cuda", "vulkan", "cpu"];
+    else runtimePreference = ["cpu", "vulkan", "cuda"];
+  }
+  return { platform, gpuVendor, runtimePreference };
+}
+
+function rankRuntimeAssets(assets, target) {
   if (!Array.isArray(assets) || assets.length === 0) return [];
+  const platformToken = target.platform === "linux" ? "-bin-linux-" : "-bin-win-";
+  const requiredExt = target.platform === "linux" ? [".zip", ".tar.gz", ".tgz"] : [".zip"];
   const candidates = assets.filter((asset) => {
     const name = String(asset?.name || "").toLowerCase();
-    // must be full Windows x64 runtime package, not cudart-only bundle
+    const extOk = requiredExt.some((ext) => name.endsWith(ext));
     return (
-      name.endsWith(".zip") &&
+      extOk &&
       name.startsWith("llama-") &&
-      name.includes("-bin-win-") &&
+      name.includes(platformToken) &&
       name.includes("x64") &&
       !name.includes("arm") &&
       !name.startsWith("cudart-")
@@ -1318,20 +1433,58 @@ function rankRuntimeAssets(assets, preferCuda) {
     const name = String(asset?.name || "").toLowerCase();
     let score = 0;
     if (name.includes("llama-")) score += 20;
-    if (name.includes("-bin-win-")) score += 20;
-    if (preferCuda) {
-      if (name.includes("cuda")) score += 50;
-      if (name.includes("vulkan")) score += 25;
-      if (name.includes("cpu")) score += 10;
-    } else {
-      if (name.includes("cpu")) score += 50;
-      if (name.includes("vulkan")) score += 30;
-      if (name.includes("cuda")) score += 15;
+    if (name.includes(platformToken)) score += 20;
+    for (let i = 0; i < target.runtimePreference.length; i += 1) {
+      const backend = target.runtimePreference[i];
+      const backendScore = Math.max(0, 60 - i * 20);
+      if (backend === "rocm" && (name.includes("rocm") || name.includes("hip"))) score += backendScore;
+      if (backend !== "rocm" && name.includes(backend)) score += backendScore;
     }
+    if (!name.includes("cuda") && !name.includes("vulkan") && !name.includes("rocm") && !name.includes("hip")) score += 8;
     return score;
   };
 
   return candidates.sort((a, b) => scoreAsset(b) - scoreAsset(a));
+}
+
+async function extractRuntimeArchive(archivePath, extractDir) {
+  if (process.platform === "win32") {
+    await new Promise((resolve, reject) => {
+      const child = spawn("powershell", [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        `Expand-Archive -LiteralPath '${archivePath.replace(/'/g, "''")}' -DestinationPath '${extractDir.replace(/'/g, "''")}' -Force`,
+      ], { windowsHide: true });
+      let stderr = "";
+      let stdout = "";
+      child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+      child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+      child.on("error", reject);
+      child.on("close", (code) => {
+        if (code === 0) resolve();
+        else reject(new Error(`Rozpakowanie nie powiodlo sie: ${(stderr || stdout || "").trim()}`));
+      });
+    });
+    return;
+  }
+  const lower = archivePath.toLowerCase();
+  if (lower.endsWith(".tar.gz") || lower.endsWith(".tgz")) {
+    const testTar = spawnSync("tar", ["--version"], { windowsHide: true });
+    if (testTar.error) throw new Error("Brak narzędzia 'tar' w systemie.");
+    const result = spawnSync("tar", ["-xzf", archivePath, "-C", extractDir], { windowsHide: true, encoding: "utf8" });
+    if (result.status !== 0) throw new Error(`Rozpakowanie tar.gz nie powiodło się: ${(result.stderr || result.stdout || "").trim()}`);
+    return;
+  }
+  if (lower.endsWith(".zip")) {
+    const testUnzip = spawnSync("unzip", ["-v"], { windowsHide: true });
+    if (testUnzip.error) throw new Error("Brak narzędzia 'unzip' w systemie.");
+    const result = spawnSync("unzip", ["-o", archivePath, "-d", extractDir], { windowsHide: true, encoding: "utf8" });
+    if (result.status !== 0) throw new Error(`Rozpakowanie zip nie powiodło się: ${(result.stderr || result.stdout || "").trim()}`);
+    return;
+  }
+  throw new Error("Nieobsługiwany format archiwum runtime.");
 }
 
 async function installLlamaRuntime() {
@@ -1340,15 +1493,16 @@ async function installLlamaRuntime() {
     return { ok: true, alreadyInstalled: true, serverExe: alreadyInstalled };
   }
 
-  emit("status", { status: "runtime-install", detail: "Sprawdzam najnowsze wydanie llama.cpp dla Windows..." });
+  const target = detectInstallTarget();
+  emit("status", { status: "runtime-install", detail: `Wykryty target runtime: ${target.platform} + ${target.gpuVendor}.` });
+  emit("status", { status: "runtime-install", detail: `Preferencja backendów: ${target.runtimePreference.join(" -> ")}.` });
+  emit("status", { status: "runtime-install", detail: `Sprawdzam najnowsze wydanie llama.cpp dla ${target.platform}...` });
   emit("runtime-install-progress", { phase: "prepare", progress: 5, detail: "Pobieranie metadanych wydania..." });
   const release = await fetchJsonViaHttpsWithRetry("https://api.github.com/repos/ggml-org/llama.cpp/releases/latest", 3);
 
-  // Prefer CPU package for reliability and smaller download size.
-  // GPU-specific runtimes can be added later without blocking first install.
-  const runtimeAssets = rankRuntimeAssets(release?.assets || [], false);
+  const runtimeAssets = rankRuntimeAssets(release?.assets || [], target);
   if (!runtimeAssets.length) {
-    throw new Error("Nie znalazlem binarki llama.cpp dla Windows x64 w najnowszym wydaniu.");
+    throw new Error(`Nie znalazlem binarki llama.cpp dla targetu ${target.platform} (${target.runtimePreference.join(", ")}).`);
   }
 
   const runtimeDir = path.join(BIELIK_HOME, "runtime");
@@ -1364,12 +1518,12 @@ async function installLlamaRuntime() {
     let lastError = null;
     for (let i = 0; i < runtimeAssets.length; i += 1) {
       const asset = runtimeAssets[i];
-      const zipPath = path.join(tempDir, String(asset.name).replace(/[<>:\"\\|?*]/g, "_"));
+      const archivePath = path.join(tempDir, String(asset.name).replace(/[<>:\"\\|?*]/g, "_"));
       try {
         emit("status", { status: "runtime-install", detail: `Wybrany asset: ${asset.name}` });
         emit("status", { status: "runtime-install", detail: `Pobieram runtime: ${asset.name}` });
         emit("runtime-install-progress", { phase: "download", progress: 8, detail: `Pobieranie ${asset.name}` });
-        await downloadFileWithProgress(asset.browser_download_url, zipPath, "Pobieranie runtime llama.cpp", (downloadPct, downloadedBytes, totalBytes) => {
+        await downloadFileWithProgress(asset.browser_download_url, archivePath, "Pobieranie runtime llama.cpp", (downloadPct, downloadedBytes, totalBytes) => {
           if (totalBytes > 0) {
             const bounded = Math.max(0, Math.min(100, Number(downloadPct) || 0));
             const uiPct = 8 + Math.round((bounded / 100) * 72);
@@ -1389,24 +1543,7 @@ async function installLlamaRuntime() {
         emit("runtime-install-progress", { phase: "extract", progress: 84, detail: "Rozpakowywanie archiwum..." });
         await fsp.rm(extractDir, { recursive: true, force: true });
         await fsp.mkdir(extractDir, { recursive: true });
-        await new Promise((resolve, reject) => {
-          const child = spawn("powershell", [
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            `Expand-Archive -LiteralPath '${zipPath.replace(/'/g, "''")}' -DestinationPath '${extractDir.replace(/'/g, "''")}' -Force`,
-          ], { windowsHide: true });
-          let stderr = "";
-          let stdout = "";
-          child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
-          child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
-          child.on("error", reject);
-          child.on("close", (code) => {
-            if (code === 0) resolve();
-            else reject(new Error(`Rozpakowanie nie powiodlo sie: ${(stderr || stdout || "").trim()}`));
-          });
-        });
+        await extractRuntimeArchive(archivePath, extractDir);
 
         emit("runtime-install-progress", { phase: "install", progress: 92, detail: "Kopiowanie runtime..." });
         await fsp.rm(finalDir, { recursive: true, force: true });
@@ -1415,14 +1552,15 @@ async function installLlamaRuntime() {
 
         const serverExe = getRuntimeServerExe();
         if (!serverExe) {
-          throw new Error(`Paczka ${asset.name} nie zawiera llama-server.exe`);
+          const expectedName = process.platform === "win32" ? "llama-server.exe" : "llama-server";
+          throw new Error(`Paczka ${asset.name} nie zawiera ${expectedName}`);
         }
         emit("runtime-install-progress", { phase: "done", progress: 100, detail: "Runtime llama.cpp zainstalowany." });
         emit("status", { status: "runtime-install-complete", detail: "Runtime llama.cpp zainstalowany." });
-        return { ok: true, serverExe, asset: asset.name, tag: release?.tag_name || "latest" };
+        return { ok: true, serverExe, asset: asset.name, tag: release?.tag_name || "latest", target };
       } catch (error) {
         lastError = error;
-        await fsp.rm(zipPath, { force: true }).catch(() => {});
+        await fsp.rm(archivePath, { force: true }).catch(() => {});
         if (i < runtimeAssets.length - 1) {
           emit("status", { status: "runtime-install", detail: `Wybrany asset nieudany (${asset.name}). Probuje kolejny...` });
           continue;
@@ -1543,6 +1681,7 @@ async function launchServerProcess(config, modelPath, port, contextTokens, gpuLa
 
 async function ensureServer(port = DEFAULT_PORT) {
   const config = getModelConfig();
+  const modelSettings = getModelSettingsForId(config?.id || selectedModelId);
   if (!config || config.kind !== "local-gguf") {
     throw new Error("Ten model nie jest lokalnym GGUF. Claude Opus 4.5 wymaga API, nie lokalnego runtime.");
   }
@@ -1572,15 +1711,29 @@ async function ensureServer(port = DEFAULT_PORT) {
     throw new Error(`Model nie jest jeszcze gotowy: ${config.displayName} (${percent}%).`);
   }
 
-  const contextTokens = clampContextTokens(customModelSettings.contextTokens ?? config.contextTokens ?? 8192);
-  const configuredGpuLayers = customModelSettings.gpuLayers ?? config.gpuLayers ?? 99;
-  const gpuLayerAttempts = customModelSettings.gpuLayers != null
+  const contextTokens = clampContextTokens(modelSettings.contextTokens ?? config.contextTokens ?? 8192);
+  const configuredGpuLayers = modelSettings.gpuLayers ?? config.gpuLayers ?? 99;
+  const gpuLayerAttempts = modelSettings.gpuLayers != null
     ? [configuredGpuLayers]
     : [...new Set([configuredGpuLayers, ...(config.gpuLayerFallbacks || [])])];
+  const runtimeConfig = {
+    ...config,
+    threads: modelSettings.threads ?? config.threads,
+    threadsBatch: modelSettings.threadsBatch ?? config.threadsBatch,
+    batchSize: modelSettings.batchSize ?? config.batchSize,
+    ubatchSize: modelSettings.ubatchSize ?? config.ubatchSize,
+    parallel: modelSettings.parallel ?? config.parallel,
+    flashAttention: modelSettings.flashAttention ?? config.flashAttention,
+    cacheTypeK: modelSettings.cacheTypeK ?? config.cacheTypeK,
+    cacheTypeV: modelSettings.cacheTypeV ?? config.cacheTypeV,
+    reasoning: modelSettings.reasoning ?? config.reasoning,
+    reasoningBudget: modelSettings.reasoningBudget ?? config.reasoningBudget,
+    extraServerArgs: Array.isArray(modelSettings.extraServerArgs) ? modelSettings.extraServerArgs : config.extraServerArgs,
+  };
   let lastError = null;
   for (let i = 0; i < gpuLayerAttempts.length; i += 1) {
     try {
-      await launchServerProcess(config, modelPath, port, contextTokens, gpuLayerAttempts[i]);
+      await launchServerProcess(runtimeConfig, modelPath, port, contextTokens, gpuLayerAttempts[i]);
       return;
     } catch (error) {
       lastError = error;
@@ -1676,18 +1829,20 @@ async function callModel(messages, abortSignal, options = {}, step = null) {
   if (abortSignal?.aborted) throw new Error("Przerwano przez uzytkownika.");
   const abortGuard = createModelAbortGuard(abortSignal);
   const reasoning = getReasoningProfile();
-  const temp = customModelSettings.temperature ?? reasoning.temperature;
-  const maxTok = customModelSettings.maxTokens ?? reasoning.maxTokens;
+  const model = getModelConfig();
+  const modelSettings = getModelSettingsForId(model?.id || selectedModelId);
+  const temp = modelSettings.temperature ?? reasoning.temperature;
+  const maxTok = modelSettings.maxTokens ?? reasoning.maxTokens;
   const body = {
-    model: getModelConfig().serverModel,
-    messages,
+    model: model.serverModel,
+    messages: buildModelMessages(messages),
     temperature: temp,
     max_tokens: maxTok,
     stream: true,
   };
-  if (customModelSettings.topP != null) body.top_p = customModelSettings.topP;
-  if (customModelSettings.topK != null) body.top_k = customModelSettings.topK;
-  if (customModelSettings.repeatPenalty != null) body.repeat_penalty = customModelSettings.repeatPenalty;
+  if (modelSettings.topP != null) body.top_p = modelSettings.topP;
+  if (modelSettings.topK != null) body.top_k = modelSettings.topK;
+  if (modelSettings.repeatPenalty != null) body.repeat_penalty = modelSettings.repeatPenalty;
 
   try {
     const res = await fetch(`http://127.0.0.1:${DEFAULT_PORT}/v1/chat/completions`, {
@@ -1820,6 +1975,8 @@ async function callModelWithRecovery(messages, abortSignal, failedModelIds, opti
     return { content, reasoning };
   } catch (error) {
     if (abortSignal?.aborted || !isTransientModelError(error)) throw error;
+    const retryCount = getTransportRetryCount();
+    if (retryCount <= 0) throw error;
     emit("status", { status: "model-error-retry", detail: `Blad polaczenia: ${textPreview(error.message, 120)}. Ponawiam...`, step });
     await sleep(2000);
     const { content, reasoning } = await callModel(messages, abortSignal, options, step);
@@ -2146,12 +2303,13 @@ ${String(raw || "").slice(0, 1600)}`;
 async function getNextActionWithRepair(abortSignal, failedModelIds, step = null) {
   let actionRawReasoning = "";
   let lastError = null;
+  const jsonRepairRetryLimit = getJsonRepairRetryLimit();
   while (true) {
-    for (let attempt = 0; attempt <= MODEL_JSON_RETRY_LIMIT; attempt += 1) {
+    for (let attempt = 0; attempt <= jsonRepairRetryLimit; attempt += 1) {
       if (attempt > 0) {
         emit("status", {
           status: "model-json-retry",
-          detail: `Naprawiam odpowiedz JSON / kontrakt (${attempt}/${MODEL_JSON_RETRY_LIMIT}).`,
+          detail: `Naprawiam odpowiedz JSON / kontrakt (${attempt}/${jsonRepairRetryLimit}).`,
         });
       }
       const { content: raw, reasoning } = await callModelWithRecovery(messages, abortSignal, failedModelIds, {}, step);
@@ -2165,10 +2323,10 @@ async function getNextActionWithRepair(abortSignal, failedModelIds, step = null)
         emit("parse-error", {
           error: error.message || String(error),
           attempt: attempt + 1,
-          maxAttempts: MODEL_JSON_RETRY_LIMIT + 1,
+          maxAttempts: jsonRepairRetryLimit + 1,
           raw: textPreview(raw, 1200),
         });
-        if (attempt >= MODEL_JSON_RETRY_LIMIT) break;
+        if (attempt >= jsonRepairRetryLimit) break;
         messages.push({
           role: "assistant",
           content: JSON.stringify({
@@ -2185,7 +2343,7 @@ async function getNextActionWithRepair(abortSignal, failedModelIds, step = null)
         emit("parse-error", {
           error: validated.error,
           attempt: attempt + 1,
-          maxAttempts: MODEL_JSON_RETRY_LIMIT + 1,
+          maxAttempts: jsonRepairRetryLimit + 1,
           kind: "action-schema",
           raw: textPreview(raw, 1200),
         });
@@ -2193,7 +2351,7 @@ async function getNextActionWithRepair(abortSignal, failedModelIds, step = null)
           status: "action-schema-retry",
           detail: `Kontrakt akcji: ${textPreview(validated.error, 120)}`,
         });
-        if (attempt >= MODEL_JSON_RETRY_LIMIT) break;
+        if (attempt >= jsonRepairRetryLimit) break;
         messages.push({
           role: "assistant",
           content: JSON.stringify({
@@ -2711,6 +2869,8 @@ function truncateFetchBody(text) {
 
 const CHAT_SYSTEM_PROMPT = `Jestes pomocnym asystentem w trybie CZATU (bez narzedzi, bez plikow w workspace, bez formatu JSON).
 Odpowiadaj zwyklym ciaglym tekstem po polsku — zwiezle i rzeczowo.
+Masz natywna funkcje kontekstu internetowego: jesli jest dolaczony blok "Kontekst z internetu", korzystaj z niego jak z faktow pomocniczych.
+Gdy nie ma takiego bloku, nie udawaj ze cos pobrales z internetu.
 Nie wymyslaj wynikow narzedzi ani struktur {"tool":...}. Jesli uzytkownik potrzebuje edycji plikow, skryptow lub sandboxa, napisz krotko zeby wylaczyl tryb „Czat” i uzyl zwyklego agenta.`;
 
 async function executeTool(action) {
@@ -3226,12 +3386,15 @@ function shrinkRetainedMessageForCompaction(msg, maxChars) {
 
 function compactMessages() {
   const tokens = estimateTokens(messages);
-  const contextTokensLimit = clampContextTokens(customModelSettings.contextTokens ?? getModelConfig().contextTokens ?? 8192);
+  const model = getModelConfig();
+  const modelSettings = getModelSettingsForId(model?.id || selectedModelId);
+  const contextTokensLimit = clampContextTokens(modelSettings.contextTokens ?? model?.contextTokens ?? 8192);
+  const maxMessages = getActiveMaxMessages();
   const overTokens = tokens > contextTokensLimit * 0.85;
-  if (messages.length <= MAX_MESSAGES && !overTokens) return;
+  if (messages.length <= maxMessages && !overTokens) return;
 
   const systemMsg = { role: "system", content: createSystemPrompt() };
-  const maxRecentMessages = Math.max(1, MAX_MESSAGES - 2);
+  const maxRecentMessages = Math.max(1, maxMessages - 2);
   const minRecentMessages = Math.min(6, maxRecentMessages);
   const targetTokens = Math.max(MIN_CONTEXT_TOKENS, Math.floor(contextTokensLimit * 0.65));
   const placeholderSummary = { role: "user", content: "[Kompaktowanie kontekstu] Podsumowanie poprzednich krokow." };
@@ -3242,7 +3405,7 @@ function compactMessages() {
     const candidateRecent = [messages[i], ...recentMessages];
     const candidate = [systemMsg, placeholderSummary, ...candidateRecent];
     const underTokenTarget = estimateTokens(candidate) <= targetTokens;
-    const underMessageLimit = candidate.length <= MAX_MESSAGES && candidateRecent.length <= maxRecentMessages;
+    const underMessageLimit = candidate.length <= maxMessages && candidateRecent.length <= maxRecentMessages;
     const keepMinimum = candidateRecent.length <= minRecentMessages;
     if ((underTokenTarget && underMessageLimit) || keepMinimum) {
       recentMessages = candidateRecent;
@@ -3256,7 +3419,7 @@ function compactMessages() {
   let summaryMsg = buildCompactionSummary(oldMessages, contextTokensLimit);
   let nextMessages = [systemMsg, summaryMsg, ...recentMessages];
 
-  while ((nextMessages.length > MAX_MESSAGES || estimateTokens(nextMessages) > targetTokens) && recentMessages.length > minRecentMessages) {
+  while ((nextMessages.length > maxMessages || estimateTokens(nextMessages) > targetTokens) && recentMessages.length > minRecentMessages) {
     oldMessages.push(recentMessages.shift());
     summaryMsg = buildCompactionSummary(oldMessages, contextTokensLimit);
     nextMessages = [systemMsg, summaryMsg, ...recentMessages];
@@ -3325,13 +3488,15 @@ async function runAgent(userText) {
     messages.push({ role: "user", content });
 
     const reasoning = getReasoningProfile();
+    const model = getModelConfig();
+    const modelSettings = getModelSettingsForId(model?.id || selectedModelId);
     const failedModelIds = new Set();
     const actionCounts = new Map();
     const reasoningHistory = [];
-    const effectiveMaxSteps = customModelSettings.maxSteps === 0
+    const effectiveMaxSteps = modelSettings.maxSteps === 0
 
       ? 999999
-      : (customModelSettings.maxSteps ?? reasoning.maxSteps);
+      : (modelSettings.maxSteps ?? reasoning.maxSteps);
     for (let step = 1; step <= effectiveMaxSteps; step += 1) {
       if (signal.aborted) throw new Error("Przerwano przez uzytkownika.");
       compactMessages();
@@ -3428,10 +3593,36 @@ async function runSimpleChat(userText) {
     if (!text) throw new Error("Pusta wiadomosc.");
     emit("run-start", { text, chatMode: true });
     emit("status", { status: "model-thinking", detail: `${getModelConfig().displayName} — tryb czatu` });
+    const isAgentControlMessage = (msg) => {
+      const content = String(msg?.content || "");
+      if (content.startsWith("Wynik narzedzia.")) return true;
+      if (content.startsWith("[Kompaktowanie kontekstu]")) return true;
+      if (msg?.role === "assistant") {
+        try {
+          const parsed = JSON.parse(content);
+          if (parsed && typeof parsed === "object" && ("tool" in parsed || "final" in parsed || "note" in parsed)) {
+            return true;
+          }
+        } catch {
+          return false;
+        }
+      }
+      return false;
+    };
+    const history = messages
+      .filter((msg) => (msg.role === "user" || msg.role === "assistant") && !isAgentControlMessage(msg))
+      .slice(-12)
+      .map((msg) => ({ role: msg.role, content: String(msg.content || "").slice(0, 3000) }));
     const chatMessages = [
       { role: "system", content: CHAT_SYSTEM_PROMPT },
+      ...history,
       { role: "user", content: text },
     ];
+    const webContext = await getLightWebContext(text);
+    if (webContext) {
+      chatMessages.splice(1, 0, { role: "user", content: `Kontekst z internetu:\n${webContext}` });
+      emit("status", { status: "model-thinking", detail: "Czat: dolaczono lekki kontekst internetowy." });
+    }
     const failedModelIds = new Set();
     const rawReply = await callModelWithRecovery(chatMessages, signal, failedModelIds, { plainChat: true });
     const replySource =
@@ -3441,6 +3632,8 @@ async function runSimpleChat(userText) {
           ? rawReply.content
           : rawReply;
     const reply = String(replySource ?? "").trim();
+    messages.push({ role: "user", content: text });
+    messages.push({ role: "assistant", content: reply });
     emit("final", { text: reply, chatMode: true });
     return { ok: true, final: reply };
   } catch (error) {
@@ -3460,6 +3653,7 @@ async function runSimpleChat(userText) {
 
 function getState() {
   const modelConfig = getModelConfig();
+  const modelSettings = getModelSettingsForId(modelConfig?.id || selectedModelId);
   const serverExe = getRuntimeServerExe();
   return {
     bielikHome: BIELIK_HOME,
@@ -3477,8 +3671,9 @@ function getState() {
       message: serverExe ? "" : "Nie znaleziono runtime/llama-server.exe. Zainstaluj runtime llama.cpp w folderze runtime.",
     },
     port: DEFAULT_PORT,
-    customModelSettings,
-    maxMessages: MAX_MESSAGES,
+    customModelSettings: modelSettings,
+    customModelSettingsByModelId,
+    maxMessages: getActiveMaxMessages(),
     accessLevel,
   };
 }
@@ -3506,13 +3701,42 @@ app.whenReady().then(async () => {
   loadChatHistory();
   const settings = loadAppSettings();
   if (settings.accessLevel) accessLevel = settings.accessLevel;
-  if (settings.customModelSettings) {
-    Object.assign(customModelSettings, settings.customModelSettings);
-    if (customModelSettings.contextTokens != null) {
-      customModelSettings.contextTokens = clampContextTokens(customModelSettings.contextTokens);
-    }
+  if (settings.customModelSettingsByModelId && typeof settings.customModelSettingsByModelId === "object") {
+    customModelSettingsByModelId = { ...settings.customModelSettingsByModelId };
   }
-  if (settings.maxMessages) MAX_MESSAGES = clampMaxMessages(settings.maxMessages);
+  // Legacy migration: global customModelSettings + maxMessages -> selectedModelId entry.
+  if (settings.customModelSettings && typeof settings.customModelSettings === "object") {
+    const targetModelId = selectedModelId || loadModelCatalog().defaultModelId;
+    setModelSettingsForId(targetModelId, {
+      ...settings.customModelSettings,
+      maxMessages: settings.maxMessages ?? settings.customModelSettings.maxMessages ?? null,
+    });
+    saveAppSettings();
+  }
+  for (const [modelId, rawSettings] of Object.entries(customModelSettingsByModelId)) {
+    const normalized = { ...DEFAULT_MODEL_SETTINGS, ...(rawSettings || {}) };
+    if (normalized.contextTokens != null) normalized.contextTokens = clampContextTokens(normalized.contextTokens);
+    if (normalized.maxMessages != null) normalized.maxMessages = clampMaxMessages(normalized.maxMessages);
+    customModelSettingsByModelId[modelId] = normalized;
+  }
+  for (const model of loadModelCatalog().models) {
+    if (model.kind !== "local-gguf") continue;
+    if (!getModelFileStatus(model).available) continue;
+    if (customModelSettingsByModelId[model.id]) continue;
+    setModelSettingsForId(model.id, {
+      maxMessages: clampMaxMessages(model.maxMessages ?? 32),
+      contextTokens: clampContextTokens(model.contextTokens ?? 8192),
+      gpuLayers: Number.isFinite(Number(model.gpuLayers)) ? Number(model.gpuLayers) : null,
+      threads: Number.isFinite(Number(model.threads)) ? Number(model.threads) : null,
+      threadsBatch: Number.isFinite(Number(model.threadsBatch)) ? Number(model.threadsBatch) : null,
+      batchSize: Number.isFinite(Number(model.batchSize)) ? Number(model.batchSize) : null,
+      ubatchSize: Number.isFinite(Number(model.ubatchSize)) ? Number(model.ubatchSize) : null,
+      parallel: Number.isFinite(Number(model.parallel)) ? Number(model.parallel) : null,
+      flashAttention: model.flashAttention ?? "on",
+      cacheTypeK: model.cacheTypeK ?? "q8_0",
+      cacheTypeV: model.cacheTypeV ?? "q8_0",
+    });
+  }
   if (workspaceResult.workspaceFallback?.used) saveAppSettings();
   createWindow();
   if (workspaceResult.workspaceFallback?.used) {
@@ -3552,6 +3776,21 @@ ipcMain.handle("app:set-model", async (_event, modelId) => {
   if (!model) throw new Error(`Nieznany model: ${modelId}`);
   if (model.kind !== "local-gguf") throw new Error(`${model.displayName} nie jest lokalnym modelem GGUF.`);
   selectedModelId = modelId;
+  if (!customModelSettingsByModelId[modelId]) {
+    setModelSettingsForId(modelId, {
+      maxMessages: clampMaxMessages(model.maxMessages ?? 32),
+      contextTokens: clampContextTokens(model.contextTokens ?? 8192),
+      gpuLayers: Number.isFinite(Number(model.gpuLayers)) ? Number(model.gpuLayers) : null,
+      threads: Number.isFinite(Number(model.threads)) ? Number(model.threads) : null,
+      threadsBatch: Number.isFinite(Number(model.threadsBatch)) ? Number(model.threadsBatch) : null,
+      batchSize: Number.isFinite(Number(model.batchSize)) ? Number(model.batchSize) : null,
+      ubatchSize: Number.isFinite(Number(model.ubatchSize)) ? Number(model.ubatchSize) : null,
+      parallel: Number.isFinite(Number(model.parallel)) ? Number(model.parallel) : null,
+      flashAttention: model.flashAttention ?? "on",
+      cacheTypeK: model.cacheTypeK ?? "q8_0",
+      cacheTypeV: model.cacheTypeV ?? "q8_0",
+    });
+  }
   saveAppSettings();
   messages = createInitialMessages();
   if (serverOwned) await stopOwnedServer();
@@ -3579,7 +3818,12 @@ ipcMain.handle("agent:kill-server", () => killModelServerResources());
 ipcMain.handle("approval:reply", (_event, approvalId, approved) => {
   ipcMain.emit(`approval:${approvalId}`, _event, approved);
 });
-ipcMain.handle("app:system-info", () => getSystemInfo());
+ipcMain.handle("app:system-info", () => {
+  const startedAt = Date.now();
+  const info = getSystemInfo();
+  logPerf("app:system-info", startedAt);
+  return info;
+});
 ipcMain.handle("app:context-info", () => getContextInfo());
 ipcMain.handle("app:install-runtime", async () => installLlamaRuntime());
 ipcMain.handle("app:set-access-level", (_event, level) => {
@@ -3623,9 +3867,17 @@ ipcMain.handle("app:install-skill", (_event, skillId) => installSkill(String(ski
 ipcMain.handle("app:uninstall-skill", (_event, skillId) => uninstallSkill(String(skillId ?? "")));
 ipcMain.handle("app:install-recommended-skills", () => installRecommendedSkills());
 
-ipcMain.handle("app:list-models", () => {
+ipcMain.handle("app:list-models", async () => {
+  const startedAt = Date.now();
   const catalog = loadModelCatalog();
-  return catalog.models.map((model) => {
+  const { removedModelIds } = await syncCatalogWithModelFiles(catalog);
+  if (removedModelIds.length > 0) {
+    emit("status", {
+      status: "models-synced",
+      detail: `Usunieto z katalogu ${removedModelIds.length} wpisow bez plikow modelu.`,
+    });
+  }
+  const items = catalog.models.map((model) => {
     const status = getModelFileStatus(model);
     const downloadInfo = activeDownloads.get(model.id);
     return {
@@ -3639,6 +3891,8 @@ ipcMain.handle("app:list-models", () => {
       selected: model.id === selectedModelId,
     };
   });
+  logPerf("app:list-models", startedAt);
+  return items;
 });
 
 ipcMain.handle("app:download-model", async (_event, modelId) => {
@@ -3779,6 +4033,20 @@ ipcMain.handle("app:add-custom-model", async (_event, input) => {
 
   catalog.models.push(newModel);
   saveModelCatalog(catalog);
+  setModelSettingsForId(id, {
+    maxMessages: 32,
+    contextTokens: runtimeConfig.contextTokens,
+    gpuLayers: runtimeConfig.gpuLayers,
+    threads: runtimeConfig.threads,
+    threadsBatch: runtimeConfig.threadsBatch,
+    batchSize: runtimeConfig.batchSize,
+    ubatchSize: runtimeConfig.ubatchSize,
+    parallel: runtimeConfig.parallel,
+    flashAttention: runtimeConfig.flashAttention,
+    cacheTypeK: runtimeConfig.cacheTypeK,
+    cacheTypeV: runtimeConfig.cacheTypeV,
+  });
+  saveAppSettings();
   return { ok: true, model: newModel };
 });
 
@@ -4098,40 +4366,106 @@ async function performDownload(url, dest, modelId) {
   });
 }
 
-ipcMain.handle("app:get-model-settings", () => ({
-  ...customModelSettings,
-  maxMessages: MAX_MESSAGES,
-  // Include current effective values for display
-  _effective: {
-    temperature: customModelSettings.temperature ?? getReasoningProfile().temperature,
-    maxTokens: customModelSettings.maxTokens ?? getReasoningProfile().maxTokens,
-    maxSteps: customModelSettings.maxSteps ?? getReasoningProfile().maxSteps,
-    contextTokens: customModelSettings.contextTokens ?? getModelConfig().contextTokens ?? 8192,
-    gpuLayers: customModelSettings.gpuLayers ?? getModelConfig().gpuLayers ?? 99,
-  },
-}));
-ipcMain.handle("app:set-model-settings", async (_event, settings) => {
-  if (settings.temperature !== undefined) customModelSettings.temperature = settings.temperature;
-  if (settings.maxTokens !== undefined) customModelSettings.maxTokens = settings.maxTokens;
-  if (settings.maxSteps !== undefined) customModelSettings.maxSteps = settings.maxSteps;
-  if (settings.topP !== undefined) customModelSettings.topP = settings.topP;
-  if (settings.topK !== undefined) customModelSettings.topK = settings.topK;
-  if (settings.repeatPenalty !== undefined) customModelSettings.repeatPenalty = settings.repeatPenalty;
-  if (settings.contextTokens !== undefined) customModelSettings.contextTokens = clampContextTokens(settings.contextTokens);
-  if (settings.gpuLayers !== undefined) customModelSettings.gpuLayers = settings.gpuLayers;
-  if (settings.maxMessages !== undefined) MAX_MESSAGES = clampMaxMessages(settings.maxMessages);
-  saveAppSettings();
-  // If context/gpu changed, need server restart
-  if (settings.contextTokens !== undefined || settings.gpuLayers !== undefined) {
-    if (serverOwned) {
-      await stopOwnedServer();
-      emit("status", { status: "settings-changed", detail: "Zmieniono ustawienia serwera — restart przy nastepnym zapytaniu." });
-    }
+const MODEL_RUNTIME_WHITELIST = new Set([
+  "temperature", "maxTokens", "maxSteps", "topP", "topK", "repeatPenalty",
+  "contextTokens", "gpuLayers", "maxMessages", "threads", "threadsBatch",
+  "batchSize", "ubatchSize", "parallel", "flashAttention", "cacheTypeK",
+  "cacheTypeV", "reasoning", "reasoningBudget", "extraServerArgs",
+]);
+
+function getEffectiveSettingsForModel(modelId) {
+  const model = loadModelCatalog().models.find((entry) => entry.id === modelId) || getModelConfig();
+  const selected = getModelSettingsForId(model?.id || modelId);
+  return {
+    temperature: selected.temperature ?? getReasoningProfile().temperature,
+    maxTokens: selected.maxTokens ?? getReasoningProfile().maxTokens,
+    maxSteps: selected.maxSteps ?? getReasoningProfile().maxSteps,
+    topP: selected.topP ?? null,
+    topK: selected.topK ?? null,
+    repeatPenalty: selected.repeatPenalty ?? null,
+    contextTokens: selected.contextTokens ?? model?.contextTokens ?? 8192,
+    gpuLayers: selected.gpuLayers ?? model?.gpuLayers ?? 99,
+    maxMessages: selected.maxMessages ?? model?.maxMessages ?? 32,
+    threads: selected.threads ?? model?.threads ?? null,
+    threadsBatch: selected.threadsBatch ?? model?.threadsBatch ?? null,
+    batchSize: selected.batchSize ?? model?.batchSize ?? null,
+    ubatchSize: selected.ubatchSize ?? model?.ubatchSize ?? null,
+    parallel: selected.parallel ?? model?.parallel ?? null,
+    flashAttention: selected.flashAttention ?? model?.flashAttention ?? null,
+    cacheTypeK: selected.cacheTypeK ?? model?.cacheTypeK ?? null,
+    cacheTypeV: selected.cacheTypeV ?? model?.cacheTypeV ?? null,
+    reasoning: selected.reasoning ?? model?.reasoning ?? null,
+    reasoningBudget: selected.reasoningBudget ?? model?.reasoningBudget ?? null,
+    extraServerArgs: selected.extraServerArgs ?? model?.extraServerArgs ?? [],
+  };
+}
+
+function sanitizeSettingsPatch(rawSettings = {}) {
+  const patch = {};
+  for (const [key, value] of Object.entries(rawSettings || {})) {
+    if (!MODEL_RUNTIME_WHITELIST.has(key)) continue;
+    patch[key] = value;
   }
-  return { customModelSettings, maxMessages: MAX_MESSAGES };
+  if (patch.contextTokens != null) patch.contextTokens = clampContextTokens(patch.contextTokens);
+  if (patch.maxMessages != null) patch.maxMessages = clampMaxMessages(patch.maxMessages);
+  return patch;
+}
+
+ipcMain.handle("app:get-model-settings", (_event, modelId) => {
+  const targetModelId = String(modelId || selectedModelId);
+  const model = loadModelCatalog().models.find((entry) => entry.id === targetModelId);
+  if (!model) throw new Error(`Nieznany model: ${targetModelId}`);
+  return {
+    modelId: targetModelId,
+    modelName: model.displayName,
+    ...getModelSettingsForId(targetModelId),
+    _effective: getEffectiveSettingsForModel(targetModelId),
+  };
 });
-ipcMain.handle("app:reset-model-settings", () => {
-  customModelSettings = { temperature: null, maxTokens: null, maxSteps: null, topP: null, topK: null, repeatPenalty: null, contextTokens: null, gpuLayers: null };
+
+ipcMain.handle("app:set-model-settings", async (_event, payload) => {
+  const targetModelId = String(payload?.modelId || selectedModelId);
+  const model = loadModelCatalog().models.find((entry) => entry.id === targetModelId);
+  if (!model) throw new Error(`Nieznany model: ${targetModelId}`);
+  const settings = sanitizeSettingsPatch(payload?.settings || payload || {});
+  setModelSettingsForId(targetModelId, settings);
   saveAppSettings();
-  return { customModelSettings, maxMessages: MAX_MESSAGES };
+  const requiresRestart = ["contextTokens", "gpuLayers", "threads", "threadsBatch", "batchSize", "ubatchSize", "parallel", "flashAttention", "cacheTypeK", "cacheTypeV", "reasoning", "reasoningBudget", "extraServerArgs"]
+    .some((key) => settings[key] !== undefined);
+  if (requiresRestart && serverOwned && targetModelId === selectedModelId) {
+    await stopOwnedServer();
+    emit("status", { status: "settings-changed", detail: "Zmieniono ustawienia modelu — runtime zrestartuje się przy następnym zapytaniu." });
+  }
+  return { ok: true, modelId: targetModelId, settings: getModelSettingsForId(targetModelId) };
+});
+
+ipcMain.handle("app:reset-model-settings", async (_event, modelId) => {
+  const targetModelId = String(modelId || selectedModelId);
+  resetModelSettingsForId(targetModelId);
+  saveAppSettings();
+  if (serverOwned && targetModelId === selectedModelId) await stopOwnedServer();
+  return { ok: true, modelId: targetModelId, settings: getModelSettingsForId(targetModelId) };
+});
+
+ipcMain.handle("app:get-model-raw-config", (_event, modelId) => {
+  const targetModelId = String(modelId || selectedModelId);
+  const settings = getModelSettingsForId(targetModelId);
+  const raw = {};
+  for (const key of MODEL_RUNTIME_WHITELIST) raw[key] = settings[key];
+  return { modelId: targetModelId, rawJson: JSON.stringify(raw, null, 2) };
+});
+
+ipcMain.handle("app:set-model-raw-config", async (_event, payload) => {
+  const targetModelId = String(payload?.modelId || selectedModelId);
+  let parsed;
+  try {
+    parsed = JSON.parse(String(payload?.rawJson || "{}"));
+  } catch {
+    throw new Error("Niepoprawny JSON konfiguracji modelu.");
+  }
+  const patch = sanitizeSettingsPatch(parsed);
+  setModelSettingsForId(targetModelId, patch);
+  saveAppSettings();
+  if (serverOwned && targetModelId === selectedModelId) await stopOwnedServer();
+  return { ok: true, modelId: targetModelId, settings: getModelSettingsForId(targetModelId) };
 });

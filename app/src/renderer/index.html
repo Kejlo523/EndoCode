@@ -135,12 +135,12 @@
             </svg>
             <span id="accessLabel">Sandbox</span>
           </button>
-          <button class="settings-btn" id="settingsBtn" title="Ustawienia modelu">
+          <button class="settings-btn model-config-btn" id="settingsBtn" title="Ustawienia aktywnego modelu">
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-              <circle cx="8" cy="8" r="2" stroke="currentColor" stroke-width="1.3" />
-              <path
-                d="M8 1v2M8 13v2M1 8h2M13 8h2M3.05 3.05l1.41 1.41M11.54 11.54l1.41 1.41M3.05 12.95l1.41-1.41M11.54 4.46l1.41-1.41"
-                stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
+              <path d="M4 2.5h8M4 8h8M4 13.5h8" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+              <circle cx="6" cy="2.5" r="1.8" fill="currentColor"/>
+              <circle cx="10.5" cy="8" r="1.8" fill="currentColor"/>
+              <circle cx="7.5" cy="13.5" r="1.8" fill="currentColor"/>
             </svg>
           </button>
           <button class="settings-btn kill-server-btn" id="killServerBtn" title="Kill switch: zabij proces modelu">
@@ -293,6 +293,7 @@
       </div>
       <div class="models-tabs">
         <button class="model-tab-btn active" id="tabLibrary">Moja Biblioteka</button>
+        <button class="model-tab-btn" id="tabInstalled">Zainstalowane</button>
         <button class="model-tab-btn" id="tabDiscover">Odkrywaj</button>
       </div>
 
@@ -332,6 +333,14 @@
           <div class="models-empty">Kliknij szukaj, aby przeglądać modele GGUF...</div>
         </div>
       </div>
+      <div id="modelsInstalledView" class="hidden">
+        <div class="models-toolbar">
+          <span class="models-status">Tylko modele lokalne z istniejącym plikiem GGUF.</span>
+        </div>
+        <div class="models-list" id="modelsInstalledList">
+          <div class="models-empty">Ładowanie zainstalowanych modeli...</div>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -349,6 +358,7 @@
         <span class="modal-title">Ustawienia modelu</span>
         <button class="modal-close" id="closeSettings">&times;</button>
       </div>
+      <div class="settings-model-name" id="settingsModelName">Aktywny model</div>
       <div class="settings-body" id="settingsBody">
         <!-- Temperature -->
         <div class="setting-row">
@@ -451,6 +461,75 @@
           <div class="setting-control">
             <input type="range" id="set_maxMessages" min="8" max="32768" step="8" value="32">
             <span class="setting-value" id="val_maxMessages">32</span>
+          </div>
+        </div>
+        <div class="setting-row">
+          <div class="setting-info">
+            <label class="setting-name">Threads</label>
+            <div class="setting-desc">Liczba wątków CPU dla runtime.</div>
+          </div>
+          <div class="setting-control">
+            <input type="range" id="set_threads" min="1" max="32" step="1" value="8">
+            <span class="setting-value" id="val_threads">8</span>
+          </div>
+        </div>
+        <div class="setting-row">
+          <div class="setting-info">
+            <label class="setting-name">Threads Batch</label>
+            <div class="setting-desc">Wątki używane przy batch processing.</div>
+          </div>
+          <div class="setting-control">
+            <input type="range" id="set_threadsBatch" min="1" max="40" step="1" value="12">
+            <span class="setting-value" id="val_threadsBatch">12</span>
+          </div>
+        </div>
+        <div class="setting-row">
+          <div class="setting-info">
+            <label class="setting-name">Batch Size</label>
+            <div class="setting-desc">Rozmiar batch tokenów.</div>
+          </div>
+          <div class="setting-control">
+            <input type="range" id="set_batchSize" min="128" max="4096" step="64" value="1024">
+            <span class="setting-value" id="val_batchSize">1024</span>
+          </div>
+        </div>
+        <div class="setting-row">
+          <div class="setting-info">
+            <label class="setting-name">Ubatch Size</label>
+            <div class="setting-desc">Rozmiar micro-batch.</div>
+          </div>
+          <div class="setting-control">
+            <input type="range" id="set_ubatchSize" min="64" max="2048" step="32" value="512">
+            <span class="setting-value" id="val_ubatchSize">512</span>
+          </div>
+        </div>
+        <div class="setting-row">
+          <div class="setting-info">
+            <label class="setting-name">Parallel Slots</label>
+            <div class="setting-desc">Liczba równoległych slotów inferencji.</div>
+          </div>
+          <div class="setting-control">
+            <input type="range" id="set_parallel" min="1" max="8" step="1" value="1">
+            <span class="setting-value" id="val_parallel">1</span>
+          </div>
+        </div>
+        <div class="setting-row">
+          <div class="setting-info">
+            <label class="setting-name">Flash Attention</label>
+            <div class="setting-desc">0 wyłączone, 1 włączone.</div>
+          </div>
+          <div class="setting-control">
+            <input type="range" id="set_flashAttention" min="0" max="1" step="1" value="1">
+            <span class="setting-value" id="val_flashAttention">1</span>
+          </div>
+        </div>
+        <div class="setting-row">
+          <div class="setting-info">
+            <label class="setting-name">Raw JSON config</label>
+            <div class="setting-desc">Zaawansowana edycja runtime settings (whitelist pól).</div>
+          </div>
+          <div class="setting-control">
+            <textarea id="rawModelJson" class="raw-model-json" spellcheck="false"></textarea>
           </div>
         </div>
       </div>
