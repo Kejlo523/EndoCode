@@ -1094,11 +1094,13 @@ async function deriveLookupQueryWithModel(userText, history, abortSignal) {
     {
       role: "system",
       content: [
-        "Jestes parserem zapytan web lookup.",
-        "Zamien wiadomosc uzytkownika na 2-8 slow kluczowych do wyszukiwarki.",
+        "Jestes klasyfikatorem potrzeby web lookup + parserem zapytan.",
+        "Najpierw oceń, czy do odpowiedzi POTRZEBNY jest internet.",
+        "Jesli internet NIE jest potrzebny, zwroc dokladnie: NONE",
+        "Jesli internet jest potrzebny, zwroc zapytanie 2-8 slow kluczowych do wyszukiwarki.",
         "Wyjscie: TYLKO jedna linia tekstu (bez markdown, bez cudzyslowow, bez komentarzy).",
         "Jesli user pyta o konkretna domene, domena musi zostac w zapytaniu.",
-        "Jesli user pisze 'jeszcze raz' i brak kontekstu, zwroc puste.",
+        "Jesli user pisze 'jeszcze raz' i brak kontekstu, zwroc NONE.",
       ].join("\n"),
     },
     ...(recent ? [{ role: "user", content: `Kontekst ostatnich wiadomosci:\n${recent}` }] : []),
@@ -1108,7 +1110,9 @@ async function deriveLookupQueryWithModel(userText, history, abortSignal) {
     const failed = new Set();
     const parsed = await callModelWithRecovery(promptMessages, abortSignal, failed, { plainChat: true, silent: true });
     const raw = String(parsed?.content || "").split(/\r?\n/)[0] || "";
-    const cleaned = normalizeWebQuery(raw.replace(/^["'`]+|["'`]+$/g, ""));
+    const cleanedRaw = normalizeWebQuery(raw.replace(/^["'`]+|["'`]+$/g, ""));
+    if (/^none$/i.test(cleanedRaw)) return "";
+    const cleaned = cleanedRaw;
     if (!cleaned) return "";
     return cleaned.slice(0, 140);
   } catch {
@@ -1172,8 +1176,9 @@ function collectRelatedTopics(topics = [], out = []) {
   return out;
 }
 
-async function getLightWebContext(query, preferredQuery = "") {
+async function getLightWebContext(query, preferredQuery = "", options = {}) {
   const normalized = normalizeWebQuery(query);
+  const strictPreferred = options?.strictPreferred === true;
   if (!shouldUseWebLookup(normalized)) {
     return { context: "", sources: [], visitedUrls: [], fromCache: false, skipped: true, query: normalized };
   }
@@ -1182,7 +1187,10 @@ async function getLightWebContext(query, preferredQuery = "") {
   if (cached && (Date.now() - cached.at) < CHAT_WEB_LOOKUP_CACHE_TTL_MS) {
     return { ...cached.value, fromCache: true };
   }
-  const candidates = buildWebLookupCandidates(normalized, preferredQuery);
+  const preferredNormalized = normalizeWebQuery(preferredQuery);
+  const candidates = strictPreferred && preferredNormalized
+    ? [preferredNormalized]
+    : buildWebLookupCandidates(normalized, preferredQuery);
   const domain = extractDomainCandidate(`${preferredQuery} ${normalized}`);
   const domainUrl = domain ? `https://${domain}` : "";
   if (domainUrl) {
@@ -1297,7 +1305,7 @@ ${lines.join("\n")}`
     fromCache: false,
     skipped: false,
     query: normalized,
-    lookupQuery: normalized,
+    lookupQuery: preferredNormalized || normalized,
     error: "",
   };
   chatWebLookupCache.set(cacheKey, { at: Date.now(), value: fallback });
@@ -3942,19 +3950,34 @@ async function runSimpleChat(userText) {
       { role: "user", content: text },
     ];
     const modelLookupQuery = await deriveLookupQueryWithModel(text, history, signal);
-    emit("chat-web-lookup", {
-      phase: "start",
-      query: text,
-      lookupQuery: modelLookupQuery,
-      detail: "Model interpretuje pytanie i uruchamia web lookup...",
-    });
-    const webLookup = await getLightWebContext(text, modelLookupQuery);
-    if (webLookup?.error) {
+    let webLookup = null;
+    if (modelLookupQuery) {
       emit("chat-web-lookup", {
-        phase: "error",
-        query: webLookup.query || text,
-        lookupUrl: webLookup.lookupUrl || "",
-        detail: webLookup.error,
+        phase: "start",
+        query: text,
+        lookupQuery: modelLookupQuery,
+        detail: "Model zdecydował, że potrzebny jest web lookup.",
+      });
+      webLookup = await getLightWebContext(text, modelLookupQuery, { strictPreferred: true });
+      if (webLookup?.error) {
+        emit("chat-web-lookup", {
+          phase: "error",
+          query: webLookup.query || text,
+          lookupUrl: webLookup.lookupUrl || "",
+          detail: webLookup.error,
+        });
+      }
+    } else {
+      emit("chat-web-lookup", {
+        phase: "result",
+        used: false,
+        fromCache: false,
+        lookupUrl: "",
+        query: text,
+        lookupQuery: "",
+        sources: [],
+        visitedUrls: [],
+        detail: "Model zdecydował, że to pytanie nie wymaga wyszukiwania w internecie.",
       });
     }
     if (webLookup?.context) {
@@ -3981,7 +4004,7 @@ async function runSimpleChat(userText) {
         detail: "Dołączono kontekst internetowy do odpowiedzi.",
       });
       if (webLookup.lookupQuery) lastChatLookupQuery = webLookup.lookupQuery;
-    } else {
+    } else if (modelLookupQuery) {
       emit("chat-web-lookup", {
         phase: "result",
         used: false,
