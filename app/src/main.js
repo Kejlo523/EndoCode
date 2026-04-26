@@ -33,6 +33,8 @@ const CHAT_WEB_PAGE_FETCH_MAX_SOURCES = 8;
 const CHAT_WEB_PAGE_SNIPPET_CHARS = 320;
 const CHAT_WEB_SEARCH_RESULT_LIMIT = 12;
 const CHAT_WEB_HTML_SIGNAL_LIMIT = 10;
+const CHAT_WEB_SOURCE_GOOD_SNIPPET_CHARS = 120;
+const CHAT_WEB_SOURCE_WEAK_SNIPPET_CHARS = 45;
 const CHAT_ATTACHMENT_MAX_BYTES = 6 * 1024 * 1024;
 const CHAT_ATTACHMENT_TEXT_LIMIT = 12000;
 const SAFE_RUNTIME_LIMITS = {
@@ -1686,22 +1688,68 @@ function extractHtmlSignals(html = "") {
 }
 
 async function fetchLivePageInsights(url) {
-  if (!isHttpUrl(url)) return { summary: "", signals: [] };
+  if (!isHttpUrl(url)) {
+    return { summary: "", signals: [], status: 0, ok: false, error: "invalid-url" };
+  }
   try {
     const response = await fetch(url, {
       redirect: "follow",
       headers: { "User-Agent": "EndoCode-Desktop-App" },
       signal: AbortSignal.timeout(CHAT_WEB_PAGE_FETCH_TIMEOUT_MS),
     });
-    if (!response.ok) return { summary: "", signals: [] };
+    if (!response.ok) {
+      return { summary: "", signals: [], status: response.status || 0, ok: false, error: "http-error" };
+    }
     const html = await response.text();
     const visible = stripHtmlToVisibleText(html);
     const summary = compactWebSnippet(visible).slice(0, CHAT_WEB_PAGE_SNIPPET_CHARS);
     const signals = extractHtmlSignals(html);
-    return { summary, signals };
-  } catch {
-    return { summary: "", signals: [] };
+    return { summary, signals, status: response.status || 200, ok: true, error: "" };
+  } catch (error) {
+    return {
+      summary: "",
+      signals: [],
+      status: 0,
+      ok: false,
+      error: compactWebSnippet(error?.message || "fetch-error"),
+    };
   }
+}
+
+function classifyWebSourceQuality(insight = {}) {
+  const summaryLen = String(insight.summary || "").trim().length;
+  const signalCount = Array.isArray(insight.signals) ? insight.signals.length : 0;
+  const isReachable = Boolean(insight.ok) || (Number(insight.status) >= 200 && Number(insight.status) < 400);
+  if (!isReachable) return "niedostepny";
+  if (summaryLen >= CHAT_WEB_SOURCE_GOOD_SNIPPET_CHARS || signalCount >= 2) return "ok";
+  if (summaryLen >= CHAT_WEB_SOURCE_WEAK_SNIPPET_CHARS || signalCount >= 1) return "slaby";
+  return "slaby";
+}
+
+function summarizeWebLookupQuality(sourceDiagnostics = []) {
+  const counts = { ok: 0, slaby: 0, niedostepny: 0 };
+  for (const item of sourceDiagnostics) {
+    const quality = item?.quality;
+    if (quality === "ok" || quality === "slaby" || quality === "niedostepny") counts[quality] += 1;
+  }
+  const total = sourceDiagnostics.length;
+  const usable = counts.ok + counts.slaby;
+  let confidence = "low";
+  if (counts.ok >= 2 || (counts.ok >= 1 && usable >= 2)) confidence = "high";
+  else if (counts.ok >= 1 || counts.slaby >= 2) confidence = "medium";
+  return { confidence, total, usable, counts };
+}
+
+function buildWebConfidenceInstruction(webLookup = null) {
+  const confidence = String(webLookup?.quality?.confidence || "low").toLowerCase();
+  const qualityLine = `Pewnosc zrodel web: ${confidence}.`;
+  if (confidence === "high") {
+    return `${qualityLine} Uzywaj tylko faktow, ktore maja oparcie w zalaczonych snippetach/URL. Nie dopisuj brakujacych cen, opinii ani rankingow.`;
+  }
+  if (confidence === "medium") {
+    return `${qualityLine} Traktuj dane jako czesciowo potwierdzone: podaj tylko informacje wspierane snippetami i wyraznie oddziel to od ogolnych wskazowek.`;
+  }
+  return `${qualityLine} Dane sa slabe lub niepelne: nie podawaj konkretnych liczb, cen, ocen, nazw ofert ani rekomendacji \"najlepsza opcja\" bez doslownego potwierdzenia w snippetach.`;
 }
 
 function decodeDuckDuckGoRedirectUrl(rawHref = "") {
@@ -1789,12 +1837,23 @@ async function getLightWebContext(query, preferredQuery = "", options = {}) {
       const directContext = `Kontekst z internetu (ultra-light, moze byc niepelny):
 - Pipeline: domain-first fetch -> extract visible text + general html digest
 - Zapytanie lookup: ${preferredQuery || normalized}
+- Pewnosc zrodel: ${classifyWebSourceQuality(domainInfo)}
 - [LIVE:DOMAIN] ${domainInfo.summary || "Brak krótkiego streszczenia strony"}
 ${signalLines.join("\n")}`;
+      const sourceDiagnostics = [{
+        url: domainUrl,
+        status: Number(domainInfo.status || 0),
+        quality: classifyWebSourceQuality(domainInfo),
+        summaryChars: String(domainInfo.summary || "").length,
+        signalCount: Array.isArray(domainInfo.signals) ? domainInfo.signals.length : 0,
+      }];
+      const quality = summarizeWebLookupQuality(sourceDiagnostics);
       return {
         context: directContext,
         sources: [{ title: `Strona ${domain}`, url: domainUrl, snippet: domainInfo.summary || domainInfo.signals?.[0] || "" }],
         visitedUrls: [domainUrl],
+        sourceDiagnostics,
+        quality,
         lookupUrl: "",
         fromCache: false,
         skipped: false,
@@ -1852,12 +1911,22 @@ ${signalLines.join("\n")}`;
         candidateUrls = (await searchWebLinks(candidateQuery)).slice(0, CHAT_WEB_PAGE_FETCH_MAX_SOURCES);
       }
       const liveInsights = await Promise.all(candidateUrls.map((url) => fetchLivePageInsights(url)));
+      const sourceDiagnostics = [];
       for (let i = 0; i < candidateUrls.length; i += 1) {
-        const insight = liveInsights[i] || { summary: "", signals: [] };
+        const insight = liveInsights[i] || { summary: "", signals: [], status: 0, ok: false, error: "missing-insight" };
         const snippet = compactWebSnippet(insight.summary || "");
         const signals = Array.isArray(insight.signals) ? insight.signals.slice(0, 3) : [];
+        const quality = classifyWebSourceQuality(insight);
+        sourceDiagnostics.push({
+          url: candidateUrls[i],
+          status: Number(insight.status || 0),
+          quality,
+          summaryChars: snippet.length,
+          signalCount: signals.length,
+          error: insight.error || "",
+        });
         if (!snippet && !signals.length) continue;
-        lines.push(`- [LIVE:${i + 1}] ${snippet || "Brak krótkiego streszczenia."}`);
+        lines.push(`- [LIVE:${i + 1}|${quality}] ${snippet || "Brak krótkiego streszczenia."}`);
         for (const signal of signals) lines.push(`- [HTML:${i + 1}] ${signal}`);
         if (!dedupedSources.some((source) => source.url === candidateUrls[i])) {
           dedupedSources.push({
@@ -1867,6 +1936,8 @@ ${signalLines.join("\n")}`;
           });
         }
       }
+      const quality = summarizeWebLookupQuality(sourceDiagnostics);
+      lines.push(`- [QUALITY] confidence=${quality.confidence}; ok=${quality.counts.ok}; slaby=${quality.counts.slaby}; niedostepny=${quality.counts.niedostepny}`);
 
       const result = {
         context: lines.length
@@ -1877,6 +1948,8 @@ ${lines.join("\n")}`
           : "",
         sources: dedupedSources,
         visitedUrls: candidateUrls,
+        sourceDiagnostics,
+        quality,
         lookupUrl,
         fromCache: false,
         skipped: false,
@@ -1893,6 +1966,8 @@ ${lines.join("\n")}`
         context: "",
         sources: [],
         visitedUrls: [],
+        sourceDiagnostics: [],
+        quality: { confidence: "low", total: 0, usable: 0, counts: { ok: 0, slaby: 0, niedostepny: 0 } },
         lookupUrl,
         fromCache: false,
         skipped: false,
@@ -1906,6 +1981,8 @@ ${lines.join("\n")}`
     context: "",
     sources: [],
     visitedUrls: [],
+    sourceDiagnostics: [],
+    quality: { confidence: "low", total: 0, usable: 0, counts: { ok: 0, slaby: 0, niedostepny: 0 } },
     fromCache: false,
     skipped: false,
     query: normalized,
@@ -1919,6 +1996,7 @@ ${lines.join("\n")}`
 function buildWebLookupFallbackSummary(webLookup, userQuery = "") {
   const sources = Array.isArray(webLookup?.sources) ? webLookup.sources : [];
   const visitedUrls = Array.isArray(webLookup?.visitedUrls) ? webLookup.visitedUrls : [];
+  const quality = webLookup?.quality || { confidence: "low", counts: { ok: 0, slaby: 0, niedostepny: 0 } };
   const lines = [];
   for (const source of sources.slice(0, 6)) {
     const title = compactWebSnippet(source?.title || "Zrodlo");
@@ -1934,12 +2012,14 @@ function buildWebLookupFallbackSummary(webLookup, userQuery = "") {
   if (!lines.length && !uniqueUrls.length) return "";
   return `Wstepne wyniki z internetu dla zapytania "${compactWebSnippet(userQuery || webLookup?.query || "", 180)}":
 
+Ocena jakosci zrodel: confidence=${quality.confidence}; ok=${quality?.counts?.ok || 0}; slaby=${quality?.counts?.slaby || 0}; niedostepny=${quality?.counts?.niedostepny || 0}
+
 ${lines.length ? lines.join("\n") : "- Brak snippetow; znaleziono tylko URL-e."}
 
 URL-e do sprawdzenia:
 ${uniqueUrls.length ? uniqueUrls.map((url) => `- ${url}`).join("\n") : "- Brak URL-i"}
 
-Podsumuj to, co da sie potwierdzic z powyzszych danych. Jesli dane sa niepelne, napisz wprost czego brakuje, ale nadal podaj to co znaleziono.`;
+Podsumuj to, co da sie potwierdzic z powyzszych danych. Nie wymyslaj cen, opinii i rankingow bez doslownego pokrycia w snippetach. Jesli dane sa niepelne, napisz wprost czego brakuje, ale nadal podaj to co znaleziono.`;
 }
 
 function fetchJsonViaHttps(url, timeoutMs = 45000) {
@@ -4013,6 +4093,8 @@ Ten blok moze zawierac pipeline: lookup + fetch live page + extract visible text
 Nie pisz, ze "nie masz internetu" lub "nie mozesz sprawdzic online", bo tryb czatu moze dolaczyc internetowy kontekst automatycznie.
 Gdy takiego bloku nie ma, odpowiedz z wiedzy wlasnej i w razie potrzeby zaznacz brak swiezych danych z internetu.
 ZASADA ANTYHALUCYNACJI: nie wymyslaj danych firm, kontaktow, adresow, cen, ofert, numerow telefonu ani emaili. Gdy dane sa niepelne, podaj najlepsze dostepne informacje z kontekstu internetowego i jasno zaznacz ograniczenia zamiast odmawiac odpowiedzi.
+Jesli dostajesz informacje o pewnosci zrodel (Pewnosc zrodel web: high|medium|low), dostosuj poziom stanowczosci odpowiedzi: low = tylko ostrozne wnioski bez konkretnych liczb i rankingow; medium = fakty potwierdzone + ostrozne dopowiedzenia; high = fakty potwierdzone snippetami.
+Gdy uzytkownik pyta o oferty/ceny/porownania i dane sa niepelne, zakoncz odpowiedz sekcjami: "Co potwierdzono:" oraz "Czego nie potwierdzono:".
 Jesli podajesz fakty z bloku internetowego, dodaj na koncu sekcje "Zrodla:" i wypisz URL-e z ktorych pochodza dane.
 Nigdy nie pisz fikcyjnych zrodel typu "[zrodlo internetowe]" ani "brak zapisanego zrodla".
 Nie wymyslaj wynikow narzedzi ani struktur {"tool":...}. Jesli uzytkownik potrzebuje edycji plikow, skryptow lub sandboxa, napisz krotko zeby wylaczyl tryb „Czat” i uzyl zwyklego agenta.`;
@@ -4919,16 +5001,17 @@ async function runSimpleChat(userText) {
     }
     if (webLookup?.context) {
       chatMessages.splice(1, 0, { role: "user", content: `Kontekst z internetu:\n${webLookup.context}` });
+      chatMessages.splice(2, 0, { role: "user", content: buildWebConfidenceInstruction(webLookup) });
       emit("status", { status: "model-thinking", detail: "Czat: dolaczono lekki kontekst internetowy." });
       const sourceUrls = Array.isArray(webLookup.sources)
         ? webLookup.sources.map((source) => String(source?.url || "").trim()).filter(Boolean).slice(0, 6)
         : [];
       if (sourceUrls.length) {
-        chatMessages.splice(2, 0, {
+        chatMessages.splice(3, 0, {
           role: "user",
           content: `Zweryfikowane zrodla URL (uzyj tylko ich, nie wymyslaj nowych):\n${sourceUrls.map((url) => `- ${url}`).join("\n")}`,
         });
-        chatMessages.splice(3, 0, {
+        chatMessages.splice(4, 0, {
           role: "user",
           content: "W tej odpowiedzi wolno cytowac tylko powyzsze URL-e z biezacej tury. Ignoruj jakiekolwiek starsze zrodla z historii.",
         });
@@ -4942,6 +5025,8 @@ async function runSimpleChat(userText) {
         lookupQuery: webLookup.lookupQuery || modelLookupQuery || "",
         sources: Array.isArray(webLookup.sources) ? webLookup.sources.slice(0, 5) : [],
         visitedUrls: Array.isArray(webLookup.visitedUrls) ? webLookup.visitedUrls.slice(0, 5) : [],
+        quality: webLookup.quality || null,
+        sourceDiagnostics: Array.isArray(webLookup.sourceDiagnostics) ? webLookup.sourceDiagnostics.slice(0, 8) : [],
         detail: "Dołączono kontekst internetowy do odpowiedzi.",
       });
       if (webLookup.lookupQuery) lastChatLookupQuery = webLookup.lookupQuery;
@@ -4955,9 +5040,15 @@ async function runSimpleChat(userText) {
         lookupQuery: webLookup?.lookupQuery || modelLookupQuery || "",
         sources: Array.isArray(webLookup?.sources) ? webLookup.sources.slice(0, 5) : [],
         visitedUrls: Array.isArray(webLookup?.visitedUrls) ? webLookup.visitedUrls.slice(0, 5) : [],
+        quality: webLookup?.quality || null,
+        sourceDiagnostics: Array.isArray(webLookup?.sourceDiagnostics) ? webLookup.sourceDiagnostics.slice(0, 8) : [],
         detail: webLookup?.skipped ? "Pominięto web lookup dla krótkiego/nieadekwatnego zapytania." : "Brak trafnego kontekstu internetowego.",
       });
       const fallbackSummaryPrompt = buildWebLookupFallbackSummary(webLookup, text);
+      chatMessages.splice(1, 0, {
+        role: "user",
+        content: buildWebConfidenceInstruction(webLookup || { quality: { confidence: "low" } }),
+      });
       chatMessages.splice(1, 0, {
         role: "user",
         content: fallbackSummaryPrompt || "Web lookup nie zwrocil pelnego kontekstu. Podaj uczciwie, co udalo sie ustalic i czego nie da sie jeszcze potwierdzic.",
@@ -5000,11 +5091,12 @@ async function runSimpleChat(userText) {
         const forcedLookup = await getLightWebContext(text, forcedQuery, { strictPreferred: true });
         if (forcedLookup?.context) {
           chatMessages.splice(1, 0, { role: "user", content: `Kontekst z internetu:\n${forcedLookup.context}` });
+          chatMessages.splice(2, 0, { role: "user", content: buildWebConfidenceInstruction(forcedLookup) });
           const src = Array.isArray(forcedLookup.sources)
             ? forcedLookup.sources.map((source) => String(source?.url || "").trim()).filter(Boolean).slice(0, 6)
             : [];
           if (src.length) {
-            chatMessages.splice(2, 0, {
+            chatMessages.splice(3, 0, {
               role: "user",
               content: `Zweryfikowane zrodla URL (uzyj tylko ich, nie wymyslaj nowych):\n${src.map((url) => `- ${url}`).join("\n")}`,
             });
@@ -5018,6 +5110,8 @@ async function runSimpleChat(userText) {
             lookupQuery: forcedLookup.lookupQuery || forcedQuery,
             sources: Array.isArray(forcedLookup.sources) ? forcedLookup.sources.slice(0, 5) : [],
             visitedUrls: Array.isArray(forcedLookup.visitedUrls) ? forcedLookup.visitedUrls.slice(0, 5) : [],
+            quality: forcedLookup.quality || null,
+            sourceDiagnostics: Array.isArray(forcedLookup.sourceDiagnostics) ? forcedLookup.sourceDiagnostics.slice(0, 8) : [],
             detail: "Auto-web: dołączono kontekst internetowy i ponawiam odpowiedź.",
           });
           const second = await callModelWithRecovery(chatMessages, signal, failedModelIds, { plainChat: true });
@@ -5038,6 +5132,8 @@ async function runSimpleChat(userText) {
             lookupQuery: forcedLookup?.lookupQuery || forcedQuery,
             sources: Array.isArray(forcedLookup?.sources) ? forcedLookup.sources.slice(0, 5) : [],
             visitedUrls: Array.isArray(forcedLookup?.visitedUrls) ? forcedLookup.visitedUrls.slice(0, 5) : [],
+            quality: forcedLookup?.quality || null,
+            sourceDiagnostics: Array.isArray(forcedLookup?.sourceDiagnostics) ? forcedLookup.sourceDiagnostics.slice(0, 8) : [],
             detail: "Auto-web: brak trafnych danych przy ponownej próbie lookup.",
           });
         }
