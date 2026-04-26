@@ -1786,6 +1786,32 @@ ${lines.join("\n")}`
   return fallback;
 }
 
+function buildWebLookupFallbackSummary(webLookup, userQuery = "") {
+  const sources = Array.isArray(webLookup?.sources) ? webLookup.sources : [];
+  const visitedUrls = Array.isArray(webLookup?.visitedUrls) ? webLookup.visitedUrls : [];
+  const lines = [];
+  for (const source of sources.slice(0, 6)) {
+    const title = compactWebSnippet(source?.title || "Zrodlo");
+    const snippet = compactWebSnippet(source?.snippet || "");
+    const url = String(source?.url || "").trim();
+    if (!title && !snippet && !url) continue;
+    lines.push(`- ${title || "Zrodlo"}${snippet ? `: ${snippet}` : ""}${url ? `\n  URL: ${url}` : ""}`);
+  }
+  const uniqueUrls = [...new Set([
+    ...sources.map((s) => String(s?.url || "").trim()),
+    ...visitedUrls.map((u) => String(u || "").trim()),
+  ].filter((url) => isHttpUrl(url)))].slice(0, 8);
+  if (!lines.length && !uniqueUrls.length) return "";
+  return `Wstepne wyniki z internetu dla zapytania "${compactWebSnippet(userQuery || webLookup?.query || "", 180)}":
+
+${lines.length ? lines.join("\n") : "- Brak snippetow; znaleziono tylko URL-e."}
+
+URL-e do sprawdzenia:
+${uniqueUrls.length ? uniqueUrls.map((url) => `- ${url}`).join("\n") : "- Brak URL-i"}
+
+Podsumuj to, co da sie potwierdzic z powyzszych danych. Jesli dane sa niepelne, napisz wprost czego brakuje, ale nadal podaj to co znaleziono.`;
+}
+
 function fetchJsonViaHttps(url, timeoutMs = 45000) {
   return new Promise((resolve, reject) => {
     const request = https.get(url, {
@@ -4646,12 +4672,21 @@ async function runSimpleChat(userText) {
         visitedUrls: Array.isArray(webLookup?.visitedUrls) ? webLookup.visitedUrls.slice(0, 5) : [],
         detail: webLookup?.skipped ? "Pominięto web lookup dla krótkiego/nieadekwatnego zapytania." : "Brak trafnego kontekstu internetowego.",
       });
+      const fallbackSummaryPrompt = buildWebLookupFallbackSummary(webLookup, text);
       chatMessages.splice(1, 0, {
         role: "user",
-        content: "Web lookup nie zwrocil zweryfikowanych danych. Nie podawaj sekcji Zrodla ani twierdzen, ze cos znaleziono w sieci.",
+        content: fallbackSummaryPrompt || "Web lookup nie zwrocil pelnego kontekstu. Podaj uczciwie, co udalo sie ustalic i czego nie da sie jeszcze potwierdzic.",
       });
     }
     if (!webLookup?.context && looksLikeWebsiteFactQuestion(text)) {
+      const fallbackSummaryPrompt = buildWebLookupFallbackSummary(webLookup, text);
+      if (fallbackSummaryPrompt) {
+        const fallbackReply = `Znalazlem czesciowe dane z sieci i wypisuje je ponizej.\n\n${fallbackSummaryPrompt}`;
+        messages.push({ role: "user", content: text });
+        messages.push({ role: "assistant", content: fallbackReply });
+        emit("final", { text: fallbackReply, chatMode: true });
+        return { ok: true, final: fallbackReply, guarded: false };
+      }
       const guardedReply = "Brak zweryfikowanych danych z sieci dla tego zapytania. Nie mogę rzetelnie podać oferty/kontaktu bez trafnego wyniku web lookup. Podaj proszę dokładny URL lub krótsze zapytanie, a sprawdzę ponownie.";
       messages.push({ role: "user", content: text });
       messages.push({ role: "assistant", content: guardedReply });
@@ -4659,6 +4694,14 @@ async function runSimpleChat(userText) {
       return { ok: true, final: guardedReply, guarded: true };
     }
     if (!webLookup?.context && looksLikeFreshFactQuestion(text)) {
+      const fallbackSummaryPrompt = buildWebLookupFallbackSummary(webLookup, text);
+      if (fallbackSummaryPrompt) {
+        const fallbackReply = `Nie mam pelnego potwierdzenia faktow, ale to udalo sie realnie znalezc:\n\n${fallbackSummaryPrompt}`;
+        messages.push({ role: "user", content: text });
+        messages.push({ role: "assistant", content: fallbackReply });
+        emit("final", { text: fallbackReply, chatMode: true });
+        return { ok: true, final: fallbackReply, guarded: false };
+      }
       const guardedReply = "Brak zweryfikowanych danych z sieci dla tego pytania (aktualny stan na datę). Nie podam faktów bez źródeł. Podaj proszę dokładniejszy zakres lub URL, a spróbuję ponownie.";
       messages.push({ role: "user", content: text });
       messages.push({ role: "assistant", content: guardedReply });
