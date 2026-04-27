@@ -209,10 +209,6 @@
                 </svg>
                 Sandbox
               </span>
-              <label class="chat-mode-label" title="Jedna odpowiedź tekstowa bez narzędzi (szybsze pytania). Wyłącz przy pracy z plikami.">
-                <input type="checkbox" id="chatModeToggle">
-                Czat
-              </label>
             </div>
             <div class="composer-buttons">
               <input type="file" id="fileInput" class="hidden" style="display:none;">
@@ -301,6 +297,9 @@
         <button class="model-tab-btn" id="tabDiscover">Odkrywaj</button>
         <button class="model-tab-btn" id="tabManual">Dodaj ręcznie</button>
       </div>
+      <div class="models-status" style="margin-bottom:10px;">
+        W kartach modeli najpierw patrz na: <strong>Typ</strong>, <strong>Rozmiar pliku</strong> i <strong>Kontekst</strong> — to najszybciej pokazuje, czy model pasuje do Twojego sprzętu.
+      </div>
 
       <div id="modelsLibraryView">
         <div class="models-toolbar">
@@ -325,7 +324,7 @@
               <option value="github">GitHub / direct</option>
             </select>
             <input type="text" id="hfSearchInput" placeholder="Szukaj modeli albo wklej link/repo .gguf..." />
-            <button class="modal-btn" id="hfSearchBtn">Szukaj</button>
+            <button class="modal-btn" id="hfSearchBtn">Odśwież</button>
           </div>
           <div class="models-filters">
              <button class="filter-btn active" data-filter="all">Wszystkie</button>
@@ -335,7 +334,11 @@
           </div>
         </div>
         <div class="discovery-list" id="discoveryList">
-          <div class="models-empty">Kliknij szukaj, aby przeglądać modele GGUF...</div>
+          <div class="models-empty">Ładuję listę modeli z sieci...</div>
+        </div>
+        <div class="discovery-footer" id="discoveryFooter">
+          <span class="models-status" id="discoveryStatus">Gotowe</span>
+          <div id="discoverySentinel" class="discovery-sentinel" aria-hidden="true"></div>
         </div>
       </div>
       <div id="modelsInstalledView" class="hidden">
@@ -572,6 +575,8 @@
   <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <script src="./modules/skills-module.js"></script>
+  <script src="./modules/models-module.js"></script>
 
   <script src="./renderer.js"></script>
 

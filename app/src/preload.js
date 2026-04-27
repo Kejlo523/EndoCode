@@ -25,6 +25,7 @@ contextBridge.exposeInMainWorld("endocode", {
   uninstallSkill: (skillId) => ipcRenderer.invoke("app:uninstall-skill", skillId),
   installRecommendedSkills: () => ipcRenderer.invoke("app:install-recommended-skills"),
   getModelSettings: (modelId) => ipcRenderer.invoke("app:get-model-settings", modelId),
+  getModelRecommendedSettings: (modelId) => ipcRenderer.invoke("app:get-model-recommended-settings", modelId),
   setModelSettings: (payload) => ipcRenderer.invoke("app:set-model-settings", payload),
   resetModelSettings: (modelId) => ipcRenderer.invoke("app:reset-model-settings", modelId),
   getModelRawConfig: (modelId) => ipcRenderer.invoke("app:get-model-raw-config", modelId),

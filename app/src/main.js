@@ -8,9 +8,28 @@ const os = require("node:os");
 const { pipeline } = require("node:stream/promises");
 const { Readable } = require("node:stream");
 const https = require("node:https");
-const { jsonrepair } = require("jsonrepair");
 const JSZip = require("jszip");
 const { createTelemetryMonitor } = require("./main/telemetry");
+const { createRuntimeManifestStore } = require("./main/runtime-core/runtime-manifest");
+const {
+  detectInstallTarget: detectInstallTargetByPolicy,
+  rankRuntimeAssets: rankRuntimeAssetsByPolicy,
+  inferBackendFromAssetName,
+  inferBackendFromLogs,
+} = require("./main/runtime-core/backend-policy");
+const { createBaselineMetrics } = require("./main/telemetry/baseline-metrics");
+const { createInstructionPolicyEngine } = require("./main/prompt/instruction-policy");
+const {
+  ALLOWED_TOOLS,
+  allowedToolNamesList,
+  buildToolsPromptBlock,
+} = require("./main/agent/command-contract");
+const { createRuntimeEngine } = require("./main/runtime-core/runtime-engine");
+const { createSessionMemory } = require("./main/agent/session-memory");
+const { createAgentPlanner } = require("./main/agent/agent-planner");
+const { createToolExecutor } = require("./main/agent/tool-executor");
+const { createTurnOrchestrator } = require("./main/agent/turn-orchestrator");
+const { registerAgentIpcHandlers } = require("./main/agent/ipc-compat");
 
 const DEFAULT_PORT = 8088;
 const MAX_FILE_BYTES = 220000;
@@ -25,10 +44,12 @@ const SERVER_START_TIMEOUT_MAX_MS = 15 * 60 * 1000;
 const PLAIN_CHAT_MAX_CHARS = 18000;
 const PLAIN_CHAT_REPEAT_CHUNK_LIMIT = 40;
 const SERVER_SHUTDOWN_TIMEOUT_MS = 6000;
-const CHAT_WEB_LOOKUP_TIMEOUT_MS = 2500;
+const CHAT_WEB_LOOKUP_TIMEOUT_MS = 3000;
+const CHAT_WEB_LOOKUP_RETRY_TIMEOUT_MS = 6000;
 const CHAT_WEB_LOOKUP_CACHE_TTL_MS = 5 * 60 * 1000;
 const CHAT_WEB_LOOKUP_MAX_ITEMS = 6;
-const CHAT_WEB_PAGE_FETCH_TIMEOUT_MS = 2200;
+const CHAT_WEB_PAGE_FETCH_TIMEOUT_MS = 2500;
+const CHAT_WEB_PAGE_FETCH_RETRY_TIMEOUT_MS = 5000;
 const CHAT_WEB_PAGE_FETCH_MAX_SOURCES = 8;
 const CHAT_WEB_PAGE_SNIPPET_CHARS = 320;
 const CHAT_WEB_SEARCH_RESULT_LIMIT = 12;
@@ -146,28 +167,7 @@ function clampMaxMessages(value, limits = getTokenRuntimeLimits()) {
   return Math.min(maxMessages, Math.max(8, Math.round(n)));
 }
 
-/** Zgodne z gałęziami w executeTool — nie zmieniaj nazw bez aktualizacji obu miejsc. */
-const ALLOWED_TOOLS = new Set([
-  "pwd",
-  "cd",
-  "ls",
-  "read_file",
-  "write_file",
-  "mkdir",
-  "replace_text",
-  "create_pdf",
-  "create_pptx",
-  "create_docx",
-  "run_powershell",
-  "fetch_url",
-  "extract_media",
-  "download_file",
-  "analyze_image",
-]);
-
-function allowedToolNamesList() {
-  return [...ALLOWED_TOOLS].sort().join(", ");
-}
+const TOOLS_PROMPT_BLOCK = buildToolsPromptBlock();
 
 const REASONING_LEVELS = {
   low: {
@@ -203,29 +203,16 @@ const REASONING_LEVELS = {
 const CORE_SYSTEM_PROMPT = `Jestes EndoCode: lokalnym agentem kodujacym i produkcyjnym.
 Pracujesz na lokalnych modelach, lokalnych plikach i jawnych narzedziach. UI pokazuje uzytkownikowi Twoje kroki.
 
-FORMAT ODPOWIEDZI:
-- Odpowiadaj wylacznie jednym poprawnym obiektem JSON.
-- Kazdy krok to dokladnie jedna akcja: albo {"tool":"...","args":{...}}, albo {"final":"..."}.
-- Mozesz dodac "note", ale to publiczna, krotka informacja dla UI. Nie ujawniaj ukrytego toku rozumowania.
-- Nie zwracaj tablic, Markdownu ani tekstu poza JSON.
-- W stringach JSON nie uzywaj surowych nowych linii; uzyj \\n. W sciezkach uzywaj /.
+AUTONOMIA:
+- Dzialaj autonomicznie: sam zdecyduj czy potrzebny jest tool czy final.
+- Preferuj naturalna odpowiedz po polsku. Jesli chcesz uruchomic narzedzie, najlepiej podaj:
+  TOOL: <nazwa_narzedzia>
+  ARGS: <JSON obiektu>
+- Dopuszczalna jest tez odpowiedz JSON legacy {"tool":"...","args":{...}} albo {"final":"..."}.
+- Gdy odpowiedz ma byc finalna, podaj jasny final dla uzytkownika.
 
 DOSTEPNE NARZEDZIA:
-- pwd {}
-- cd {"path":"folder"}
-- ls {"path":".","maxEntries":100}
-- read_file {"path":"plik","maxBytes":30000}
-- write_file {"path":"plik","content":"...","mode":"overwrite albo append"}
-- mkdir {"path":"folder"}
-- replace_text {"path":"plik","old":"tekst","new":"tekst","count":1}
-- create_pdf {"path":"raport.pdf","title":"Tytul","markdown":"# Tresc"} albo {"path":"raport.pdf","title":"Tytul","html":"<h1>Tresc</h1>"}
-- create_pptx {"path":"prez.pptx","title":"Tytul","markdown":"## Slajd 1\\n- punkt\\n## Slajd 2"}
-- create_docx {"path":"dok.docx","title":"Tytul","markdown":"# Naglowek\\nAkapit"}
-- run_powershell {"command":"npm test","timeout":60}
-- fetch_url {"url":"https://example.com","timeout":15,"raw":false}
-- extract_media {"url":"https://example.com","timeout":15}
-- download_file {"url":"https://example.com/file.zip","path":"plik.zip"}
-- analyze_image {"path":"plik.jpg"}
+${TOOLS_PROMPT_BLOCK}
 
 PODSTAWOWY LOOP:
 1. Zrozum zadanie i sprawdz obecny folder.
@@ -248,6 +235,8 @@ ZASADY NARZEDZI I SIECI:
 - Nie powtarzaj identycznego nieudanego wywolania narzedzia. Po drugim podobnym bledzie zmien taktyke.
 - Fetch nie renderuje JavaScriptu. Preferuj API JSON/CSV/XML lub stabilne zrodla.
 - Pobieraj i zapisuj duze odpowiedzi jako pliki, nie wklejaj ich w JSON.
+- Decyduj samodzielnie: gdy odpowiedz wymaga realnej weryfikacji, uzyj narzedzi zamiast zgadywac.
+- Gdy korzystasz z internetu, final ma zawierac sekcje "Źródła:" z URL-ami faktycznie uzytymi do odpowiedzi.
 
 ARTEFAKTY:
 - Dokumenty, PDF, PPTX, arkusze i obrazy tworz lokalnie.
@@ -257,7 +246,7 @@ ARTEFAKTY:
 ODZYSK PO PROBLEMACH:
 - Brak narzedzia/dependency: sprawdz PATH albo lokalne skrypty; zaproponuj lub wykonaj lokalna instalacje tylko gdy to uzasadnione.
 - Brak uprawnien: zapisz w bezpiecznym folderze workspace i powiedz dlaczego.
-- Model zwrocil blad JSON: napraw tylko JSON kontraktu, nie zmieniaj celu zadania.
+- Model zwrocil blad formatu akcji: popraw tylko format kontraktu (NOTE/FINAL/TOOL/ARGS), nie zmieniaj celu zadania.
 - Jesli nie da sie kontynuowac, final musi podac konkretna przyczyne i najblizszy mozliwy nastepny krok.`;
 
 const AGENT_GUIDANCE_MAX_CHARS = 18000;
@@ -349,12 +338,24 @@ let serverOwned = false;
 let runningModelId = null;
 let runInProgress = false;
 let runAbortController = null;
+let runtimeEngine = null;
+let agentCore = null;
 let lastChatLookupQuery = "";
 let accessLevel = "sandbox"; // "sandbox" or "full"
 let chatHistory = [];
 let currentChatId = null;
 const VISION_PORT = 11435;
 const telemetryMonitor = createTelemetryMonitor();
+const baselineMetrics = createBaselineMetrics();
+let runtimeManifestStore = null;
+let runtimeBackendStatus = {
+  expectedBackend: "unknown",
+  activeBackend: "unknown",
+  validation: "unknown",
+  detail: "",
+  lastCheckedAt: "",
+};
+let instructionPolicyMeta = { loadedFiles: [], omittedFiles: [], sizeChars: 0, hash: "" };
 
 let activeDownloads = new Map();
 const DEFAULT_MODEL_SETTINGS = {
@@ -603,9 +604,9 @@ function pathExists(p) {
   }
 }
 
-function findBielikHome() {
+function findEndocodeHome() {
   const starts = [
-    process.env.BIELIK_HOME,
+    process.env.ENDOCODE_HOME,
     process.cwd(),
     app.isPackaged ? path.dirname(process.execPath) : null,
     __dirname,
@@ -627,9 +628,10 @@ function findBielikHome() {
   return path.resolve(__dirname, "..", "..");
 }
 
-const BIELIK_HOME = findBielikHome();
-const bootSettings = readJsonFile(path.join(BIELIK_HOME, "config", "endocode-state.json"), {});
-let workspaceRoot = path.resolve(bootSettings.workspaceRoot || path.join(BIELIK_HOME, "workspace"));
+const ENDOCODE_HOME = findEndocodeHome();
+runtimeManifestStore = createRuntimeManifestStore({ appHome: ENDOCODE_HOME });
+const bootSettings = readJsonFile(path.join(ENDOCODE_HOME, "config", "endocode-state.json"), {});
+let workspaceRoot = path.resolve(bootSettings.workspaceRoot || path.join(ENDOCODE_HOME, "workspace"));
 let cwd = workspaceRoot;
 
 function readJsonFile(filePath, fallback) {
@@ -677,7 +679,7 @@ function loadModelCatalog() {
       },
     ],
   };
-  const catalog = readJsonFile(path.join(BIELIK_HOME, "config", "models.json"), fallback);
+  const catalog = readJsonFile(path.join(ENDOCODE_HOME, "config", "models.json"), fallback);
   if (!Array.isArray(catalog.models)) catalog.models = [];
   for (const preset of loadModelPresets()) {
     if (!catalog.models.some((model) => model.id === preset.id)) {
@@ -693,7 +695,7 @@ function loadModelCatalog() {
 }
 
 function loadModelPresets() {
-  const data = readJsonFile(path.join(BIELIK_HOME, "config", "model-presets.json"), { models: [] });
+  const data = readJsonFile(path.join(ENDOCODE_HOME, "config", "model-presets.json"), { models: [] });
   if (!Array.isArray(data.models)) return [];
   return data.models
     .filter((preset) => preset && typeof preset === "object")
@@ -705,6 +707,8 @@ function applyRuntimeSafetyGuards(rawConfig = {}, modelMeta = {}) {
   const profile = getCachedModelProfile();
   const sizeGB = Number(modelMeta.expectedBytes || 0) / 1073741824;
   const category = String(modelMeta.category || rawConfig.category || "").toLowerCase();
+  const gpuAccelerated = String(profile?.gpuBackendClass || "cpu-only") !== "cpu-only";
+  const threadProfile = getRuntimeThreadProfile(profile, category);
 
   const config = { ...rawConfig };
   config.contextTokens = clampContextTokens(clampInt(
@@ -713,35 +717,39 @@ function applyRuntimeSafetyGuards(rawConfig = {}, modelMeta = {}) {
     SAFE_RUNTIME_LIMITS.contextMax,
     8192,
   ));
-  if (category !== "small" || sizeGB >= 6) config.contextTokens = Math.min(config.contextTokens, 16384);
+  if (category !== "small" || sizeGB >= 6) config.contextTokens = Math.min(config.contextTokens, 12288);
   if (sizeGB >= 10 || category === "large") config.contextTokens = Math.min(config.contextTokens, 8192);
-  if (Number(profile?.ramGB || 0) > 0 && Number(profile.ramGB) < 24) config.contextTokens = Math.min(config.contextTokens, 8192);
+  if (sizeGB >= 16) config.contextTokens = Math.min(config.contextTokens, 6144);
+  if (Number(profile?.ramGB || 0) > 0 && Number(profile.ramGB) < 24) config.contextTokens = Math.min(config.contextTokens, 4096);
+  if (gpuAccelerated && Number(profile?.vramGB || 0) > 0 && Number(profile.vramGB) < 10) {
+    config.contextTokens = Math.min(config.contextTokens, 6144);
+  }
 
   config.threads = clampInt(
-    config.threads ?? (os.cpus().length || 8),
+    config.threads ?? threadProfile.threads,
     SAFE_RUNTIME_LIMITS.threadsMin,
     SAFE_RUNTIME_LIMITS.threadsMax,
-    8,
+    threadProfile.threads,
   );
   config.threadsBatch = clampInt(
-    config.threadsBatch ?? (config.threads + 2),
+    config.threadsBatch ?? threadProfile.threadsBatch,
     SAFE_RUNTIME_LIMITS.threadsBatchMin,
     SAFE_RUNTIME_LIMITS.threadsBatchMax,
-    config.threads + 2,
+    threadProfile.threadsBatch,
   );
   if (config.threadsBatch < config.threads) config.threadsBatch = config.threads;
 
   config.batchSize = clampInt(
-    config.batchSize ?? 1024,
+    config.batchSize ?? (gpuAccelerated ? 512 : 768),
     SAFE_RUNTIME_LIMITS.batchMin,
     SAFE_RUNTIME_LIMITS.batchMax,
-    1024,
+    gpuAccelerated ? 512 : 768,
   );
   config.ubatchSize = clampInt(
-    config.ubatchSize ?? 256,
+    config.ubatchSize ?? Math.max(128, Math.floor(config.batchSize / 2)),
     SAFE_RUNTIME_LIMITS.ubatchMin,
     SAFE_RUNTIME_LIMITS.ubatchMax,
-    256,
+    Math.max(128, Math.floor(config.batchSize / 2)),
   );
   if (config.ubatchSize > config.batchSize) config.ubatchSize = Math.min(config.batchSize, SAFE_RUNTIME_LIMITS.ubatchMax);
   config.parallel = clampInt(
@@ -758,8 +766,8 @@ function applyRuntimeSafetyGuards(rawConfig = {}, modelMeta = {}) {
   config.gpuLayerFallbacks = createGpuLayerFallbacks(config.gpuLayers, profile?.gpuBackendClass || "cpu-only");
 
   config.flashAttention = String(config.flashAttention ?? "on");
-  config.cacheTypeK = config.cacheTypeK || "q8_0";
-  config.cacheTypeV = config.cacheTypeV || "q8_0";
+  config.cacheTypeK = config.cacheTypeK || (gpuAccelerated ? "q4_0" : "q8_0");
+  config.cacheTypeV = config.cacheTypeV || (gpuAccelerated ? "q4_0" : "q8_0");
   return config;
 }
 
@@ -807,7 +815,7 @@ function createPresetModelConfig(preset) {
 }
 
 function saveModelCatalog(catalog) {
-  writeJsonFile(path.join(BIELIK_HOME, "config", "models.json"), {
+  writeJsonFile(path.join(ENDOCODE_HOME, "config", "models.json"), {
     ...catalog,
     models: (catalog.models || []).filter((model) => !model.preset),
   });
@@ -838,7 +846,7 @@ async function syncCatalogWithModelFiles(catalog) {
       syncedModels.push(model);
       continue;
     }
-    const modelPath = path.resolve(BIELIK_HOME, model.file);
+    const modelPath = path.resolve(ENDOCODE_HOME, model.file);
     if (await pathExistsAsync(modelPath)) {
       syncedModels.push(model);
       continue;
@@ -872,11 +880,11 @@ async function syncCatalogWithModelFiles(catalog) {
 }
 
 function loadAppSettings() {
-  return readJsonFile(path.join(BIELIK_HOME, "config", "endocode-state.json"), {});
+  return readJsonFile(path.join(ENDOCODE_HOME, "config", "endocode-state.json"), {});
 }
 
 function saveAppSettings() {
-  writeJsonFile(path.join(BIELIK_HOME, "config", "endocode-state.json"), {
+  writeJsonFile(path.join(ENDOCODE_HOME, "config", "endocode-state.json"), {
     selectedModelId,
     reasoningLevel: selectedReasoning,
     accessLevel,
@@ -886,7 +894,7 @@ function saveAppSettings() {
 }
 
 function getChatHistoryPath() {
-  return path.join(BIELIK_HOME, "config", "chat-history.json");
+  return path.join(ENDOCODE_HOME, "config", "chat-history.json");
 }
 
 function loadChatHistory() {
@@ -904,11 +912,11 @@ function saveChatHistory() {
 }
 
 function getSkillStorePath() {
-  return path.join(BIELIK_HOME, "config", "skills.json");
+  return path.join(ENDOCODE_HOME, "config", "skills.json");
 }
 
 function getSkillsRoot() {
-  return path.join(BIELIK_HOME, "config", "skills");
+  return path.join(ENDOCODE_HOME, "config", "skills");
 }
 
 function loadSkillStore() {
@@ -995,7 +1003,7 @@ async function uninstallSkill(skillId) {
   saveSkillStore(store);
   await fsp.rm(path.join(getSkillsRoot(), skill.id), { recursive: true, force: true });
   if (skillId === "vision") {
-    await fsp.rm(path.join(BIELIK_HOME, "models", "vision"), { recursive: true, force: true });
+    await fsp.rm(path.join(ENDOCODE_HOME, "models", "vision"), { recursive: true, force: true });
   }
   refreshSystemPrompt();
   emit("status", { status: "skills-changed", detail: `Odinstalowano skill: ${skill.name}` });
@@ -1100,6 +1108,24 @@ function getCachedModelProfile() {
   return telemetryMonitor.getCachedModelProfile();
 }
 
+function getRuntimeThreadProfile(profile = {}, category = "medium") {
+  const logical = Math.max(2, os.cpus().length || 8);
+  const physicalEstimate = Math.max(2, Math.floor(logical / 2));
+  const backendClass = String(profile.gpuBackendClass || "cpu-only");
+  const gpuAccelerated = backendClass !== "cpu-only";
+  if (gpuAccelerated) {
+    // With GPU offload, fewer CPU threads usually improves token latency.
+    const threads = Math.max(4, Math.min(8, physicalEstimate));
+    const threadsBatch = Math.max(threads, Math.min(16, threads * 2));
+    return { threads, threadsBatch };
+  }
+  const cpuThreads = category === "large"
+    ? Math.max(4, Math.min(physicalEstimate, 12))
+    : Math.max(4, Math.min(logical, 16));
+  const threadsBatch = Math.max(cpuThreads, Math.min(20, cpuThreads + 2));
+  return { threads: cpuThreads, threadsBatch };
+}
+
 function inferModelCategory({ file, displayName, expectedBytes, category }) {
   if (category) return category;
   const paramB = inferParamB(displayName, file);
@@ -1140,9 +1166,12 @@ function createRuntimeModelConfig(model = {}) {
     category: model.category,
   });
 
-  let contextTokens = category === "small" ? 32768 : category === "medium" ? 16384 : 8192;
-  if (sizeGB > 13 && category !== "large") contextTokens = 8192;
-  if (profile.ramGB < 24 && category !== "small") contextTokens = Math.min(contextTokens, 8192);
+  // Runtime-first defaults: keep context conservative to preserve full GPU offload.
+  let contextTokens = category === "small" ? 8192 : category === "medium" ? 6144 : 4096;
+  if (sizeGB > 16) contextTokens = 4096;
+  if (sizeGB > 24) contextTokens = 3072;
+  if (profile.ramGB < 24) contextTokens = Math.min(contextTokens, 4096);
+  if (Number(profile.vramGB || 0) >= 20 && category === "small") contextTokens = Math.max(contextTokens, 12288);
   if (Number.isFinite(Number(model.contextTokens)) && Number(model.contextTokens) > 0) {
     contextTokens = clampContextTokens(model.contextTokens);
   }
@@ -1164,19 +1193,27 @@ function createRuntimeModelConfig(model = {}) {
     gpuLayers = Number(model.gpuLayers);
   }
 
+  const threadProfile = getRuntimeThreadProfile(profile, category);
+  const vramGB = Number(profile.vramGB || 0);
+  const gpuAccelerated = String(profile.gpuBackendClass || "cpu-only") !== "cpu-only";
+  const batchSize = gpuAccelerated
+    ? (vramGB >= 16 ? 1024 : vramGB >= 10 ? 768 : vramGB >= 6 ? 512 : 256)
+    : (category === "small" ? 1024 : 512);
+  const ubatchSize = Math.max(64, Math.min(512, Math.floor(batchSize / 2)));
+
   return applyRuntimeSafetyGuards({
     category,
     contextTokens,
     gpuLayers,
     gpuLayerFallbacks: createGpuLayerFallbacks(gpuLayers, profile.gpuBackendClass),
-    threads: Math.max(2, Math.min(16, os.cpus().length || 8)),
-    threadsBatch: Math.max(2, Math.min(20, (os.cpus().length || 8) + 4)),
-    batchSize: category === "small" ? 2048 : 1024,
-    ubatchSize: 512,
+    threads: threadProfile.threads,
+    threadsBatch: threadProfile.threadsBatch,
+    batchSize,
+    ubatchSize,
     parallel: 1,
     flashAttention: "on",
-    cacheTypeK: "q8_0",
-    cacheTypeV: "q8_0",
+    cacheTypeK: gpuAccelerated ? "q4_0" : "q8_0",
+    cacheTypeV: gpuAccelerated ? "q4_0" : "q8_0",
   }, { expectedBytes, category });
 }
 
@@ -1241,7 +1278,7 @@ async function importLocalModelFromFile(input = {}) {
         { name: "GGUF models", extensions: ["gguf", "guff"] },
         { name: "All files", extensions: ["*"] },
       ],
-      defaultPath: path.join(BIELIK_HOME, "models"),
+      defaultPath: path.join(ENDOCODE_HOME, "models"),
     });
     if (pick.canceled || !pick.filePaths?.[0]) return { ok: false, canceled: true };
     sourcePath = pick.filePaths[0];
@@ -1256,7 +1293,7 @@ async function importLocalModelFromFile(input = {}) {
   const srcStat = await fsp.stat(sourcePath);
   if (!srcStat.isFile()) throw new Error("Wybrana ścieżka nie jest plikiem.");
   const fileName = safeModelFileName(path.basename(sourcePath).replace(/\.guff$/i, ".gguf"));
-  const modelDir = path.join(BIELIK_HOME, "models");
+  const modelDir = path.join(ENDOCODE_HOME, "models");
   await fsp.mkdir(modelDir, { recursive: true });
 
   let finalFileName = fileName;
@@ -1672,14 +1709,25 @@ function extractDomainCandidate(text) {
   return match[1];
 }
 
+async function fetchWithRetry(url, init = {}, timeouts = [2500, 5000]) {
+  let lastError = null;
+  for (let i = 0; i < timeouts.length; i += 1) {
+    try {
+      return await fetch(url, { ...init, signal: AbortSignal.timeout(timeouts[i]) });
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError || new Error("fetch failed");
+}
+
 async function fetchLivePageSnippet(url) {
   if (!isHttpUrl(url)) return "";
   try {
-    const response = await fetch(url, {
+    const response = await fetchWithRetry(url, {
       redirect: "follow",
       headers: { "User-Agent": "EndoCode-Desktop-App" },
-      signal: AbortSignal.timeout(CHAT_WEB_PAGE_FETCH_TIMEOUT_MS),
-    });
+    }, [CHAT_WEB_PAGE_FETCH_TIMEOUT_MS, CHAT_WEB_PAGE_FETCH_RETRY_TIMEOUT_MS]);
     if (!response.ok) return "";
     const html = await response.text();
     const visible = stripHtmlToVisibleText(html);
@@ -1762,11 +1810,10 @@ async function fetchLivePageInsights(url) {
     return { summary: "", signals: [], status: 0, ok: false, error: "invalid-url" };
   }
   try {
-    const response = await fetch(url, {
+    const response = await fetchWithRetry(url, {
       redirect: "follow",
       headers: { "User-Agent": "EndoCode-Desktop-App" },
-      signal: AbortSignal.timeout(CHAT_WEB_PAGE_FETCH_TIMEOUT_MS),
-    });
+    }, [CHAT_WEB_PAGE_FETCH_TIMEOUT_MS, CHAT_WEB_PAGE_FETCH_RETRY_TIMEOUT_MS]);
     if (!response.ok) {
       return { summary: "", signals: [], status: response.status || 0, ok: false, error: "http-error" };
     }
@@ -1858,11 +1905,10 @@ async function searchWebLinks(query) {
   if (!q) return [];
   const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}`;
   try {
-    const response = await fetch(url, {
+    const response = await fetchWithRetry(url, {
       redirect: "follow",
       headers: { "User-Agent": "EndoCode-Desktop-App" },
-      signal: AbortSignal.timeout(CHAT_WEB_LOOKUP_TIMEOUT_MS),
-    });
+    }, [CHAT_WEB_LOOKUP_TIMEOUT_MS, CHAT_WEB_LOOKUP_RETRY_TIMEOUT_MS]);
     if (!response.ok) return [];
     const html = await response.text();
     return extractDuckDuckGoHtmlLinks(html);
@@ -1936,7 +1982,12 @@ ${signalLines.join("\n")}`;
   for (const candidateQuery of candidates) {
     const lookupUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(candidateQuery)}&format=json&no_html=1&skip_disambig=1`;
     try {
-      const data = await fetchJson(lookupUrl, { signal: AbortSignal.timeout(CHAT_WEB_LOOKUP_TIMEOUT_MS) });
+      let data;
+      try {
+        data = await fetchJson(lookupUrl, { signal: AbortSignal.timeout(CHAT_WEB_LOOKUP_TIMEOUT_MS) });
+      } catch {
+        data = await fetchJson(lookupUrl, { signal: AbortSignal.timeout(CHAT_WEB_LOOKUP_RETRY_TIMEOUT_MS) });
+      }
       const lines = [];
       const sources = [];
       const abstract = compactWebSnippet(data?.AbstractText);
@@ -2256,8 +2307,30 @@ function setModelSettingsForId(modelId, patch = {}) {
   customModelSettingsByModelId[modelId] = { ...base, ...patch };
 }
 
+function getRecommendedSettingsForModelId(modelId = selectedModelId) {
+  const catalog = loadModelCatalog();
+  const model = catalog.models.find((entry) => entry.id === modelId) || getModelConfig();
+  const runtime = createRuntimeModelConfig(model);
+  const tokenLimits = getTokenRuntimeLimits();
+  const recommended = {
+    contextTokens: clampContextTokens(runtime.contextTokens ?? model?.contextTokens ?? 8192, tokenLimits),
+    gpuLayers: clampRuntimeNumber(runtime.gpuLayers ?? model?.gpuLayers ?? 99, 0, 99),
+    maxTokens: clampResponseTokens(model?.maxTokens ?? 1300, tokenLimits),
+    maxMessages: clampMaxMessages(model?.maxMessages ?? 32, tokenLimits),
+    threads: clampRuntimeNumber(runtime.threads, SAFE_RUNTIME_LIMITS.threadsMin, SAFE_RUNTIME_LIMITS.threadsMax),
+    threadsBatch: clampRuntimeNumber(runtime.threadsBatch, SAFE_RUNTIME_LIMITS.threadsBatchMin, SAFE_RUNTIME_LIMITS.threadsBatchMax),
+    batchSize: clampRuntimeNumber(runtime.batchSize, SAFE_RUNTIME_LIMITS.batchMin, SAFE_RUNTIME_LIMITS.batchMax),
+    ubatchSize: clampRuntimeNumber(runtime.ubatchSize, SAFE_RUNTIME_LIMITS.ubatchMin, SAFE_RUNTIME_LIMITS.ubatchMax),
+    parallel: clampRuntimeNumber(runtime.parallel, SAFE_RUNTIME_LIMITS.parallelMin, SAFE_RUNTIME_LIMITS.parallelMax),
+    flashAttention: runtime.flashAttention || "on",
+    cacheTypeK: runtime.cacheTypeK || "q8_0",
+    cacheTypeV: runtime.cacheTypeV || "q8_0",
+  };
+  return sanitizeSettingsPatch(recommended);
+}
+
 function resetModelSettingsForId(modelId) {
-  customModelSettingsByModelId[modelId] = { ...DEFAULT_MODEL_SETTINGS };
+  customModelSettingsByModelId[modelId] = { ...DEFAULT_MODEL_SETTINGS, ...getRecommendedSettingsForModelId(modelId) };
 }
 
 function getActiveMaxMessages() {
@@ -2291,7 +2364,7 @@ function readInstructionFile(filePath) {
 }
 
 function getAgentPlaybookFiles() {
-  const dir = path.join(BIELIK_HOME, "config", "agent-playbooks");
+  const dir = path.join(ENDOCODE_HOME, "config", "agent-playbooks");
   try {
     return fs.readdirSync(dir, { withFileTypes: true })
       .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".md"))
@@ -2303,32 +2376,16 @@ function getAgentPlaybookFiles() {
 }
 
 function loadAgentGuidancePrompt() {
-  const files = [];
-  const rootAgents = path.join(BIELIK_HOME, "AGENTS.md");
-  files.push(rootAgents);
-  if (path.resolve(workspaceRoot) !== path.resolve(BIELIK_HOME)) {
-    files.push(path.join(workspaceRoot, "AGENTS.md"));
-    files.push(path.join(workspaceRoot, "CLAUDE.md"));
-  }
-  files.push(...getAgentPlaybookFiles());
-
-  let total = "";
-  const seen = new Set();
-  for (const file of files) {
-    const resolved = path.resolve(file);
-    if (seen.has(resolved)) continue;
-    seen.add(resolved);
-    const text = readInstructionFile(resolved);
-    if (!text) continue;
-    const rel = path.relative(BIELIK_HOME, resolved).replaceAll("\\", "/") || path.basename(resolved);
-    const block = `\n\n--- ${rel} ---\n${text}`;
-    if ((total.length + block.length) > AGENT_GUIDANCE_MAX_CHARS) {
-      total += `\n\n[Instrukcje skrocone: limit ${AGENT_GUIDANCE_MAX_CHARS} znakow. Czytaj najwazniejsze reguly powyzej.]`;
-      break;
-    }
-    total += block;
-  }
-  return total.trim();
+  const engine = createInstructionPolicyEngine({
+    appHome: ENDOCODE_HOME,
+    maxChars: AGENT_GUIDANCE_MAX_CHARS,
+    readFile: readInstructionFile,
+    playbookFilesProvider: getAgentPlaybookFiles,
+  });
+  const built = engine.buildPrompt(workspaceRoot);
+  const hash = crypto.createHash("sha256").update(String(built.prompt || ""), "utf8").digest("hex").slice(0, 16);
+  instructionPolicyMeta = { ...(built.meta || {}), hash };
+  return built.prompt || "";
 }
 
 function createSystemPrompt() {
@@ -2358,7 +2415,7 @@ function createInitialMessages() {
 function getModelsForUi() {
   const catalog = loadModelCatalog();
   return catalog.models.map((model) => {
-    const modelPath = model.file ? path.resolve(BIELIK_HOME, model.file) : null;
+    const modelPath = model.file ? path.resolve(ENDOCODE_HOME, model.file) : null;
     const fileStatus = getModelFileStatus(model);
     const available = model.kind === "local-gguf" ? fileStatus.available : Boolean(model.enabled);
     return {
@@ -2375,7 +2432,7 @@ function getModelFileStatus(model) {
   if (model.kind !== "local-gguf" || !model.file) {
     return { available: Boolean(model.enabled), size: 0, expectedBytes: 0, progress: model.enabled ? 1 : 0 };
   }
-  const modelPath = path.resolve(BIELIK_HOME, model.file);
+  const modelPath = path.resolve(ENDOCODE_HOME, model.file);
   try {
     const size = fs.statSync(modelPath).size;
     const expectedBytes = Number(model.expectedBytes || 0);
@@ -2448,7 +2505,7 @@ function relativeToRoot(p) {
 }
 
 function getFallbackWorkspaceRoot() {
-  return os.homedir() || path.join(BIELIK_HOME, "workspace");
+  return os.homedir() || path.join(ENDOCODE_HOME, "workspace");
 }
 
 async function applyWorkspaceRoot(root, options = {}) {
@@ -2506,71 +2563,48 @@ async function validateCurrentWorkspaceRoot() {
 }
 
 function getRuntimeServerExe() {
-  const runtimeDir = path.join(BIELIK_HOME, "runtime");
-  const expectedFile = process.platform === "win32" ? "llama-server.exe" : "llama-server";
-  const stack = [runtimeDir];
-  while (stack.length) {
-    const dir = stack.pop();
-    if (!pathExists(dir)) continue;
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) stack.push(full);
-      if (entry.isFile() && entry.name.toLowerCase() === expectedFile) return full;
-    }
+  return runtimeManifestStore?.getActiveServerPath?.() || null;
+}
+
+function detectLoadedBackendsFromVersion(serverExe) {
+  try {
+    const result = spawnSync(serverExe, ["--version"], {
+      cwd: path.dirname(serverExe),
+      windowsHide: true,
+      encoding: "utf8",
+      timeout: 12000,
+    });
+    const out = `${result?.stdout || ""}\n${result?.stderr || ""}`.toLowerCase();
+    return {
+      cuda: /loaded cuda backend|ggml-cuda/i.test(out),
+      vulkan: /loaded vulkan backend|ggml-vulkan/i.test(out),
+      cpu: /loaded cpu backend|ggml-cpu/i.test(out),
+      raw: out,
+    };
+  } catch {
+    return { cuda: false, vulkan: false, cpu: false, raw: "" };
   }
-  return null;
 }
 
 function detectInstallTarget() {
-  const platform = process.platform;
-  const gpuInfo = probeGpuInfo();
-  const gpuVendor = String(gpuInfo?.gpuVendor || "unknown").toLowerCase();
-  let runtimePreference = ["cpu"];
-  if (platform === "linux") {
-    if (gpuVendor === "nvidia") runtimePreference = ["cuda", "vulkan", "cpu"];
-    else if (gpuVendor === "amd") runtimePreference = ["rocm", "vulkan", "cpu"];
-    else runtimePreference = ["vulkan", "cpu"];
-  } else {
-    if (gpuVendor === "nvidia") runtimePreference = ["cuda", "vulkan", "cpu"];
-    else runtimePreference = ["cpu", "vulkan", "cuda"];
-  }
-  return { platform, gpuVendor, runtimePreference };
+  return detectInstallTargetByPolicy(process.platform, probeGpuInfo());
 }
 
 function rankRuntimeAssets(assets, target) {
-  if (!Array.isArray(assets) || assets.length === 0) return [];
+  return rankRuntimeAssetsByPolicy(assets, target);
+}
+
+function findCudaCompanionAsset(assets, target) {
+  if (!Array.isArray(assets) || !assets.length) return null;
   const platformToken = target.platform === "linux" ? "-bin-linux-" : "-bin-win-";
-  const requiredExt = target.platform === "linux" ? [".zip", ".tar.gz", ".tgz"] : [".zip"];
   const candidates = assets.filter((asset) => {
     const name = String(asset?.name || "").toLowerCase();
-    const extOk = requiredExt.some((ext) => name.endsWith(ext));
-    return (
-      extOk &&
-      name.startsWith("llama-") &&
-      name.includes(platformToken) &&
-      name.includes("x64") &&
-      !name.includes("arm") &&
-      !name.startsWith("cudart-")
-    );
+    return name.startsWith("cudart-")
+      && name.includes(platformToken)
+      && name.includes("x64")
+      && name.endsWith(".zip");
   });
-  if (!candidates.length) return [];
-
-  const scoreAsset = (asset) => {
-    const name = String(asset?.name || "").toLowerCase();
-    let score = 0;
-    if (name.includes("llama-")) score += 20;
-    if (name.includes(platformToken)) score += 20;
-    for (let i = 0; i < target.runtimePreference.length; i += 1) {
-      const backend = target.runtimePreference[i];
-      const backendScore = Math.max(0, 60 - i * 20);
-      if (backend === "rocm" && (name.includes("rocm") || name.includes("hip"))) score += backendScore;
-      if (backend !== "rocm" && name.includes(backend)) score += backendScore;
-    }
-    if (!name.includes("cuda") && !name.includes("vulkan") && !name.includes("rocm") && !name.includes("hip")) score += 8;
-    return score;
-  };
-
-  return candidates.sort((a, b) => scoreAsset(b) - scoreAsset(a));
+  return candidates[0] || null;
 }
 
 async function extractRuntimeArchive(archivePath, extractDir) {
@@ -2613,10 +2647,53 @@ async function extractRuntimeArchive(archivePath, extractDir) {
   throw new Error("Nieobsługiwany format archiwum runtime.");
 }
 
+async function collectDllFilesRecursive(rootDir) {
+  const out = [];
+  async function walk(current) {
+    let entries = [];
+    try {
+      entries = await fsp.readdir(current, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        await walk(full);
+      } else if (entry.isFile() && /\.dll$/i.test(entry.name)) {
+        out.push(full);
+      }
+    }
+  }
+  await walk(rootDir);
+  return out;
+}
+
+async function hoistRuntimeDlls(runtimeDir) {
+  const dlls = await collectDllFilesRecursive(runtimeDir);
+  for (const dllPath of dlls) {
+    if (path.dirname(dllPath) === runtimeDir) continue;
+    const target = path.join(runtimeDir, path.basename(dllPath));
+    await fsp.copyFile(dllPath, target).catch(() => {});
+  }
+}
+
 async function installLlamaRuntime() {
   const alreadyInstalled = getRuntimeServerExe();
   if (alreadyInstalled) {
-    return { ok: true, alreadyInstalled: true, serverExe: alreadyInstalled };
+    const backendProbe = detectLoadedBackendsFromVersion(alreadyInstalled);
+    const hasCudaPlugin = fs.existsSync(path.join(path.dirname(alreadyInstalled), "ggml-cuda.dll"));
+    if (!(hasCudaPlugin && !backendProbe.cuda)) {
+      await runtimeManifestStore.writeManifest({
+        serverExe: alreadyInstalled,
+        source: "existing",
+      }).catch(() => {});
+      return { ok: true, alreadyInstalled: true, serverExe: alreadyInstalled };
+    }
+    emit("status", {
+      status: "runtime-install",
+      detail: "Wykryto runtime z ggml-cuda.dll, ale backend CUDA sie nie laduje. Naprawiam instalacje...",
+    });
   }
 
   const target = detectInstallTarget();
@@ -2627,11 +2704,12 @@ async function installLlamaRuntime() {
   const release = await fetchJsonViaHttpsWithRetry("https://api.github.com/repos/ggml-org/llama.cpp/releases/latest", 3);
 
   const runtimeAssets = rankRuntimeAssets(release?.assets || [], target);
+  const cudaCompanionAsset = findCudaCompanionAsset(release?.assets || [], target);
   if (!runtimeAssets.length) {
     throw new Error(`Nie znalazlem binarki llama.cpp dla targetu ${target.platform} (${target.runtimePreference.join(", ")}).`);
   }
 
-  const runtimeDir = path.join(BIELIK_HOME, "runtime");
+  const runtimeDir = path.join(ENDOCODE_HOME, "runtime");
   const tempDir = path.join(runtimeDir, "_install_tmp");
   const extractDir = path.join(tempDir, "extract");
   const releaseTag = String(release?.tag_name || "latest").replace(/[^a-z0-9._-]/gi, "_");
@@ -2671,10 +2749,21 @@ async function installLlamaRuntime() {
         await fsp.mkdir(extractDir, { recursive: true });
         await extractRuntimeArchive(archivePath, extractDir);
 
+        if (inferBackendFromAssetName(asset.name) === "cuda" && cudaCompanionAsset?.browser_download_url) {
+          const companionArchivePath = path.join(tempDir, String(cudaCompanionAsset.name).replace(/[<>:\"\\|?*]/g, "_"));
+          emit("status", { status: "runtime-install", detail: `Pobieram zaleznosci CUDA: ${cudaCompanionAsset.name}` });
+          emit("runtime-install-progress", { phase: "extract", progress: 88, detail: "Pobieranie cudart..." });
+          await downloadFileWithProgress(cudaCompanionAsset.browser_download_url, companionArchivePath, "Pobieranie cudart");
+          emit("runtime-install-progress", { phase: "extract", progress: 90, detail: "Rozpakowywanie cudart..." });
+          await extractRuntimeArchive(companionArchivePath, extractDir);
+          await fsp.rm(companionArchivePath, { force: true }).catch(() => {});
+        }
+
         emit("runtime-install-progress", { phase: "install", progress: 92, detail: "Kopiowanie runtime..." });
         await fsp.rm(finalDir, { recursive: true, force: true });
         await fsp.mkdir(finalDir, { recursive: true });
         await fsp.cp(extractDir, finalDir, { recursive: true, force: true });
+        await hoistRuntimeDlls(finalDir);
 
         const serverExe = getRuntimeServerExe();
         if (!serverExe) {
@@ -2683,6 +2772,13 @@ async function installLlamaRuntime() {
         }
         emit("runtime-install-progress", { phase: "done", progress: 100, detail: "Runtime llama.cpp zainstalowany." });
         emit("status", { status: "runtime-install-complete", detail: "Runtime llama.cpp zainstalowany." });
+        await runtimeManifestStore.writeManifest({
+          serverExe,
+          releaseTag: release?.tag_name || "latest",
+          assetName: asset.name,
+          installTarget: target,
+          expectedBackend: inferBackendFromAssetName(asset.name),
+        }).catch(() => {});
         return { ok: true, serverExe, asset: asset.name, tag: release?.tag_name || "latest", target };
       } catch (error) {
         lastError = error;
@@ -2702,7 +2798,7 @@ async function installLlamaRuntime() {
 function getModelPath() {
   const config = getModelConfig();
   if (!config?.file) return null;
-  return path.resolve(BIELIK_HOME, config.file);
+  return path.resolve(ENDOCODE_HOME, config.file);
 }
 
 function appendServerOptionArgs(serverArgs, config) {
@@ -2747,11 +2843,15 @@ async function getServerModelId(port = DEFAULT_PORT) {
 }
 
 async function launchServerProcess(config, modelPath, port, contextTokens, gpuLayers) {
-  await fsp.mkdir(path.join(BIELIK_HOME, "logs"), { recursive: true });
-  const outLog = fs.openSync(path.join(BIELIK_HOME, "logs", "local-codex-server.out.log"), "a");
-  const errLog = fs.openSync(path.join(BIELIK_HOME, "logs", "local-codex-server.err.log"), "a");
+  await fsp.mkdir(path.join(ENDOCODE_HOME, "logs"), { recursive: true });
+  const outLogPath = path.join(ENDOCODE_HOME, "logs", "local-codex-server.out.log");
+  const errLogPath = path.join(ENDOCODE_HOME, "logs", "local-codex-server.err.log");
+  const outLog = fs.openSync(outLogPath, "a");
+  const errLog = fs.openSync(errLogPath, "a");
   const serverExe = getRuntimeServerExe();
   if (!serverExe) throw new Error("Nie znaleziono runtime/llama-server.exe.");
+  const runtimeManifest = runtimeManifestStore.readManifest() || {};
+  const expectedBackend = String(runtimeManifest.expectedBackend || "unknown");
 
   emit("status", { status: "server-starting", detail: `Uruchamiam: ${config.displayName} (ctx ${contextTokens}, GPU layers ${gpuLayers}).` });
   const serverArgs = [
@@ -2762,6 +2862,8 @@ async function launchServerProcess(config, modelPath, port, contextTokens, gpuLa
     "--port", String(port),
     "--jinja",
   ];
+  // Fast startup path; unknown flags are avoided for compatibility.
+  if (String(config.fastStartup || "on") === "on") serverArgs.push("--no-warmup");
   if (config.reasoning) {
     serverArgs.push("--reasoning", String(config.reasoning));
   }
@@ -2797,84 +2899,70 @@ async function launchServerProcess(config, modelPath, port, contextTokens, gpuLa
   const startupTimeoutMs = getServerStartupTimeoutMs(config, contextTokens);
   const startedAt = Date.now();
   while (Date.now() - startedAt < startupTimeoutMs) {
-    if (serverProcess?.exitCode !== null) throw new Error("llama-server zakonczyl prace przed startem API.");
+    if (serverProcess?.exitCode !== null) {
+      const errTail = `${readLogTail(errLogPath, 1200)}\n${readLogTail(outLogPath, 800)}`.trim();
+      throw new Error(`llama-server zakonczyl prace przed startem API.${errTail ? ` Log: ${errTail.slice(-500)}` : ""}`);
+    }
     if (await isServerReady(port)) {
+      const backendLog = `${readLogTail(outLogPath, 3000)}\n${readLogTail(errLogPath, 3000)}`;
+      const backendByLogs = inferBackendFromLogs(backendLog);
+      const backendByBinary = inferBackendFromRuntimeBinaries(serverExe);
+      const gpuOffloadDetected = /offloaded\s+\d+\/\d+\s+layers?\s+to\s+gpu/i.test(backendLog);
+      const activeBackend = backendByLogs !== "unknown"
+        ? backendByLogs
+        : (gpuOffloadDetected ? backendByBinary : backendByBinary);
+      if (gpuLayers > 0 && backendByBinary === "cuda" && activeBackend !== "cuda" && !gpuOffloadDetected) {
+        throw new Error("Runtime CUDA nie zostal aktywowany (ggml-cuda.dll bez zaladowanego backendu). Uruchom ponownie instalacje runtime.");
+      }
+      runtimeBackendStatus = {
+        expectedBackend,
+        activeBackend,
+        validation: activeBackend !== "unknown" ? "validated" : "unverified",
+        detail: activeBackend !== "unknown"
+          ? `Wykryto backend ${activeBackend}${gpuOffloadDetected ? " (GPU offload potwierdzony)." : ""}.`
+          : "Nie udało się jednoznacznie odczytać backendu z logów.",
+        lastCheckedAt: new Date().toISOString(),
+      };
+      baselineMetrics.recordRuntimeLaunch(activeBackend, { expectedBackend, gpuLayers, contextTokens });
+      await runtimeManifestStore.writeManifest({
+        serverExe,
+        expectedBackend,
+        activeBackend,
+        lastLaunchAt: new Date().toISOString(),
+      }).catch(() => {});
       emit("status", { status: "server-ready", detail: `${config.displayName} gotowy na http://127.0.0.1:${port}` });
       return;
     }
-    await sleep(1000);
+    const elapsed = Date.now() - startedAt;
+    await sleep(elapsed < 8000 ? 300 : 800);
   }
   throw new Error(`Serwer nie odpowiedzial w ciagu ${Math.round(startupTimeoutMs / 1000)} sekund.`);
 }
 
+function getRuntimeEngine() {
+  if (!runtimeEngine) {
+    runtimeEngine = createRuntimeEngine({
+      isServerReady,
+      getServerModelId,
+      stopOwnedServer,
+      launchServerProcess,
+      getModelConfig,
+      getModelPath,
+      getModelFileStatus,
+      getModelSettingsForId,
+      resetRuntimeRecoveryState,
+      baselineMetrics,
+      emit,
+      getSelectedModelId: () => selectedModelId,
+      getRunningModelId: () => runningModelId,
+      setRunningModelId: (value) => { runningModelId = value; },
+    });
+  }
+  return runtimeEngine;
+}
+
 async function ensureServer(port = DEFAULT_PORT) {
-  const config = getModelConfig();
-  const modelSettings = getModelSettingsForId(config?.id || selectedModelId);
-  if (!config || config.kind !== "local-gguf") {
-    throw new Error("Ten model nie jest lokalnym GGUF. Claude Opus 4.5 wymaga API, nie lokalnego runtime.");
-  }
-
-  if (await isServerReady(port)) {
-    const liveModel = await getServerModelId(port);
-    const expectedFile = path.basename(getModelPath());
-    const matchesCurrent = runningModelId === selectedModelId ||
-      liveModel === config.serverModel ||
-      (liveModel && liveModel.includes(expectedFile));
-    if (matchesCurrent) {
-      runningModelId = selectedModelId;
-      emit("status", { status: "server-ready", detail: `Uzywam aktywnego serwera: ${config.displayName}.` });
-      return;
-    }
-    if (serverOwned) {
-      await stopOwnedServer();
-    } else {
-      throw new Error(`Port ${port} zajmuje inny model (${liveModel || "nieznany"}). Zamknij ten serwer albo uruchom ponownie aplikacje.`);
-    }
-  }
-
-  const modelPath = getModelPath();
-  const fileStatus = getModelFileStatus(config);
-  if (!fileStatus.available) {
-    const percent = Math.round((fileStatus.progress || 0) * 100);
-    throw new Error(`Model nie jest jeszcze gotowy: ${config.displayName} (${percent}%).`);
-  }
-
-  const contextTokens = clampContextTokens(modelSettings.contextTokens ?? config.contextTokens ?? 8192);
-  const configuredGpuLayers = modelSettings.gpuLayers ?? config.gpuLayers ?? 99;
-  const gpuLayerAttempts = modelSettings.gpuLayers != null
-    ? [configuredGpuLayers]
-    : [...new Set([configuredGpuLayers, ...(config.gpuLayerFallbacks || [])])];
-  const runtimeConfig = {
-    ...config,
-    threads: modelSettings.threads ?? config.threads,
-    threadsBatch: modelSettings.threadsBatch ?? config.threadsBatch,
-    batchSize: modelSettings.batchSize ?? config.batchSize,
-    ubatchSize: modelSettings.ubatchSize ?? config.ubatchSize,
-    parallel: modelSettings.parallel ?? config.parallel,
-    flashAttention: modelSettings.flashAttention ?? config.flashAttention,
-    cacheTypeK: modelSettings.cacheTypeK ?? config.cacheTypeK,
-    cacheTypeV: modelSettings.cacheTypeV ?? config.cacheTypeV,
-    reasoning: modelSettings.reasoning ?? config.reasoning,
-    reasoningBudget: modelSettings.reasoningBudget ?? config.reasoningBudget,
-    extraServerArgs: Array.isArray(modelSettings.extraServerArgs) ? modelSettings.extraServerArgs : config.extraServerArgs,
-  };
-  let lastError = null;
-  for (let i = 0; i < gpuLayerAttempts.length; i += 1) {
-    try {
-      await launchServerProcess(runtimeConfig, modelPath, port, contextTokens, gpuLayerAttempts[i]);
-      return;
-    } catch (error) {
-      lastError = error;
-      await stopOwnedServer({ force: true });
-      if (i < gpuLayerAttempts.length - 1) {
-        emit("status", {
-          status: "server-starting",
-          detail: `Start nie wyszedl (${error.message || String(error)}). Probuje GPU layers ${gpuLayerAttempts[i + 1]}.`,
-        });
-      }
-    }
-  }
-  throw lastError || new Error("Nie udalo sie uruchomic modelu.");
+  return getRuntimeEngine().ensureReady(port);
 }
 
 async function stopOwnedServer(options = {}) {
@@ -3080,6 +3168,10 @@ async function callModel(messages, abortSignal, options = {}, step = null) {
       if (!silent) emit("thinking-end", { full: thinkingContent, step });
     }
 
+    if (!String(fullContent || "").trim() && String(thinkingContent || "").trim()) {
+      // Some models stream only reasoning-like text; treat it as content fallback.
+      return { content: thinkingContent, reasoning: thinkingContent };
+    }
     return { content: fullContent, reasoning: thinkingContent };
   } catch (error) {
     if (abortSignal?.aborted) throw new Error("Przerwano przez uzytkownika.");
@@ -3153,16 +3245,7 @@ async function callModelWithRecovery(messages, abortSignal, failedModelIds, opti
 }
 
 function parseJsonCandidate(candidate) {
-  try {
-    return JSON.parse(candidate);
-  } catch (e1) {
-    try {
-      return JSON.parse(jsonrepair(candidate));
-    } catch {
-      const msg = String(e1?.message || e1);
-      throw new Error(`Model nie zwrocil JSON: ${msg.slice(0, 400)}`);
-    }
-  }
+  return JSON.parse(candidate);
 }
 
 function parseJsonAction(raw) {
@@ -3185,6 +3268,97 @@ function parseJsonAction(raw) {
     }
   }
   throw lastError || new Error(`Model nie zwrocil JSON: ${text.slice(0, 300)}`);
+}
+
+function parseActionEnvelope(raw) {
+  let text = String(raw || "").trim();
+  if (!text) throw new Error("Pusta odpowiedz modelu.");
+  if (text.startsWith("```")) {
+    text = text.replace(/^```(?:[a-z0-9_-]+)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  }
+  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  let note = "";
+  let tool = "";
+  let argsRaw = "";
+  let final = "";
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (/^NOTE:/i.test(line)) {
+      note = line.replace(/^NOTE:\s*/i, "").trim();
+      continue;
+    }
+    if (/^FINAL:/i.test(line)) {
+      const current = line.replace(/^FINAL:\s*/i, "");
+      const rest = lines.slice(i + 1).join("\n");
+      final = [current, rest].filter(Boolean).join("\n").trim();
+      break;
+    }
+    if (/^TOOL:/i.test(line)) {
+      tool = line.replace(/^TOOL:\s*/i, "").trim();
+      const argsLineIndex = lines.slice(i + 1).findIndex((x) => /^ARGS:/i.test(x));
+      if (argsLineIndex >= 0) {
+        const absolute = i + 1 + argsLineIndex;
+        const argsHead = lines[absolute].replace(/^ARGS:\s*/i, "").trim();
+        const argsTail = lines.slice(absolute + 1).join("\n").trim();
+        argsRaw = [argsHead, argsTail].filter(Boolean).join("\n").trim();
+      } else {
+        argsRaw = "{}";
+      }
+      break;
+    }
+  }
+
+  if (final) {
+    return { note, final };
+  }
+  if (tool) {
+    let args = {};
+    if (argsRaw) {
+      try {
+        args = JSON.parse(argsRaw);
+      } catch (error) {
+        throw new Error(`Niepoprawne ARGS JSON: ${String(error?.message || error).slice(0, 260)}`);
+      }
+    }
+    return { note, tool, args };
+  }
+
+  // Legacy fallback for compatibility with old model outputs
+  try {
+    return parseJsonAction(text);
+  } catch {
+    throw new Error("Niepoprawny format akcji. Uzyj NOTE/FINAL/TOOL/ARGS.");
+  }
+}
+
+function inferActionFromNaturalText(raw) {
+  const text = String(raw || "").trim();
+  if (!text) return null;
+  const lower = text.toLowerCase();
+  const toolNames = [...ALLOWED_TOOLS].sort((a, b) => b.length - a.length);
+  let detectedTool = null;
+  for (const tool of toolNames) {
+    const re = new RegExp(`\\b${tool.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i");
+    if (re.test(lower)) {
+      detectedTool = tool;
+      break;
+    }
+  }
+  if (!detectedTool) return null;
+  let args = {};
+  const jsonCandidate = extractFirstJsonObject(text);
+  if (jsonCandidate) {
+    try {
+      const parsed = JSON.parse(jsonCandidate);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        if (parsed.args && typeof parsed.args === "object" && !Array.isArray(parsed.args)) args = parsed.args;
+        else args = parsed;
+      }
+    } catch {
+      args = {};
+    }
+  }
+  return { note: "Auto-zinterpretowano intencje modelu.", tool: detectedTool, args };
 }
 
 function stableJson(value) {
@@ -3549,7 +3723,7 @@ Nigdy nie zwracaj JSON jako tablicy [...] — tylko jeden obiekt {...}.
 Jesli blad dotyczy zbyt dlugiego write_file w jednym kroku: zwroc krotszy poprawny write_file (overwrite lub append), reszte w nastepnych krokach.
 
 Jesli blad mowi o braku "final" / pustym "final", a uzytkownik pytal o mozliwosci („co potrafisz” itd.): zwroc np.
-{"note":"Mozliwosci agenta","final":"Pracuje w sandboxie plikow. Narzedzia: pwd, cd, ls, read_file, write_file, mkdir, replace_text, create_pdf, create_pptx, create_docx, run_powershell, fetch_url, extract_media, download_file, analyze_image. Odpowiadam po polsku; do PPTX/DOCX potrzebny Python z python-pptx / python-docx."}
+{"note":"Mozliwosci agenta","final":"Pracuje w sandboxie plikow. Narzedzia: ${allowedToolNamesList()}. Odpowiadam po polsku; do PPTX/DOCX potrzebny Python z python-pptx / python-docx."}
 
 Jesli nie wiesz co dalej:
 {"note":"odzysk","final":"Nie udalo sie zwrocic poprawnej akcji — sprobuj ponownie lub zmien zadanie."}
@@ -3564,105 +3738,69 @@ ${String(raw || "").slice(0, 1600)}`;
 async function getNextActionWithRepair(abortSignal, failedModelIds, step = null) {
   let actionRawReasoning = "";
   let lastError = null;
-  let lastRawJsonCandidate = "";
-  const jsonRepairRetryLimit = getJsonRepairRetryLimit();
-  while (true) {
-    for (let attempt = 0; attempt <= jsonRepairRetryLimit; attempt += 1) {
-      if (attempt > 0) {
-        emit("status", {
-          status: "model-json-retry",
-          detail: `Naprawiam odpowiedz JSON / kontrakt (${attempt}/${jsonRepairRetryLimit}).`,
-        });
-      }
-      const { content: raw, reasoning } = await callModelWithRecovery(messages, abortSignal, failedModelIds, {}, step);
-      if (reasoning) actionRawReasoning = reasoning;
-      if (!lastRawJsonCandidate) lastRawJsonCandidate = String(raw || "");
-      if (attempt > 0 && isPatchDriftTooLarge(lastRawJsonCandidate, raw)) {
-        const driftMsg = "Naprawa JSON zmienila zbyt duza czesc odpowiedzi. Popraw tylko uszkodzony fragment.";
-        lastError = new Error(driftMsg);
-        emit("parse-error", {
-          error: driftMsg,
-          attempt: attempt + 1,
-          maxAttempts: jsonRepairRetryLimit + 1,
-          kind: "json-drift",
-          raw: textPreview(raw, 1200),
-        });
-        if (attempt >= jsonRepairRetryLimit) break;
-        messages.push({
-          role: "assistant",
-          content: JSON.stringify({
-            note: "Odrzucono poprawke: zbyt duzy drift wzgledem poprzedniego szkicu JSON.",
-          }),
-        });
-        messages.push({
-          role: "user",
-          content: `Popraw TYLKO lokalny fragment poprzedniego szkicu JSON. Nie tworz nowego obiektu od zera.\n\nPoprzedni szkic:\n${textPreview(lastRawJsonCandidate, 1600)}`,
-        });
-        continue;
-      }
-      emit("model-raw", { raw });
-      let parsed;
-      try {
-        parsed = parseJsonAction(raw);
-      } catch (error) {
-        lastError = error;
-        const location = extractJsonErrorLocation(error?.message || error, raw);
-        lastRawJsonCandidate = String(raw || "");
-        emit("parse-error", {
-          error: error.message || String(error),
-          attempt: attempt + 1,
-          maxAttempts: jsonRepairRetryLimit + 1,
-          raw: textPreview(raw, 1200),
-        });
-        if (attempt >= jsonRepairRetryLimit) break;
-        messages.push({
-          role: "assistant",
-          content: JSON.stringify({
-            note: "Poprzednia odpowiedz modelu byla niepoprawnym JSON-em i zostala odrzucona.",
-          }),
-        });
-        messages.push({ role: "user", content: makeJsonRepairPrompt(error, lastRawJsonCandidate, { location }) });
-        continue;
-      }
-
-      const validated = validateModelAction(parsed);
-      if (!validated.ok) {
-        lastError = new Error(validated.error);
-        const location = extractJsonErrorLocation(validated.error, raw);
-        lastRawJsonCandidate = String(raw || "");
-        emit("parse-error", {
-          error: validated.error,
-          attempt: attempt + 1,
-          maxAttempts: jsonRepairRetryLimit + 1,
-          kind: "action-schema",
-          raw: textPreview(raw, 1200),
-        });
-        emit("status", {
-          status: "action-schema-retry",
-          detail: `Kontrakt akcji: ${textPreview(validated.error, 120)}`,
-        });
-        if (attempt >= jsonRepairRetryLimit) break;
-        messages.push({
-          role: "assistant",
-          content: JSON.stringify({
-            note: "Odpowiedz miala poprawny JSON, ale brakowalo 'final' albo dozwolonego 'tool' z prawidlowym 'args'.",
-          }),
-        });
-        messages.push({ role: "user", content: makeActionSchemaRepairPrompt(validated.error, lastRawJsonCandidate, { location }) });
-        continue;
-      }
-
-      return { action: validated.action, reasoning: actionRawReasoning };
-
+  let lastRaw = "";
+  const retryLimit = Math.max(1, getJsonRepairRetryLimit());
+  for (let attempt = 0; attempt <= retryLimit; attempt += 1) {
+    if (attempt > 0) {
+      emit("status", {
+        status: "action-schema-retry",
+        detail: `Naprawiam format akcji (${attempt}/${retryLimit}).`,
+      });
     }
-    emit("status", {
-      status: "model-json-retry",
-      detail: "Naprawa JSON nie powiodla sie w limicie prob. Nie przelaczam modelu — ten sam model musi poprawic JSON.",
-      step,
-    });
-    break;
+    const promptMessages = agentCore?.memory
+      ? [...createInitialMessages(), ...agentCore.memory.getModelContext()]
+      : messages;
+    const { content: raw, reasoning } = await callModelWithRecovery(promptMessages, abortSignal, failedModelIds, {}, step);
+    lastRaw = String(raw || "");
+    if (reasoning) actionRawReasoning = reasoning;
+    emit("model-raw", { raw });
+    let parsed;
+    try {
+      parsed = parseActionEnvelope(raw);
+    } catch (error) {
+      lastError = error;
+      const inferred = inferActionFromNaturalText(raw);
+      if (inferred) {
+        const inferredValidated = validateModelAction(inferred);
+        if (inferredValidated.ok) return { action: inferredValidated.action, reasoning: actionRawReasoning };
+      }
+      if (attempt >= retryLimit) break;
+      const guidance = `Popraw format odpowiedzi. Uzyj tylko:\nNOTE: ... (opcjonalnie)\nFINAL: ...\nalbo\nNOTE: ...\nTOOL: ${allowedToolNamesList().split(", ")[0]}\nARGS: {"key":"value"}\n\nPoprzednia odpowiedz:\n${textPreview(raw, 1200)}`;
+      if (agentCore?.memory) {
+        agentCore.memory.append("assistant", `Format error: ${error.message}`);
+        agentCore.memory.append("user", guidance);
+      }
+      continue;
+    }
+    const validated = validateModelAction(parsed);
+    if (!validated.ok) {
+      lastError = new Error(validated.error);
+      const inferred = inferActionFromNaturalText(raw);
+      if (inferred) {
+        const inferredValidated = validateModelAction(inferred);
+        if (inferredValidated.ok) return { action: inferredValidated.action, reasoning: actionRawReasoning };
+      }
+      if (attempt >= retryLimit) break;
+      const guidance = `Kontrakt akcji niepoprawny: ${validated.error}\nPopraw tylko NOTE/FINAL/TOOL/ARGS bez zmiany celu zadania.`;
+      if (agentCore?.memory) {
+        agentCore.memory.append("assistant", `Schema error: ${validated.error}`);
+        agentCore.memory.append("user", guidance);
+      }
+      continue;
+    }
+    return { action: validated.action, reasoning: actionRawReasoning };
   }
-  throw new Error(`Model zwrocil niepoprawny JSON lub kontrakt akcji po kilku probach: ${lastError?.message || "nieznany blad"}`);
+  const fallbackText = String(lastRaw || "").trim();
+  if (fallbackText) {
+    return {
+      action: {
+        note: "Model zwrocil naturalna odpowiedz bez formalnej akcji. Traktuje jako final.",
+        final: fallbackText,
+      },
+      reasoning: actionRawReasoning,
+    };
+  }
+  throw new Error(`Model zwrocil niepoprawny format akcji: ${lastError?.message || "nieznany blad"}`);
 }
 
 
@@ -3677,6 +3815,18 @@ function readLogTail(filePath, limit = 5000) {
     return text.length > limit ? text.slice(-limit) : text;
   } catch {
     return "";
+  }
+}
+
+function inferBackendFromRuntimeBinaries(serverExePath = "") {
+  try {
+    const dir = path.dirname(String(serverExePath || ""));
+    if (!dir || !fs.existsSync(dir)) return "unknown";
+    if (fs.existsSync(path.join(dir, "ggml-cuda.dll"))) return "cuda";
+    if (fs.existsSync(path.join(dir, "ggml-vulkan.dll"))) return "vulkan";
+    return "cpu";
+  } catch {
+    return "unknown";
   }
 }
 
@@ -4155,19 +4305,13 @@ function truncateFetchBody(text) {
   };
 }
 
-const CHAT_SYSTEM_PROMPT = `Jestes pomocnym asystentem w trybie CZATU (bez akcji narzedziowych, bez plikow w workspace, bez formatu JSON).
-Odpowiadaj zwyklym ciaglym tekstem po polsku — zwiezle i rzeczowo.
-W tym trybie masz NATYWNY, AUTOMATYCZNY dostep do lekkiego kontekstu internetowego.
-Jesli pojawia sie blok "Kontekst z internetu", traktuj go jako aktualne dane pomocnicze i uzyj go w odpowiedzi.
-Ten blok moze zawierac pipeline: lookup + fetch live page + extract visible text.
-Nie pisz, ze "nie masz internetu" lub "nie mozesz sprawdzic online", bo tryb czatu moze dolaczyc internetowy kontekst automatycznie.
-Gdy takiego bloku nie ma, odpowiedz z wiedzy wlasnej i w razie potrzeby zaznacz brak swiezych danych z internetu.
-ZASADA ANTYHALUCYNACJI: nie wymyslaj danych firm, kontaktow, adresow, cen, ofert, numerow telefonu ani emaili. Gdy dane sa niepelne, podaj najlepsze dostepne informacje z kontekstu internetowego i jasno zaznacz ograniczenia zamiast odmawiac odpowiedzi.
-Jesli dostajesz informacje o pewnosci zrodel (Pewnosc zrodel web: high|medium|low), dostosuj poziom stanowczosci odpowiedzi: low = tylko ostrozne wnioski bez konkretnych liczb i rankingow; medium = fakty potwierdzone + ostrozne dopowiedzenia; high = fakty potwierdzone snippetami.
-Gdy uzytkownik pyta o oferty/ceny/porownania i dane sa niepelne, zakoncz odpowiedz sekcjami: "Co potwierdzono:" oraz "Czego nie potwierdzono:".
-Jesli podajesz fakty z bloku internetowego, dodaj na koncu sekcje "Zrodla:" i wypisz URL-e z ktorych pochodza dane.
-Nigdy nie pisz fikcyjnych zrodel typu "[zrodlo internetowe]" ani "brak zapisanego zrodla".
-Nie wymyslaj wynikow narzedzi ani struktur {"tool":...}. Jesli uzytkownik potrzebuje edycji plikow, skryptow lub sandboxa, napisz krotko zeby wylaczyl tryb „Czat” i uzyl zwyklego agenta.`;
+const CHAT_SYSTEM_PROMPT = `Jestes pomocnym asystentem w trybie CZATU (bez akcji narzedziowych i bez edycji plikow).
+Odpowiadaj po polsku, konkretnie i naturalnie.
+W tym trybie mozesz dostac blok "Kontekst z internetu". Traktuj go jako aktualne dane i samodzielnie decyduj, jak mocno na nim oprzec odpowiedz.
+Jesli danych jest za malo, odpowiedz uczciwie i zaznacz niepewnosc zamiast zgadywac.
+Nie wymyslaj adresow URL ani danych firmowych (telefony, ceny, oferty, adresy, maile), jesli nie wynikaja z kontekstu.
+Jesli korzystasz z danych internetowych, dodaj na koncu krotka sekcje "Źródła:" z URL-ami, ktorych faktycznie uzyles.
+Nie zwracaj JSON ani pseudo-wywolan narzedzi.`;
 
 function looksLikeWebsiteFactQuestion(text) {
   const q = String(text || "").toLowerCase();
@@ -4228,6 +4372,14 @@ function stripSourceSectionsFromHistory(text) {
     out.push(line);
   }
   return out.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function appendSourcesSection(text, sourceUrls = []) {
+  const body = String(text || "").trim();
+  const urls = [...new Set((Array.isArray(sourceUrls) ? sourceUrls : []).map((url) => String(url || "").trim()).filter((url) => /^https?:\/\//i.test(url)))].slice(0, 12);
+  if (!urls.length) return body;
+  if (/^zrodla\s*:|^źródła\s*:/im.test(body)) return body;
+  return `${body}\n\nŹródła:\n${urls.map((url) => `- ${url}`).join("\n")}`;
 }
 
 async function executeTool(action) {
@@ -4500,7 +4652,7 @@ async function downloadFileWithProgress(url, targetPath, label, onProgress = nul
 }
 
 async function ensureVisionSupport() {
-  const visionDir = path.join(BIELIK_HOME, "models", "vision");
+  const visionDir = path.join(ENDOCODE_HOME, "models", "vision");
   await fsp.mkdir(visionDir, { recursive: true });
   
   const textModelUrl = "https://huggingface.co/moondream/moondream2-gguf/resolve/main/moondream2-text-model-f16.gguf";
@@ -4541,7 +4693,7 @@ async function ensureVisionServer() {
     for (const pid of getListeningPidsOnPort(VISION_PORT)) forceKillPid(pid);
   }
 
-  const logDir = path.join(BIELIK_HOME, "logs");
+  const logDir = path.join(ENDOCODE_HOME, "logs");
   await fsp.mkdir(logDir, { recursive: true });
   const outLogPath = path.join(logDir, "vision-server.out.log");
   const errLogPath = path.join(logDir, "vision-server.err.log");
@@ -4848,109 +5000,91 @@ function formatChatFacingError(error, options = {}) {
   return `Nie udalo sie wygenerowac odpowiedzi: ${detail}`;
 }
 
+function getAgentCore() {
+  if (!agentCore) {
+    const memory = createSessionMemory({
+      maxTaskMessages: 8,
+      summarize: (batch) => batch.map(summarizeMessageForCompaction).join("\n"),
+      detectIntentKey: (text) => compactWhitespace(String(text || "")).toLowerCase().slice(0, 140),
+    });
+    const planner = createAgentPlanner({
+      nextAction: getNextActionWithRepair,
+      getRepeatLimit: getActionRepeatLimit,
+      signatureForAction: actionSignature,
+    });
+    const toolExecutor = createToolExecutor({
+      executeTool,
+      onToolResult: (payload) => emit("tool-result", payload),
+    });
+    const orchestrator = createTurnOrchestrator({
+      planner,
+      toolExecutor,
+      memory,
+      emit,
+      compactMessages,
+      appendSourcesSection,
+      buildRepeatedActionBlock,
+    });
+    agentCore = { memory, planner, toolExecutor, orchestrator };
+  }
+  return agentCore;
+}
+
 async function runAgent(userText) {
   if (runInProgress) throw new Error("Agent juz pracuje.");
   runInProgress = true;
   runAbortController = new AbortController();
+  const startedAt = Date.now();
   const signal = runAbortController.signal;
   try {
     await validateCurrentWorkspaceRoot();
     await ensureServer(DEFAULT_PORT);
-    
+    const core = getAgentCore();
+
     let content;
     if (typeof userText === "object" && userText !== null && userText.imageBase64) {
       const promptText = userText.text || "Proszę przeanalizować załączony obraz.";
       emit("run-start", { text: userText.text || "[Wysłano obraz]" });
-      
       const tempImgPath = path.join(os.tmpdir(), `endocode_vision_${Date.now()}.jpg`);
       await fsp.writeFile(tempImgPath, Buffer.from(userText.imageBase64, "base64"));
-      
       try {
         const description = await runVisionSupport(tempImgPath, promptText);
-        content = `[Użytkownik załączył obraz. Pomocniczy system wizji (Moondream2) przeanalizował go dla Ciebie z następującym wynikiem]:\n\n"${description}"\n\n[Polecenie użytkownika]:\n${promptText}`;
+        content = `${promptText}\n\nVision context:\n${description}`;
       } catch (err) {
-        content = `[Użytkownik załączył obraz, ale system pomocniczy napotkał błąd podczas analizy: ${err.message}]\n\n[Polecenie]: ${promptText}`;
+        content = `${promptText}\n\nVision error: ${err.message}`;
       } finally {
         fs.unlink(tempImgPath, () => {});
       }
+    } else if (typeof userText === "object" && userText !== null && userText.attachment) {
+      const text = String(userText.text || "").trim();
+      const attachment = userText.attachment;
+      emit("run-start", { text: text || `[Załączono plik: ${attachment?.name || "plik"}]` });
+      const extracted = await extractAttachmentText(attachment);
+      content = extracted.ok
+        ? `${text || "Przeanalizuj załączony plik."}\n\nAttachment: ${extracted.name}\n${extracted.text}`
+        : `${text || "Przeanalizuj załączony plik."}\n\nAttachment read error: ${extracted.reason}`;
     } else {
-      content = userText;
-      emit("run-start", { text: userText });
+      content = String(userText || "");
+      emit("run-start", { text: content });
     }
     messages.push({ role: "user", content });
 
-    const reasoning = getReasoningProfile();
     const model = getModelConfig();
     const modelSettings = getModelSettingsForId(model?.id || selectedModelId);
+    const reasoning = getReasoningProfile();
+    const effectiveMaxSteps = modelSettings.maxSteps === 0 ? 999999 : (modelSettings.maxSteps ?? reasoning.maxSteps);
     const failedModelIds = new Set();
-    const actionCounts = new Map();
-    const reasoningHistory = [];
-    const effectiveMaxSteps = modelSettings.maxSteps === 0
-
-      ? 999999
-      : (modelSettings.maxSteps ?? reasoning.maxSteps);
-    for (let step = 1; step <= effectiveMaxSteps; step += 1) {
-      if (signal.aborted) throw new Error("Przerwano przez uzytkownika.");
-      compactMessages();
-      const stepLabel = effectiveMaxSteps >= 999999 ? `Krok ${step}` : `Krok ${step} / ${effectiveMaxSteps}`;
-      emit("status", { status: "model-thinking", detail: `${getModelConfig().displayName} — ${stepLabel}`, step });
-      const { action, reasoning } = await getNextActionWithRepair(signal, failedModelIds, step);
-      
-      // Loop Detection for Reasoning
-      if (reasoning && reasoning.trim().length > 10) {
-        const lastReasoning = reasoningHistory[reasoningHistory.length - 1];
-        if (lastReasoning === reasoning.trim()) {
-           throw new Error(`Wykryto petle myslenia modelu (identyczne rozumowanie w kroku ${step-1} i ${step}). Zatrzymuje zadanie, aby uniknac nieskonczonej petli.`);
-        }
-        reasoningHistory.push(reasoning.trim());
-        if (reasoningHistory.length > 3) reasoningHistory.shift();
-      }
-
-      if (action.note) emit("note", { note: action.note, step });
-
-      if (action.final) {
-        emit("final", { note: action.note || "", text: action.final, step });
-        messages.push({ role: "assistant", content: JSON.stringify(action) });
-        return { ok: true, final: action.final };
-      }
-
-
-
-      messages.push({ role: "assistant", content: JSON.stringify(action) });
-      if (signal.aborted) throw new Error("Przerwano przez uzytkownika.");
-      let toolPayload;
-      const signature = actionSignature(action);
-      const seenCount = actionCounts.get(signature) || 0;
-      const repeatLimit = getActionRepeatLimit(action);
-      if (seenCount >= repeatLimit) {
-        toolPayload = buildRepeatedActionBlock(action, seenCount);
-        emit("tool-result", {
-          tool: action.tool,
-          ok: false,
-          error: toolPayload.error,
-          recoveryHint: toolPayload.recoveryHint,
-        });
-      } else {
-        actionCounts.set(signature, seenCount + 1);
-        try {
-          const result = await executeTool(action);
-          toolPayload = { ok: true, result };
-        } catch (error) {
-          if (signal.aborted) throw new Error("Przerwano przez uzytkownika.");
-          const recoveryHint = getToolRecoveryHint(error, action);
-          toolPayload = { ok: false, error: error.message, recoveryHint };
-          emit("tool-result", { tool: action.tool, ok: false, error: error.message, recoveryHint });
-        }
-      }
-
-      messages.push({
-        role: "user",
-        content: `Wynik narzedzia. Kontynuuj albo zakoncz finalem. Jesli ok=false, uwzglednij recoveryHint (jesli jest) i sprobuj innej sciezki — mozesz ponownie uzyc narzedzi, dopoki nie osiagniesz celu lub limitu krokow:\n${JSON.stringify(toolPayload, null, 2)}`,
-      });
-    }
-    const msg = "Osiagnieto limit krokow. Napisz, zeby kontynuowac.";
-    emit("final", { text: msg });
-    return { ok: true, final: msg };
+    const result = await core.orchestrator.runTurn({
+      signal,
+      userContent: content,
+      maxSteps: effectiveMaxSteps,
+      failedModelIds,
+    });
+    const finalText = String(result?.final || "");
+    emit("final", { text: finalText });
+    messages.push({ role: "assistant", content: JSON.stringify({ final: finalText }) });
+    baselineMetrics.recordRun({ mode: "agent", latencyMs: Date.now() - startedAt, ok: true, backend: runtimeBackendStatus.activeBackend });
+    return { ok: true, final: finalText };
   } catch (error) {
     if (signal.aborted) {
       emit("final", { text: "Przerwano zadanie." });
@@ -4965,6 +5099,7 @@ async function runAgent(userText) {
       role: "assistant",
       content: JSON.stringify({ note: "Zadanie zatrzymane z powodu bledu.", final: message }),
     });
+    baselineMetrics.recordRun({ mode: "agent", latencyMs: Date.now() - startedAt, ok: false, backend: runtimeBackendStatus.activeBackend });
     return { ok: false, error: message };
   } finally {
     runInProgress = false;
@@ -4973,10 +5108,16 @@ async function runAgent(userText) {
   }
 }
 
+async function dispatchUserRequest(payload) {
+  // Unified autonomous mode: model plans and executes in one pipeline.
+  return runAgent(payload);
+}
+
 async function runSimpleChat(userText) {
   if (runInProgress) throw new Error("Agent juz pracuje.");
   runInProgress = true;
   runAbortController = new AbortController();
+  const startedAt = Date.now();
   const signal = runAbortController.signal;
   try {
     await validateCurrentWorkspaceRoot();
@@ -5034,18 +5175,14 @@ async function runSimpleChat(userText) {
         emit("status", { status: "model-thinking", detail: `Czat: ${extracted.reason}` });
       }
     }
-    const modelLookupQueryRaw = await deriveLookupQueryWithModel(text, history, signal);
-    const forceLookup = looksLikeFreshFactQuestion(text);
-    const modelLookupQuery = modelLookupQueryRaw || (forceLookup ? buildForcedLookupQuery(text) : "");
+    const modelLookupQuery = await deriveLookupQueryWithModel(text, history, signal);
     let webLookup = null;
     if (modelLookupQuery) {
       emit("chat-web-lookup", {
         phase: "start",
         query: text,
         lookupQuery: modelLookupQuery,
-        detail: modelLookupQueryRaw
-          ? "Model zdecydował, że potrzebny jest web lookup."
-          : "Wymuszono web lookup dla pytania o świeże fakty/daty.",
+        detail: "Model zdecydowal, ze potrzebny jest web lookup.",
       });
       webLookup = await getLightWebContext(text, modelLookupQuery, { strictPreferred: false });
       if (webLookup?.error) {
@@ -5079,11 +5216,7 @@ async function runSimpleChat(userText) {
       if (sourceUrls.length) {
         chatMessages.splice(3, 0, {
           role: "user",
-          content: `Zweryfikowane zrodla URL (uzyj tylko ich, nie wymyslaj nowych):\n${sourceUrls.map((url) => `- ${url}`).join("\n")}`,
-        });
-        chatMessages.splice(4, 0, {
-          role: "user",
-          content: "W tej odpowiedzi wolno cytowac tylko powyzsze URL-e z biezacej tury. Ignoruj jakiekolwiek starsze zrodla z historii.",
+          content: `Dostepne zrodla URL z tej tury:\n${sourceUrls.map((url) => `- ${url}`).join("\n")}`,
         });
       }
       emit("chat-web-lookup", {
@@ -5114,26 +5247,7 @@ async function runSimpleChat(userText) {
         sourceDiagnostics: Array.isArray(webLookup?.sourceDiagnostics) ? webLookup.sourceDiagnostics.slice(0, 8) : [],
         detail: webLookup?.skipped ? "Pominięto web lookup dla krótkiego/nieadekwatnego zapytania." : "Brak trafnego kontekstu internetowego.",
       });
-      const fallbackSummaryPrompt = buildWebLookupFallbackSummary(webLookup, text);
-      chatMessages.splice(1, 0, {
-        role: "user",
-        content: buildWebConfidenceInstruction(webLookup || { quality: { confidence: "low" } }),
-      });
-      chatMessages.splice(1, 0, {
-        role: "user",
-        content: fallbackSummaryPrompt || "Web lookup nie zwrocil pelnego kontekstu. Podaj uczciwie, co udalo sie ustalic i czego nie da sie jeszcze potwierdzic.",
-      });
-    }
-    if (!webLookup?.context && (looksLikeWebsiteFactQuestion(text) || looksLikeFreshFactQuestion(text))) {
-      const fallbackSummaryPrompt = buildWebLookupFallbackSummary(webLookup, text);
-      if (fallbackSummaryPrompt) {
-        chatMessages.splice(1, 0, { role: "user", content: fallbackSummaryPrompt });
-      } else {
-        chatMessages.splice(1, 0, {
-          role: "user",
-          content: "Nie zatrzymuj odpowiedzi z powodu braku pelnej weryfikacji. Podaj najlepsze dostepne wyniki i zaznacz ograniczenia.",
-        });
-      }
+      chatMessages.splice(1, 0, { role: "user", content: "Lookup sieciowy nie dal mocnego kontekstu. Odpowiedz uczciwie: co wiadomo i czego nie udalo sie potwierdzic." });
     }
     const failedModelIds = new Set();
     let rawReply = await callModelWithRecovery(chatMessages, signal, failedModelIds, { plainChat: true });
@@ -5145,73 +5259,14 @@ async function runSimpleChat(userText) {
           : rawReply;
     let reply = String(replySource ?? "").trim();
 
-    const shouldRetryWithWeb =
-      !webLookup?.context &&
-      !modelLookupQuery &&
-      looksLikeNeedsWebInReply(reply);
-    if (shouldRetryWithWeb) {
-      const forcedQuery = buildForcedLookupQuery(text);
-      if (forcedQuery) {
-        emit("chat-web-lookup", {
-          phase: "start",
-          query: text,
-          lookupQuery: forcedQuery,
-          detail: "Auto-web: model zasugerował potrzebę sprawdzenia, uruchamiam lookup.",
-        });
-        const forcedLookup = await getLightWebContext(text, forcedQuery, { strictPreferred: true });
-        if (forcedLookup?.context) {
-          chatMessages.splice(1, 0, { role: "user", content: `Kontekst z internetu:\n${forcedLookup.context}` });
-          chatMessages.splice(2, 0, { role: "user", content: buildWebConfidenceInstruction(forcedLookup) });
-          const src = Array.isArray(forcedLookup.sources)
-            ? forcedLookup.sources.map((source) => String(source?.url || "").trim()).filter(Boolean).slice(0, 6)
-            : [];
-          if (src.length) {
-            chatMessages.splice(3, 0, {
-              role: "user",
-              content: `Zweryfikowane zrodla URL (uzyj tylko ich, nie wymyslaj nowych):\n${src.map((url) => `- ${url}`).join("\n")}`,
-            });
-          }
-          emit("chat-web-lookup", {
-            phase: "result",
-            used: true,
-            fromCache: Boolean(forcedLookup.fromCache),
-            lookupUrl: forcedLookup.lookupUrl || "",
-            query: forcedLookup.query || text,
-            lookupQuery: forcedLookup.lookupQuery || forcedQuery,
-            sources: Array.isArray(forcedLookup.sources) ? forcedLookup.sources.slice(0, 5) : [],
-            visitedUrls: Array.isArray(forcedLookup.visitedUrls) ? forcedLookup.visitedUrls.slice(0, 5) : [],
-            quality: forcedLookup.quality || null,
-            sourceDiagnostics: Array.isArray(forcedLookup.sourceDiagnostics) ? forcedLookup.sourceDiagnostics.slice(0, 8) : [],
-            detail: "Auto-web: dołączono kontekst internetowy i ponawiam odpowiedź.",
-          });
-          const second = await callModelWithRecovery(chatMessages, signal, failedModelIds, { plainChat: true });
-          const secondSource =
-            typeof second === "string"
-              ? second
-              : second && typeof second === "object" && "content" in second
-                ? second.content
-                : second;
-          reply = String(secondSource ?? "").trim();
-        } else {
-          emit("chat-web-lookup", {
-            phase: "result",
-            used: false,
-            fromCache: Boolean(forcedLookup?.fromCache),
-            lookupUrl: forcedLookup?.lookupUrl || "",
-            query: forcedLookup?.query || text,
-            lookupQuery: forcedLookup?.lookupQuery || forcedQuery,
-            sources: Array.isArray(forcedLookup?.sources) ? forcedLookup.sources.slice(0, 5) : [],
-            visitedUrls: Array.isArray(forcedLookup?.visitedUrls) ? forcedLookup.visitedUrls.slice(0, 5) : [],
-            quality: forcedLookup?.quality || null,
-            sourceDiagnostics: Array.isArray(forcedLookup?.sourceDiagnostics) ? forcedLookup.sourceDiagnostics.slice(0, 8) : [],
-            detail: "Auto-web: brak trafnych danych przy ponownej próbie lookup.",
-          });
-        }
-      }
+    if (webLookup?.sources?.length) {
+      const usedUrls = webLookup.sources.map((entry) => String(entry?.url || "").trim()).filter(Boolean).slice(0, 8);
+      reply = appendSourcesSection(reply, usedUrls);
     }
     messages.push({ role: "user", content: text });
     messages.push({ role: "assistant", content: reply });
     emit("final", { text: reply, chatMode: true });
+    baselineMetrics.recordRun({ mode: "chat", latencyMs: Date.now() - startedAt, ok: true, backend: runtimeBackendStatus.activeBackend });
     return { ok: true, final: reply };
   } catch (error) {
     if (signal.aborted) {
@@ -5223,6 +5278,7 @@ async function runSimpleChat(userText) {
       modelName: getModelConfig()?.displayName,
     });
     emit("final", { text: message, chatMode: true });
+    baselineMetrics.recordRun({ mode: "chat", latencyMs: Date.now() - startedAt, ok: false, backend: runtimeBackendStatus.activeBackend });
     return { ok: false, error: message };
   } finally {
     runInProgress = false;
@@ -5236,7 +5292,7 @@ function getState() {
   const modelSettings = getModelSettingsForId(modelConfig?.id || selectedModelId);
   const serverExe = getRuntimeServerExe();
   return {
-    bielikHome: BIELIK_HOME,
+    appHome: ENDOCODE_HOME,
     workspaceRoot,
     cwd: relativeToRoot(cwd),
     selectedModelId,
@@ -5249,7 +5305,14 @@ function getState() {
     runtimeStatus: {
       llamaAvailable: Boolean(serverExe),
       message: serverExe ? "" : "Nie znaleziono runtime/llama-server.exe. Zainstaluj runtime llama.cpp w folderze runtime.",
+      backend: runtimeBackendStatus.activeBackend,
+      expectedBackend: runtimeBackendStatus.expectedBackend,
+      backendValidation: runtimeBackendStatus.validation,
+      backendDetail: runtimeBackendStatus.detail,
+      backendCheckedAt: runtimeBackendStatus.lastCheckedAt,
     },
+    baselineMetrics: baselineMetrics.getSummary(),
+    instructionPolicy: instructionPolicyMeta,
     port: DEFAULT_PORT,
     customModelSettings: modelSettings,
     customModelSettingsByModelId,
@@ -5401,24 +5464,31 @@ ipcMain.handle("app:set-reasoning", (_event, level) => {
   emit("status", { status: "reasoning-selected", detail: `Intensywnosc: ${REASONING_LEVELS[level].label}` });
   return getState();
 });
-ipcMain.handle("agent:send", (_event, payload) => runAgent(payload));
-ipcMain.handle("agent:chat", (_event, text) => runSimpleChat(text));
-ipcMain.handle("agent:abort", () => {
-  if (runAbortController) {
-    runAbortController.abort();
-    return { aborted: true };
-  }
-  return { aborted: false };
-});
-ipcMain.handle("agent:kill-server", () => killModelServerResources());
-ipcMain.handle("approval:reply", (_event, approvalId, approved) => {
-  ipcMain.emit(`approval:${approvalId}`, _event, approved);
+registerAgentIpcHandlers(ipcMain, {
+  runAgent: (payload) => dispatchUserRequest(payload),
+  runSimpleChat: (text) => dispatchUserRequest(text),
+  abortRun: () => {
+    if (runAbortController) {
+      runAbortController.abort();
+      return { aborted: true };
+    }
+    return { aborted: false };
+  },
+  killServer: () => killModelServerResources(),
+  approvalReply: (_event, approvalId, approved) => {
+    ipcMain.emit(`approval:${approvalId}`, _event, approved);
+    return { ok: true };
+  },
 });
 ipcMain.handle("app:system-info", () => {
   const startedAt = Date.now();
   const info = getSystemInfo();
   logPerf("app:system-info", startedAt);
-  return info;
+  return {
+    ...info,
+    runtimeBackend: runtimeBackendStatus.activeBackend,
+    runtimeBackendValidation: runtimeBackendStatus.validation,
+  };
 });
 ipcMain.handle("app:context-info", () => getContextInfo());
 ipcMain.handle("app:install-runtime", async () => installLlamaRuntime());
@@ -5501,7 +5571,7 @@ ipcMain.handle("app:download-model", async (_event, modelId) => {
   if (!model) throw new Error("Model nie znaleziony w katalogu.");
   if (model.kind !== "local-gguf") throw new Error("Ten model nie jest lokalnym plikiem GGUF.");
 
-  const dest = path.resolve(BIELIK_HOME, model.file);
+  const dest = path.resolve(ENDOCODE_HOME, model.file);
   const fileName = path.basename(model.file);
   const sourceRepo = model.source;
   let url = model.downloadUrl;
@@ -5528,7 +5598,7 @@ ipcMain.handle("app:delete-model", async (_event, modelId) => {
   const model = catalog.models.find(m => m.id === modelId);
   if (!model) throw new Error("Model nie znaleziony.");
   
-  const filePath = path.resolve(BIELIK_HOME, model.file);
+  const filePath = path.resolve(ENDOCODE_HOME, model.file);
   if (fs.existsSync(filePath)) {
     fs.unlinkSync(filePath);
     return { ok: true };
@@ -6040,6 +6110,17 @@ ipcMain.handle("app:get-model-settings", (_event, modelId) => {
     _limits: tokenLimits,
     ...getModelSettingsForId(targetModelId),
     _effective: getEffectiveSettingsForModel(targetModelId),
+  };
+});
+
+ipcMain.handle("app:get-model-recommended-settings", (_event, modelId) => {
+  const targetModelId = String(modelId || selectedModelId);
+  const model = loadModelCatalog().models.find((entry) => entry.id === targetModelId);
+  if (!model) throw new Error(`Nieznany model: ${targetModelId}`);
+  return {
+    modelId: targetModelId,
+    modelName: model.displayName,
+    settings: getRecommendedSettingsForModelId(targetModelId),
   };
 });
 

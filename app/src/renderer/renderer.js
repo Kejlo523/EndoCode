@@ -23,7 +23,6 @@ const composerAccess = document.getElementById("composerAccess");
 const liveActivity = document.getElementById("liveActivity");
 const liveLabel = document.getElementById("liveLabel");
 const liveDetail = document.getElementById("liveDetail");
-const chatModeToggle = document.getElementById("chatModeToggle");
 
 const attachBtn = document.getElementById("attachBtn");
 const fileInput = document.getElementById("fileInput");
@@ -107,7 +106,6 @@ let runtimeInstallInProgress = false;
 let currentSettingsModelId = null;
 let refreshStateInFlight = false;
 let updateSystemInFlight = false;
-let loadModelsInFlight = false;
 let streamingAssistantMessage = null;
 const modelRenderCacheLibrary = new Map();
 const modelRenderCacheInstalled = new Map();
@@ -118,6 +116,28 @@ let liveDurationTicker = null;
 let activeRunStartedAtMs = null;
 let currentThinkingSegment = null;
 const activeToolSegments = [];
+const skillsModule = window.EndoModules?.createSkillsModule?.({
+  skillsList,
+  skillsCount,
+  skillRenderCache,
+  escapeHtml,
+  api: {
+    listSkills: () => window.endocode.listSkills(),
+  },
+});
+const modelsModule = window.EndoModules?.createModelsModule?.({
+  modelsList,
+  modelsInstalledList,
+  modelsModal,
+  modelsStatus,
+  modelRenderCacheLibrary,
+  modelRenderCacheInstalled,
+  escapeHtml,
+  escapeAttr,
+  api: {
+    listModels: () => window.endocode.listModels(),
+  },
+});
 
 // ── Helpers ──
 function escapeHtml(value) {
@@ -557,6 +577,17 @@ function toolActionLabel(tool, args) {
   }
 }
 
+function extractSourcesFromAnswer(text = "") {
+  const raw = String(text || "");
+  const marker = raw.match(/(?:^|\n)Źródła:\s*([\s\S]*)$/i);
+  if (!marker?.[1]) return [];
+  const urls = marker[1]
+    .split(/\r?\n/)
+    .map((line) => line.replace(/^\s*-\s*/, "").trim())
+    .filter((line) => /^https?:\/\//i.test(line));
+  return [...new Set(urls)].slice(0, 12);
+}
+
 function renderDiff(diff) {
   if (!Array.isArray(diff) || diff.length === 0) return "";
   const added = diff.filter(r => r.type === "add").length;
@@ -825,7 +856,8 @@ async function updateSystemMonitor() {
     if (info.gpu >= 0) {
       gpuBar.style.width = `${info.gpu}%`;
       const vendor = info.gpuVendor && info.gpuVendor !== "unknown" ? ` ${String(info.gpuVendor).toUpperCase()}` : "";
-      gpuValue.textContent = `${info.gpu}%${vendor}`;
+      const backend = info.runtimeBackend && info.runtimeBackend !== "unknown" ? ` ${String(info.runtimeBackend).toUpperCase()}` : "";
+      gpuValue.textContent = `${info.gpu}%${vendor}${backend}`;
     } else {
       gpuBar.style.width = "0%";
       gpuValue.textContent = info.gpuVendor && info.gpuVendor !== "unknown" ? String(info.gpuVendor).toUpperCase() : "N/A";
@@ -900,7 +932,13 @@ function applyStateToUi(state) {
   if (runtimeWarning) {
     const runtimeMissing = state.runtimeStatus ? !state.runtimeStatus.llamaAvailable : !state.serverExe;
     runtimeWarning.classList.toggle("hidden", !runtimeMissing);
-    runtimeWarning.title = runtimeMissing ? (state.runtimeStatus?.message || "Brak runtime llama.cpp.") : "";
+    const backendHint = state.runtimeStatus?.backend && state.runtimeStatus.backend !== "unknown"
+      ? `Backend: ${state.runtimeStatus.backend}`
+      : "Backend: niezweryfikowany";
+    const detail = state.runtimeStatus?.backendDetail ? ` ${state.runtimeStatus.backendDetail}` : "";
+    runtimeWarning.title = runtimeMissing
+      ? (state.runtimeStatus?.message || "Brak runtime llama.cpp.")
+      : `${backendHint}.${detail}`;
     if (installRuntimeBtn) {
       installRuntimeBtn.disabled = !runtimeMissing || runtimeInstallInProgress;
       installRuntimeBtn.textContent = runtimeInstallInProgress ? "Instalowanie..." : "Pobierz i zainstaluj";
@@ -968,213 +1006,24 @@ function renderReasoningSelect(state) {
 
 // ══════════════ SKILLS ══════════════
 function renderSkills(skills = []) {
-  if (!skillsList) return;
-  const normalized = skills.map((skill) => ({
-    id: skill.id,
-    name: skill.name,
-    category: skill.category,
-    summary: skill.summary,
-    installed: Boolean(skill.installed),
-    localOnly: skill.localOnly !== false,
-  }));
-  if (!normalized.some((skill) => skill.id === "vision")) {
-    normalized.push({
-      id: "vision",
-      name: "Vision (VLM Support)",
-      category: "Zdolności Agenta",
-      summary: "Włącza obsługę załączników obrazów oraz narzędzie analize_image.",
-      installed: false,
-      localOnly: true,
-    });
-  }
-  normalized.sort((a, b) => Number(b.installed) - Number(a.installed) || a.name.localeCompare(b.name));
-  const installedCount = normalized.filter((skill) => skill.installed).length;
-  if (skillsCount) skillsCount.textContent = `${installedCount} / ${normalized.length} aktywnych`;
-  if (!normalized.length) {
-    skillsList.innerHTML = `<div class="skills-empty">Brak lokalnych skilli.</div>`;
-    return;
-  }
-  skillsList.innerHTML = normalized.map((skill) => `
-    <article class="skill-card ${skill.installed ? "installed" : ""}">
-      <div class="skill-card-main">
-        <div class="skill-card-top">
-          <span class="skill-name">${escapeHtml(skill.name)}</span>
-          <span class="skill-category">${escapeHtml(skill.category)}</span>
-        </div>
-        <p class="skill-summary">${escapeHtml(skill.summary)}</p>
-        <div class="skill-local">${skill.localOnly ? "local-only" : "online"}</div>
-      </div>
-      <div class="skill-actions">
-        <span class="skill-state ${skill.installed ? "installed" : "available"}">${skill.installed ? "Aktywny" : "Dostępny"}</span>
-        <button class="skill-install-btn ${skill.installed ? "installed" : ""}" data-skill-id="${escapeHtml(skill.id)}" data-action="${skill.installed ? "uninstall" : "install"}">
-          ${skill.installed ? "Usuń" : "Instaluj"}
-        </button>
-      </div>
-    </article>
-  `).join("");
-  skillRenderCache.clear();
-  normalized.forEach((skill) => skillRenderCache.set(skill.id, JSON.stringify(skill)));
+  skillsModule?.renderSkills(skills);
 }
 
 async function loadSkills() {
-  if (!skillsList) return;
-  skillsList.innerHTML = `<div class="skills-empty">Ładowanie...</div>`;
-  try {
-    renderSkills(await window.endocode.listSkills());
-  } catch (e) {
-    skillsList.innerHTML = `<div class="skills-empty error">${escapeHtml(e.message || String(e))}</div>`;
-  }
+  await skillsModule?.loadSkills?.();
 }
 
 // ══════════════ MODELS ══════════════
-function normalizeModelUiState(model) {
-  const status = model.fileStatus || {};
-  const progress = Number(status.progress || 0);
-  const bytes = Number(status.expectedBytes || model.expectedBytes || 0);
-  const sizeGB = bytes > 0 ? `${(bytes / 1024 / 1024 / 1024).toFixed(1)} GB` : "?";
-  const categoryLabel = { small: "Mały", medium: "Średni", large: "Duży" }[model.category] || "";
-  const state = status.state || (status.available ? "completed" : "idle");
-  return {
-    ...model,
-    ui: {
-      state,
-      progress,
-      sizeGB,
-      categoryLabel,
-      downloaded: Number(status.downloaded || 0),
-      total: Number(status.total || 0),
-      error: status.error || "",
-      isDownloaded: Boolean(status.available),
-      isDownloading: state === "queued" || state === "downloading",
-      isFailed: state === "failed",
-    },
-  };
-}
-
-function renderModelCard(model) {
-  const { ui } = model;
-  let badge = "";
-  if (model.kind === "cloud-api") badge = '<span class="model-badge cloud">Cloud API</span>';
-  else if (ui.isDownloaded) badge = '<span class="model-badge installed">Pobrany</span>';
-  else if (ui.isDownloading) badge = '<span class="model-badge">Pobieranie...</span>';
-  else if (ui.isFailed) badge = '<span class="model-badge error">Błąd pobierania</span>';
-  else badge = '<span class="model-badge">Gotowy do pobrania</span>';
-
-  const actions = [];
-  if (model.kind !== "cloud-api") {
-    if (ui.isDownloaded) {
-      actions.push(`<button class="model-btn use" onclick="useModel('${escapeAttr(model.id)}')">${model.selected ? "Aktywny" : "Użyj"}</button>`);
-      actions.push(`<button class="model-btn use" onclick="openSettingsModal('${escapeAttr(model.id)}')">Ustawienia</button>`);
-      actions.push(`<button class="model-btn delete" onclick="deleteModel('${escapeAttr(model.id)}')">Usuń</button>`);
-    } else if (ui.isDownloading) {
-      actions.push(`<button class="model-btn download" disabled>${ui.state === "queued" ? "W kolejce..." : `Pobieranie ${ui.progress}%...`}</button>`);
-    } else {
-      const cta = ui.isFailed ? "Ponów pobieranie" : `Pobierz (${ui.sizeGB})`;
-      actions.push(`<button class="model-btn download" onclick="downloadModel('${escapeAttr(model.id)}')">${cta}</button>`);
-    }
-  } else {
-    actions.push(`<button class="model-btn use" onclick="useModel('${escapeAttr(model.id)}')">${model.selected ? "Aktywny" : "Użyj"}</button>`);
-  }
-
-  return `
-    <article class="model-item ${model.selected ? "selected" : ""}" data-model-id="${escapeAttr(model.id)}" data-model-state="${escapeAttr(ui.state)}">
-      <div class="model-info-header">
-        <div class="model-main-info">
-          <span class="model-name">${escapeHtml(model.displayName)}</span>
-          <span class="model-id">${escapeHtml(model.id)}</span>
-        </div>
-        ${badge}
-      </div>
-      <p class="model-desc">${escapeHtml(model.description)}</p>
-      <div class="model-meta">
-        <div class="model-meta-item"><span>Rodzaj:</span> <strong>${model.kind === "local-gguf" ? "Lokalny" : "API"}</strong></div>
-        ${ui.categoryLabel ? `<div class="model-meta-item"><span>Rozmiar:</span> <strong>${ui.categoryLabel}</strong></div>` : ""}
-        ${model.contextTokens ? `<div class="model-meta-item"><span>Kontekst:</span> <strong>${(model.contextTokens / 1024).toFixed(0)}k</strong></div>` : ""}
-      </div>
-      ${ui.isDownloading ? `<div class="download-progress-container"><div class="download-progress-fill" style="width:${ui.progress}%"></div></div>` : ""}
-      ${ui.isFailed && ui.error ? `<div class="model-error">${escapeHtml(ui.error)}</div>` : ""}
-      <div class="model-actions">${actions.join("")}</div>
-    </article>
-  `;
-}
-
 function renderModels(models = [], targetEl = modelsList, cacheMap = modelRenderCacheLibrary) {
-  if (!targetEl) return;
-  if (!models.length) {
-    targetEl.innerHTML = `<div class="models-empty">Brak modeli w katalogu.</div>`;
-    cacheMap.clear();
-    return;
-  }
-  const normalized = models.map(normalizeModelUiState);
-  const nextIds = new Set(normalized.map((model) => model.id));
-  for (const [id] of cacheMap) {
-    if (!nextIds.has(id)) cacheMap.delete(id);
-  }
-  const html = [];
-  for (const model of normalized) {
-    const signature = JSON.stringify({
-      id: model.id,
-      selected: model.selected,
-      state: model.ui.state,
-      progress: model.ui.progress,
-      available: model.ui.isDownloaded,
-      error: model.ui.error,
-      ctx: model.contextTokens,
-    });
-    cacheMap.set(model.id, signature);
-    html.push(renderModelCard(model));
-  }
-  targetEl.innerHTML = html.join("");
+  modelsModule?.renderModels(models, targetEl, cacheMap);
 }
 
 function patchModelDownloadProgress(modelId, progress, downloaded = 0, total = 0) {
-  const safeId = CSS.escape(String(modelId || ""));
-  const cards = modelsModal ? modelsModal.querySelectorAll(`.model-item[data-model-id="${safeId}"]`) : [];
-  cards.forEach((card) => {
-    card.setAttribute("data-model-state", "downloading");
-    let progressWrap = card.querySelector(".download-progress-container");
-    if (!progressWrap) {
-      progressWrap = document.createElement("div");
-      progressWrap.className = "download-progress-container";
-      progressWrap.innerHTML = `<div class="download-progress-fill" style="width:0%"></div>`;
-      const actions = card.querySelector(".model-actions");
-      if (actions?.parentNode) actions.parentNode.insertBefore(progressWrap, actions);
-    }
-    const fill = progressWrap.querySelector(".download-progress-fill");
-    if (fill) fill.style.width = `${Math.max(0, Math.min(100, Number(progress) || 0))}%`;
-
-    const actionBtn = card.querySelector(".model-btn.download");
-    if (actionBtn) {
-      actionBtn.disabled = true;
-      actionBtn.textContent = `Pobieranie ${Math.max(0, Math.min(100, Number(progress) || 0))}%...`;
-    }
-
-    const downloadedMb = (Number(downloaded || 0) / 1024 / 1024).toFixed(0);
-    const totalMb = Number(total || 0) > 0 ? `${(Number(total) / 1024 / 1024).toFixed(0)} MB` : "?? MB";
-    const desc = card.querySelector(".model-desc");
-    if (desc) {
-      if (!desc.dataset.originalText) desc.dataset.originalText = desc.textContent || "";
-      desc.textContent = `Pobieranie: ${downloadedMb} MB / ${totalMb}`;
-    }
-  });
+  modelsModule?.patchModelDownloadProgress(modelId, progress, downloaded, total);
 }
 
 async function loadModels() {
-  if (!modelsList) return;
-  if (loadModelsInFlight) return;
-  loadModelsInFlight = true;
-  modelsList.innerHTML = `<div class="models-empty">Ładowanie...</div>`;
-  if (modelsInstalledList) modelsInstalledList.innerHTML = `<div class="models-empty">Ładowanie...</div>`;
-  try {
-    const models = await window.endocode.listModels();
-    renderModels(models, modelsList, modelRenderCacheLibrary);
-    const installed = models.filter((model) => model.kind === "local-gguf" && model.fileStatus?.available);
-    renderModels(installed, modelsInstalledList, modelRenderCacheInstalled);
-  } catch (e) {
-    modelsList.innerHTML = `<div class="models-empty error">${escapeHtml(e.message || String(e))}</div>`;
-    if (modelsInstalledList) modelsInstalledList.innerHTML = `<div class="models-empty error">${escapeHtml(e.message || String(e))}</div>`;
-  }
-  finally { loadModelsInFlight = false; }
+  await modelsModule?.loadModels?.();
 }
 
 window.useModel = async (modelId) => {
@@ -1193,7 +1042,7 @@ window.useModel = async (modelId) => {
 
 window.downloadModel = async (modelId) => {
   try {
-    if (modelsStatus) modelsStatus.textContent = "Rozpoczynam pobieranie...";
+    modelsModule?.setModelsStatus?.("Rozpoczynam pobieranie...");
     await window.endocode.downloadModel(modelId);
     await loadModels();
   } catch (e) {
@@ -1513,24 +1362,12 @@ composer.addEventListener("submit", async (event) => {
   setBusy(true);
 
   try {
-    const useChatMode = Boolean(chatModeToggle?.checked);
-    if (useChatMode) {
-      await window.endocode.sendChat({
-        text,
-        attachment: attachedFile || (attachedBase64 ? {
-          name: "image.png",
-          mimeType: "image/png",
-          size: 0,
-          dataBase64: attachedBase64.split(",")[1] || attachedBase64,
-        } : null),
-      });
-    } else {
-      const payload = attachedBase64 ? { text, imageBase64: attachedBase64.split(",")[1] } : text;
-      if (attachedFile && !attachedBase64) {
-        addInlineEvent("note", "Załącznik", "Pliki tekstowe/dokumenty działają w trybie Czat. W trybie agenta użyj Czat lub załącz obraz z Vision.");
-      }
-      await window.endocode.send(payload);
-    }
+    const payload = attachedBase64
+      ? { text, imageBase64: attachedBase64.split(",")[1] }
+      : attachedFile
+        ? { text, attachment: attachedFile }
+        : text;
+    await window.endocode.send(payload);
   } catch (e) {
     addInlineEvent("error", "Błąd", e.message || String(e));
   } finally {
@@ -1662,13 +1499,8 @@ window.endocode.onEvent(async (event) => {
     currentThinkingSegment = null;
     activeToolSegments.length = 0;
     removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
-    if (event.chatMode) {
-      addInlineEvent("activity", "Czat", "Jedna odpowiedź tekstowa (z automatycznym lekkim kontekstem internetowym).");
-      showLive("Czat…", event.text || "");
-    } else {
-      addInlineEvent("activity", "Agent startuje", "Rozpoczęto zadanie.");
-      showLive("Przygotowuje...");
-    }
+    addInlineEvent("activity", "Model planuje", "Analiza promptu i plan działania.");
+    showLive("Przygotowuje...");
     return;
   }
   if (event.type === "run-end") {
@@ -1792,15 +1624,11 @@ window.endocode.onEvent(async (event) => {
   if (event.type === "final") {
     removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
     if (event.note) addInlineEvent("note", "Podsumowanie", event.note);
-    if (event.chatMode) {
-      const isStopFinal = String(event.text || "").trim() === "Przerwano.";
-      if (isStopFinal && hasStreamingAssistantContent()) {
-        finalizeStreamingAssistantMessage("", { overwriteText: false });
-        addInlineEvent("note", "Czat", "Generowanie przerwane. Zachowano dotychczasową treść odpowiedzi.");
-      } else {
-        finalizeStreamingAssistantMessage(event.text || "");
-      }
-    } else addMessage("assistant", event.text);
+    addMessage("assistant", event.text);
+    const sources = extractSourcesFromAnswer(event.text || "");
+    if (sources.length) {
+      addInlineEvent("activity", "Źródła", sources.map((url) => `- ${url}`).join("\n"));
+    }
     if (Number.isFinite(activeRunStartedAtMs)) {
       addTotalDurationDivider(parseEventTimeMs(event) - activeRunStartedAtMs);
       activeRunStartedAtMs = null;
@@ -1851,6 +1679,53 @@ const SETTINGS_FIELDS = [
   { id: "parallel", slider: "set_parallel", display: "val_parallel", decimals: 0 },
   { id: "flashAttention", slider: "set_flashAttention", display: "val_flashAttention", decimals: 0, formatFn: (v) => Number(v) === 1 ? "on" : "off" },
 ];
+const BASIC_SETTINGS = new Set(["contextTokens", "gpuLayers", "maxTokens", "maxMessages"]);
+let settingsAdvancedVisible = false;
+let cachedRecommendedSettings = null;
+
+function ensureSettingsControls() {
+  if (!settingsModal) return;
+  if (document.getElementById("toggleAdvancedSettings")) return;
+  const header = settingsModal.querySelector(".modal-header");
+  if (!header) return;
+  const wrap = document.createElement("div");
+  wrap.style.display = "flex";
+  wrap.style.alignItems = "center";
+  wrap.style.gap = "8px";
+  wrap.style.marginLeft = "auto";
+  wrap.innerHTML = `
+    <button id="applyRecommendedSettings" class="modal-btn" type="button">Optymalne (Auto GPU)</button>
+    <button id="toggleAdvancedSettings" class="modal-btn" type="button">Zaawansowane: off</button>
+  `;
+  const closeBtn = header.querySelector("#closeSettings");
+  if (closeBtn) header.insertBefore(wrap, closeBtn);
+  else header.appendChild(wrap);
+  document.getElementById("toggleAdvancedSettings")?.addEventListener("click", () => {
+    settingsAdvancedVisible = !settingsAdvancedVisible;
+    applySettingsVisibility();
+  });
+  document.getElementById("applyRecommendedSettings")?.addEventListener("click", () => {
+    if (!cachedRecommendedSettings) return;
+    applySettingsToSliders(cachedRecommendedSettings);
+    addInlineEvent("note", "Ustawienia", "Załadowano rekomendowane ustawienia pod ten model i sprzęt.");
+  });
+}
+
+function applySettingsVisibility() {
+  const toggle = document.getElementById("toggleAdvancedSettings");
+  if (toggle) toggle.textContent = `Zaawansowane: ${settingsAdvancedVisible ? "on" : "off"}`;
+  for (const field of SETTINGS_FIELDS) {
+    const slider = document.getElementById(field.slider);
+    const row = slider?.closest(".setting-row");
+    if (!row) continue;
+    const isBasic = BASIC_SETTINGS.has(field.id);
+    row.classList.toggle("hidden", !isBasic && !settingsAdvancedVisible);
+  }
+  if (rawModelJson) {
+    const rawRow = rawModelJson.closest(".setting-row");
+    if (rawRow) rawRow.classList.toggle("hidden", !settingsAdvancedVisible);
+  }
+}
 
 function applySliderRange(sliderId, range = {}) {
   const slider = document.getElementById(sliderId);
@@ -1881,35 +1756,43 @@ for (const field of SETTINGS_FIELDS) {
   }
 }
 
+function applySettingsToSliders(settings = {}, eff = {}) {
+  setSlider("set_temperature", "val_temperature", settings.temperature ?? eff.temperature, 2);
+  setSlider("set_maxTokens", "val_maxTokens", settings.maxTokens ?? eff.maxTokens, 0);
+  setSlider("set_maxSteps", "val_maxSteps", settings.maxSteps ?? eff.maxSteps, 0, (v) => v == 0 ? "∞" : String(v));
+  setSlider("set_topP", "val_topP", settings.topP ?? 1.0, 2);
+  setSlider("set_topK", "val_topK", settings.topK ?? 0, 0);
+  setSlider("set_repeatPenalty", "val_repeatPenalty", settings.repeatPenalty ?? 1.0, 2);
+  setSlider(
+    "set_contextTokens",
+    "val_contextTokens",
+    settings.contextTokens ?? eff.contextTokens,
+    0,
+    (v) => Number(v).toLocaleString("pl-PL"),
+  );
+  setSlider("set_gpuLayers", "val_gpuLayers", settings.gpuLayers ?? eff.gpuLayers, 0);
+  setSlider("set_maxMessages", "val_maxMessages", settings.maxMessages ?? eff.maxMessages ?? 32, 0);
+  setSlider("set_threads", "val_threads", settings.threads ?? eff.threads ?? 8, 0);
+  setSlider("set_threadsBatch", "val_threadsBatch", settings.threadsBatch ?? eff.threadsBatch ?? 12, 0);
+  setSlider("set_batchSize", "val_batchSize", settings.batchSize ?? eff.batchSize ?? 1024, 0);
+  setSlider("set_ubatchSize", "val_ubatchSize", settings.ubatchSize ?? eff.ubatchSize ?? 512, 0);
+  setSlider("set_parallel", "val_parallel", settings.parallel ?? eff.parallel ?? 1, 0);
+  setSlider("set_flashAttention", "val_flashAttention", (settings.flashAttention ?? eff.flashAttention ?? "on") === "on" ? 1 : 0, 0, (v) => Number(v) === 1 ? "on" : "off");
+}
+
 async function openSettingsModal(modelId = modelSelect.value) {
   try {
+    ensureSettingsControls();
     const settings = await window.endocode.getModelSettings(modelId);
+    const recommended = await window.endocode.getModelRecommendedSettings(modelId).catch(() => null);
+    cachedRecommendedSettings = recommended?.settings || null;
     currentSettingsModelId = settings.modelId || modelId;
     if (settingsModelName) settingsModelName.textContent = `Model: ${settings.modelName || currentSettingsModelId}`;
     const eff = settings._effective || {};
     applyDynamicTokenLimits(settings._limits || {});
-    // Populate sliders with current values
-    setSlider("set_temperature", "val_temperature", settings.temperature ?? eff.temperature, 2);
-    setSlider("set_maxTokens", "val_maxTokens", settings.maxTokens ?? eff.maxTokens, 0);
-    setSlider("set_maxSteps", "val_maxSteps", settings.maxSteps ?? eff.maxSteps, 0, (v) => v == 0 ? "∞" : String(v));
-    setSlider("set_topP", "val_topP", settings.topP ?? 1.0, 2);
-    setSlider("set_topK", "val_topK", settings.topK ?? 0, 0);
-    setSlider("set_repeatPenalty", "val_repeatPenalty", settings.repeatPenalty ?? 1.0, 2);
-    setSlider(
-      "set_contextTokens",
-      "val_contextTokens",
-      settings.contextTokens ?? eff.contextTokens,
-      0,
-      (v) => Number(v).toLocaleString("pl-PL"),
-    );
-    setSlider("set_gpuLayers", "val_gpuLayers", settings.gpuLayers ?? eff.gpuLayers, 0);
-    setSlider("set_maxMessages", "val_maxMessages", settings.maxMessages ?? eff.maxMessages ?? 32, 0);
-    setSlider("set_threads", "val_threads", settings.threads ?? eff.threads ?? 8, 0);
-    setSlider("set_threadsBatch", "val_threadsBatch", settings.threadsBatch ?? eff.threadsBatch ?? 12, 0);
-    setSlider("set_batchSize", "val_batchSize", settings.batchSize ?? eff.batchSize ?? 1024, 0);
-    setSlider("set_ubatchSize", "val_ubatchSize", settings.ubatchSize ?? eff.ubatchSize ?? 512, 0);
-    setSlider("set_parallel", "val_parallel", settings.parallel ?? eff.parallel ?? 1, 0);
-    setSlider("set_flashAttention", "val_flashAttention", (settings.flashAttention ?? eff.flashAttention ?? "on") === "on" ? 1 : 0, 0, (v) => Number(v) === 1 ? "on" : "off");
+    applySettingsToSliders(settings, eff);
+    settingsAdvancedVisible = false;
+    applySettingsVisibility();
     if (rawModelJson) {
       const raw = await window.endocode.getModelRawConfig(currentSettingsModelId);
       rawModelJson.value = raw.rawJson || "{}";
@@ -1975,7 +1858,7 @@ applySettings.addEventListener("click", async () => {
 resetSettings.addEventListener("click", async () => {
   try {
     await window.endocode.resetModelSettings(currentSettingsModelId);
-    addInlineEvent("note", "Ustawienia", "Przywrócono domyślne ustawienia.");
+    addInlineEvent("note", "Ustawienia", "Przywrócono rekomendowane ustawienia dla modelu.");
     await openSettingsModal(currentSettingsModelId); // refresh sliders
   } catch (e) {
     addInlineEvent("error", "Ustawienia", e.message || String(e));
@@ -2005,6 +1888,10 @@ if (tabLibrary && tabDiscover && tabInstalled && tabManual) {
     modelsInstalledView.classList.toggle("hidden", tabName !== "installed");
     modelsDiscoverView.classList.toggle("hidden", tabName !== "discover");
     modelsManualView.classList.toggle("hidden", tabName !== "manual");
+    if (tabName === "discover") {
+      ensureDiscoveryObserver();
+      if (!discoveryAllResults.length && !discoveryLoading) void runDiscoverySearch({ resetResults: true });
+    }
   };
 
   tabLibrary.addEventListener("click", () => activateTab("library"));
@@ -2018,21 +1905,159 @@ const discoveryList = document.getElementById("discoveryList");
 const hfSearchInput = document.getElementById("hfSearchInput");
 const hfSearchBtn = document.getElementById("hfSearchBtn");
 const modelSourceSelect = document.getElementById("modelSourceSelect");
+const discoveryStatus = document.getElementById("discoveryStatus");
+const discoverySentinel = document.getElementById("discoverySentinel");
 let currentFilter = "all";
 let lastDiscoveryResults = new Map();
+let discoveryAllResults = [];
+let discoveryRenderCount = 0;
+let discoveryLoading = false;
+let discoveryQueryTimer = null;
+let discoveryObserver = null;
+let discoveryRequestSeq = 0;
+const DISCOVERY_PAGE_SIZE = 18;
+
+function setDiscoveryStatus(text) {
+  if (discoveryStatus) discoveryStatus.textContent = text;
+}
+
+function setDiscoveryLoading(message = "Ładowanie...") {
+  if (!discoveryList) return;
+  discoveryList.innerHTML = `<div class="models-loading">${escapeHtml(message)}</div>`;
+}
+
+function ensureDiscoveryObserver() {
+  if (!discoverySentinel || discoveryObserver) return;
+  discoveryObserver = new IntersectionObserver((entries) => {
+    const hit = entries.some((entry) => entry.isIntersecting);
+    if (!hit) return;
+    renderDiscoveryPage(false);
+  }, { root: null, threshold: 0.2 });
+  discoveryObserver.observe(discoverySentinel);
+}
+
+function scheduleDiscoverySearch(delayMs = 220) {
+  if (discoveryQueryTimer) clearTimeout(discoveryQueryTimer);
+  discoveryQueryTimer = setTimeout(() => {
+    discoveryQueryTimer = null;
+    void runDiscoverySearch({ resetResults: true });
+  }, delayMs);
+}
+
+async function runDiscoverySearch(options = {}) {
+  const resetResults = options.resetResults !== false;
+  const query = hfSearchInput?.value?.trim() || "";
+  const source = modelSourceSelect?.value || "all";
+  const requestId = ++discoveryRequestSeq;
+  discoveryLoading = true;
+  if (resetResults) {
+    discoveryAllResults = [];
+    discoveryRenderCount = 0;
+    setDiscoveryLoading("Pobieram listę modeli z sieci...");
+  }
+  setDiscoveryStatus("Wyszukiwanie...");
+  if (hfSearchBtn) hfSearchBtn.disabled = true;
+  try {
+    const searchFn = window.endocode.searchModels || window.endocode.searchHfModels;
+    const results = await searchFn({ query, filter: currentFilter, source });
+    if (requestId !== discoveryRequestSeq) return;
+    discoveryAllResults = Array.isArray(results) ? results : [];
+    discoveryRenderCount = 0;
+    renderDiscoveryPage(true);
+    setDiscoveryStatus(`Wyniki: ${discoveryAllResults.length}`);
+  } catch (e) {
+    if (requestId !== discoveryRequestSeq) return;
+    if (discoveryList) discoveryList.innerHTML = `<div class="models-empty error">${escapeHtml(e.message || String(e))}</div>`;
+    setDiscoveryStatus("Błąd pobierania");
+  } finally {
+    if (requestId === discoveryRequestSeq) discoveryLoading = false;
+    if (hfSearchBtn) hfSearchBtn.disabled = false;
+  }
+}
+
+function buildDiscoveryCard(model) {
+  const m = model || {};
+  const badges = [];
+  if (m.recommended) badges.push(`<span class="model-badge recommended">Zalecane dla Twojego PC</span>`);
+  if (m.sourceLabel) badges.push(`<span class="model-badge source">${escapeHtml(m.sourceLabel)}</span>`);
+  if (m.hardwareProfile && m.recommended) badges.push(`<span class="model-badge fit">${escapeHtml(m.hardwareProfile)}</span>`);
+  const fileLine = m.fileName
+    ? `<span class="model-meta-item">Plik: <strong>${escapeHtml(m.fileName)}</strong>${m.expectedBytes ? ` (${escapeHtml((m.expectedBytes / 1024 / 1024 / 1024).toFixed(1))} GB)` : ""}</span>`
+    : "";
+  const actions = m.externalOnly
+    ? `<button class="model-btn use js-open-model-source" data-url="${escapeAttr(m.openUrl)}">Otwórz stronę</button>`
+    : `<button class="model-btn primary js-add-discovery" data-model-id="${escapeAttr(m.id)}" ${m.canDownload ? "" : "disabled"}>Dodaj i pobierz</button>
+       ${m.openUrl ? `<button class="model-btn use js-open-model-source" data-url="${escapeAttr(m.openUrl)}">Źródło</button>` : ""}`;
+
+  return `
+    <div class="model-item">
+      <div class="model-info-header">
+        <div class="model-main-info">
+          <span class="model-name">${escapeHtml(m.name || m.id || "Model")}</span>
+          <span class="model-id">${escapeHtml(m.id || "")}</span>
+        </div>
+        <div class="model-badges">${badges.join("")}</div>
+      </div>
+      <p class="model-desc">${escapeHtml(m.description || "Brak opisu.")}</p>
+      <div class="model-meta">
+        <span class="model-meta-item">Autor: ${escapeHtml(m.author || "unknown")}</span>
+        ${fileLine}
+      </div>
+      <div class="model-actions">${actions}</div>
+    </div>
+  `;
+}
+
+function attachDiscoveryCardHandlers() {
+  if (!discoveryList) return;
+  discoveryList.querySelectorAll(".js-add-discovery").forEach((btn) => {
+    btn.addEventListener("click", () => addAndDownload(btn.getAttribute("data-model-id")));
+  });
+  discoveryList.querySelectorAll(".js-open-model-source").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      try {
+        await window.endocode.openExternal(btn.getAttribute("data-url"));
+      } catch (e) {
+        alert(e.message || String(e));
+      }
+    });
+  });
+}
+
+function renderDiscoveryPage(reset = false) {
+  if (!discoveryList) return;
+  if (reset) {
+    discoveryList.innerHTML = "";
+    lastDiscoveryResults = new Map();
+    discoveryRenderCount = 0;
+  }
+  if (!discoveryAllResults.length) {
+    discoveryList.innerHTML = `<div class="models-empty">Brak wyników dla podanych filtrów.</div>`;
+    setDiscoveryStatus("Wyniki: 0");
+    return;
+  }
+  if (discoveryRenderCount >= discoveryAllResults.length) return;
+  const next = discoveryAllResults.slice(discoveryRenderCount, discoveryRenderCount + DISCOVERY_PAGE_SIZE);
+  const html = next.map((m) => {
+    lastDiscoveryResults.set(m.id, m);
+    return buildDiscoveryCard(m);
+  }).join("");
+  discoveryList.insertAdjacentHTML("beforeend", html);
+  discoveryRenderCount += next.length;
+  attachDiscoveryCardHandlers();
+  const loadedAll = discoveryRenderCount >= discoveryAllResults.length;
+  setDiscoveryStatus(loadedAll ? `Wyniki: ${discoveryAllResults.length} (koniec listy)` : `Wyniki: ${discoveryRenderCount}/${discoveryAllResults.length}`);
+}
 
 if (hfSearchBtn) {
   hfSearchBtn.addEventListener("click", async () => {
-    const query = hfSearchInput.value.trim();
-    const source = modelSourceSelect?.value || "all";
-    discoveryList.innerHTML = `<div class="models-empty">Przeszukuję źródła modeli...</div>`;
-    try {
-      const searchFn = window.endocode.searchModels || window.endocode.searchHfModels;
-      const results = await searchFn({ query, filter: currentFilter, source });
-      renderDiscovery(results);
-    } catch (e) {
-      discoveryList.innerHTML = `<div class="models-empty error">${e.message}</div>`;
-    }
+    await runDiscoverySearch({ resetResults: true });
+  });
+}
+
+if (hfSearchInput) {
+  hfSearchInput.addEventListener("input", () => {
+    scheduleDiscoverySearch(260);
   });
 }
 
@@ -2041,13 +2066,13 @@ document.querySelectorAll(".filter-btn").forEach(btn => {
     document.querySelectorAll(".filter-btn").forEach(b => b.classList.remove("active"));
     btn.classList.add("active");
     currentFilter = btn.getAttribute("data-filter");
-    if (hfSearchBtn) hfSearchBtn.click();
+    void runDiscoverySearch({ resetResults: true });
   });
 });
 
 if (modelSourceSelect) {
   modelSourceSelect.addEventListener("change", () => {
-    if (hfSearchBtn) hfSearchBtn.click();
+    void runDiscoverySearch({ resetResults: true });
   });
 }
 
@@ -2079,65 +2104,8 @@ if (pickManualModelBtn) {
   });
 }
 
-function renderDiscovery(results) {
-  if (!discoveryList) return;
-  discoveryList.innerHTML = "";
-  lastDiscoveryResults = new Map();
-  if (results.length === 0) {
-    discoveryList.innerHTML = `<div class="models-empty">Brak wyników dla podanych filtrów.</div>`;
-    return;
-  }
-
-  results.forEach(m => {
-    const card = document.createElement("div");
-    card.className = "model-item";
-    lastDiscoveryResults.set(m.id, m);
-
-    const badges = [];
-    if (m.recommended) badges.push(`<span class="model-badge recommended">Zalecane dla Twojego PC</span>`);
-    if (m.sourceLabel) badges.push(`<span class="model-badge source">${escapeHtml(m.sourceLabel)}</span>`);
-    if (m.hardwareProfile && m.recommended) badges.push(`<span class="model-badge fit">${escapeHtml(m.hardwareProfile)}</span>`);
-    const fileLine = m.fileName
-      ? `<span class="model-meta-item">Plik: <strong>${escapeHtml(m.fileName)}</strong>${m.expectedBytes ? ` (${escapeHtml((m.expectedBytes / 1024 / 1024 / 1024).toFixed(1))} GB)` : ""}</span>`
-      : "";
-    const actions = m.externalOnly
-      ? `<button class="model-btn use js-open-model-source" data-url="${escapeAttr(m.openUrl)}">Otwórz stronę</button>`
-      : `<button class="model-btn download js-add-discovery" data-model-id="${escapeAttr(m.id)}" ${m.canDownload ? "" : "disabled"}>Dodaj i pobierz</button>
-         ${m.openUrl ? `<button class="model-btn use js-open-model-source" data-url="${escapeAttr(m.openUrl)}">Źródło</button>` : ""}`;
-
-    card.innerHTML = `
-      <div class="model-info-header">
-        <div class="model-main-info">
-          <span class="model-name">${escapeHtml(m.name)}</span>
-          <span class="model-id">${escapeHtml(m.id)}</span>
-        </div>
-        <div class="model-badges">${badges.join("")}</div>
-      </div>
-      <p class="model-desc">${escapeHtml(m.description)}</p>
-      <div class="model-meta">
-        <span class="model-meta-item">Autor: ${escapeHtml(m.author)}</span>
-        ${fileLine}
-      </div>
-      <div class="model-actions">
-        ${actions}
-      </div>
-    `;
-    card.querySelector(".js-add-discovery")?.addEventListener("click", () => addAndDownload(m.id));
-    card.querySelectorAll(".js-open-model-source").forEach((btn) => {
-      btn.addEventListener("click", async () => {
-        try {
-          await window.endocode.openExternal(btn.getAttribute("data-url"));
-        } catch (e) {
-          alert(e.message || String(e));
-        }
-      });
-    });
-    discoveryList.appendChild(card);
-  });
-}
-
 window.addAndDownload = async (modelKey) => {
-  if (discoveryList) discoveryList.innerHTML = `<div class="models-empty">Przygotowuję model...</div>`;
+  setDiscoveryLoading("Przygotowuję model do pobrania...");
   try {
     const model = lastDiscoveryResults.get(modelKey);
     if (!model || !model.downloadUrl) throw new Error("Ten wynik nie ma bezpośredniego linku do pliku .gguf.");
@@ -2152,6 +2120,6 @@ window.addAndDownload = async (modelKey) => {
     if (added?.model?.id) window.endocode.downloadModel(added.model.id);
   } catch (e) {
     alert(e.message);
-    if (hfSearchBtn) hfSearchBtn.click();
+    await runDiscoverySearch({ resetResults: true });
   }
 };
