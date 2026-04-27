@@ -3,12 +3,26 @@ function createToolExecutor(options = {}) {
     executeTool,
     onToolResult = () => {},
     onSourceUrl = () => {},
+    validateAction = null,
   } = options;
 
   if (typeof executeTool !== "function") throw new Error("createToolExecutor requires executeTool");
 
   async function run(action) {
     try {
+      if (typeof validateAction === "function") {
+        const checked = validateAction(action);
+        if (!checked?.ok) {
+          const payload = {
+            tool: action?.tool,
+            ok: false,
+            error: checked?.error || "Action validation failed before execution.",
+            errorCode: checked?.errorCode || "executor_validation_failed",
+          };
+          onToolResult(payload);
+          return payload;
+        }
+      }
       const result = await executeTool(action);
       onToolResult({ tool: action?.tool, ok: true, result });
       if (action?.tool === "fetch_url" && result?.url) onSourceUrl(String(result.url));

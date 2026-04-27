@@ -1720,6 +1720,27 @@ window.endocode.onEvent(async (event) => {
     showLive("Notatka", event.note);
     return;
   }
+  if (event.type === "agent-phase") {
+    const phase = String(event.phase || "");
+    const phaseLabel =
+      phase === "understand" ? "Analiza intencji"
+        : phase === "plan" ? "Planowanie"
+          : phase === "validate" ? "Walidacja"
+            : phase === "execute" ? "Wykonanie"
+              : phase === "observe" ? "Obserwacja"
+                : phase === "recover" ? "Recovery"
+                  : phase === "finalize" ? "Finalizacja"
+                    : "Agent";
+    const detail = [
+      event.intentClass ? `intent=${event.intentClass}` : "",
+      event.tool ? `tool=${event.tool}` : "",
+      event.reason ? `reason=${event.reason}` : "",
+      event.step ? `step=${event.step}` : "",
+    ].filter(Boolean).join(" · ");
+    addInlineEvent("activity", `Model planuje: ${phaseLabel}`, detail || "Przetwarzanie etapu.");
+    showLive(`Etap: ${phaseLabel}`, detail || "Przetwarzanie");
+    return;
+  }
   if (event.type === "model-raw") {
     // skip raw JSON in inline view for cleaner UX
     return;

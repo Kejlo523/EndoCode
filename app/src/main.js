@@ -29,6 +29,7 @@ const { createSessionMemory } = require("./main/agent/session-memory");
 const { createAgentPlanner } = require("./main/agent/agent-planner");
 const { createToolExecutor } = require("./main/agent/tool-executor");
 const { createTurnOrchestrator } = require("./main/agent/turn-orchestrator");
+const { classifyIntent, validateAction, buildMachineRepairPrompt } = require("./main/agent/action-validator");
 const { registerAgentIpcHandlers } = require("./main/agent/ipc-compat");
 
 const DEFAULT_PORT = 8088;
@@ -207,12 +208,11 @@ Pracujesz na lokalnych modelach, lokalnych plikach i jawnych narzedziach. UI pok
 
 AUTONOMIA:
 - Dzialaj autonomicznie: sam zdecyduj czy potrzebny jest tool czy final.
-- Preferuj naturalna odpowiedz po polsku. Jesli chcesz uruchomic narzedzie, najlepiej podaj:
-  TOOL: <nazwa_narzedzia>
-  ARGS: <JSON obiektu>
-- Dopuszczalna jest tez odpowiedz JSON legacy {"tool":"...","args":{...}} albo {"final":"..."}.
-- Gdy potrzebujesz doprecyzowania od uzytkownika, zwroc to jako FINAL (pytanie), nie jako sam NOTE.
-- Gdy odpowiedz ma byc finalna, podaj jasny final dla uzytkownika.
+- Tryb runtime v2: zwracaj TYLKO jeden obiekt JSON akcji:
+  {"tool":"nazwa","args":{...}} albo {"final":"odpowiedz po polsku"}.
+- Zero prose poza JSON. Zero markdown. Zero tablic.
+- Gdy potrzebujesz doprecyzowania od uzytkownika, zwroc to jako {"final":"pytanie"}.
+- Gdy odpowiedz ma byc finalna, zwroc jasny final dla uzytkownika.
 
 DOSTEPNE NARZEDZIA:
 ${TOOLS_PROMPT_BLOCK}
@@ -346,6 +346,18 @@ let runQueueActive = false;
 let runtimeEngine = null;
 let agentCore = null;
 let lastChatLookupQuery = "";
+let agentRuntime = "v2";
+let currentAgentIntentClass = "general";
+let currentAgentUserPrompt = "";
+const ACTION_REFLECTION_MIN = 2;
+const agentRecoveryMetrics = {
+  parseErrors: 0,
+  schemaErrors: 0,
+  toolErrors: 0,
+  naturalTextRecoveries: 0,
+  partialJsonRecoveries: 0,
+  repairAttempts: 0,
+};
 let accessLevel = "sandbox"; // "sandbox" or "full"
 let chatHistory = [];
 let currentChatId = null;
@@ -388,6 +400,20 @@ const DEFAULT_MODEL_SETTINGS = {
 let customModelSettingsByModelId = {};
 const chatWebLookupCache = new Map();
 const runtimeRecoveryStateByModelId = new Map();
+const debugLogState = {
+  lastThinkingDeltaAt: 0,
+  thinkingDeltaCount: 0,
+  lastThinkingStep: null,
+};
+
+function resetAgentRecoveryMetrics() {
+  for (const key of Object.keys(agentRecoveryMetrics)) agentRecoveryMetrics[key] = 0;
+}
+
+function bumpAgentRecoveryMetric(key) {
+  if (!Object.hasOwn(agentRecoveryMetrics, key)) return;
+  agentRecoveryMetrics[key] += 1;
+}
 
 function appendAgentDebugLog(type, payload = {}) {
   try {
@@ -405,19 +431,39 @@ function appendAgentDebugLog(type, payload = {}) {
       "run-end",
     ]);
     if (!interesting.has(type)) return;
+    const now = Date.now();
+    if (type === "thinking-start") {
+      debugLogState.lastThinkingStep = payload?.step ?? null;
+      debugLogState.thinkingDeltaCount = 0;
+      debugLogState.lastThinkingDeltaAt = 0;
+    }
+    if (type === "thinking-delta") {
+      debugLogState.thinkingDeltaCount += 1;
+      const throttleMs = 1200;
+      if (now - debugLogState.lastThinkingDeltaAt < throttleMs) return;
+      debugLogState.lastThinkingDeltaAt = now;
+    }
     const candidateDirs = [];
     if (ENDOCODE_HOME) candidateDirs.push(path.join(ENDOCODE_HOME, "logs"));
     if (workspaceRoot) candidateDirs.push(path.join(workspaceRoot, ".endocode", "logs"));
     if (!candidateDirs.length) return;
-    const compactPayload = { ...payload };
-    if (typeof compactPayload.raw === "string" && compactPayload.raw.length > 4000) {
-      compactPayload.raw = `${compactPayload.raw.slice(0, 4000)}\n...[truncated]`;
+    let compactPayload = { ...payload };
+    if (type === "thinking-delta") {
+      compactPayload = {
+        step: payload?.step ?? debugLogState.lastThinkingStep,
+        deltasSeen: debugLogState.thinkingDeltaCount,
+        textPreview: String(payload?.text || "").slice(0, 120),
+        fullChars: typeof payload?.full === "string" ? payload.full.length : 0,
+      };
     }
-    if (typeof compactPayload.full === "string" && compactPayload.full.length > 4000) {
-      compactPayload.full = `${compactPayload.full.slice(0, 4000)}\n...[truncated]`;
+    if (typeof compactPayload.raw === "string" && compactPayload.raw.length > 1000) {
+      compactPayload.raw = `${compactPayload.raw.slice(0, 1000)}\n...[truncated]`;
     }
-    if (typeof compactPayload.text === "string" && compactPayload.text.length > 2000) {
-      compactPayload.text = `${compactPayload.text.slice(0, 2000)}...[truncated]`;
+    if (typeof compactPayload.full === "string" && compactPayload.full.length > 1000) {
+      compactPayload.full = `${compactPayload.full.slice(0, 1000)}\n...[truncated]`;
+    }
+    if (typeof compactPayload.text === "string" && compactPayload.text.length > 400) {
+      compactPayload.text = `${compactPayload.text.slice(0, 400)}...[truncated]`;
     }
     const line = `${JSON.stringify({
       at: new Date().toISOString(),
@@ -945,6 +991,7 @@ function saveAppSettings() {
   writeJsonFile(path.join(ENDOCODE_HOME, "config", "endocode-state.json"), {
     selectedModelId,
     reasoningLevel: selectedReasoning,
+    agentRuntime,
     accessLevel,
     customModelSettingsByModelId,
     workspaceRoot,
@@ -3387,109 +3434,66 @@ function parseActionEnvelope(raw) {
   if (text.startsWith("```")) {
     text = text.replace(/^```(?:[a-z0-9_-]+)?\s*/i, "").replace(/\s*```$/i, "").trim();
   }
-  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  let note = "";
-  let tool = "";
-  let argsRaw = "";
-  let final = "";
-  for (let i = 0; i < lines.length; i += 1) {
-    const line = lines[i];
-    if (/^NOTE:/i.test(line)) {
-      note = line.replace(/^NOTE:\s*/i, "").trim();
-      continue;
-    }
-    if (/^FINAL:/i.test(line)) {
-      const current = line.replace(/^FINAL:\s*/i, "");
-      const rest = lines.slice(i + 1).join("\n");
-      final = [current, rest].filter(Boolean).join("\n").trim();
-      break;
-    }
-    if (/^TOOL:/i.test(line)) {
-      tool = line.replace(/^TOOL:\s*/i, "").trim();
-      const argsLineIndex = lines.slice(i + 1).findIndex((x) => /^ARGS:/i.test(x));
-      if (argsLineIndex >= 0) {
-        const absolute = i + 1 + argsLineIndex;
-        const argsHead = lines[absolute].replace(/^ARGS:\s*/i, "").trim();
-        const argsTail = lines.slice(absolute + 1).join("\n").trim();
-        argsRaw = [argsHead, argsTail].filter(Boolean).join("\n").trim();
-      } else {
-        argsRaw = "{}";
-      }
-      break;
-    }
+  const parsed = parseJsonAction(text);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("Action v2 requires a single JSON object.");
   }
-
-  if (final) {
-    return { note, final };
-  }
-  if (tool) {
-    let args = {};
-    if (argsRaw) {
-      try {
-        args = JSON.parse(argsRaw);
-      } catch (error) {
-        throw new Error(`Niepoprawne ARGS JSON: ${String(error?.message || error).slice(0, 260)}`);
-      }
-    }
-    return { note, tool, args };
-  }
-
-  // Inline fallback: model often writes "Use TOOL: write_file. ARGS: {...}" inside prose.
-  const inlineFinal = text.match(/\bFINAL\s*:\s*([\s\S]+)$/i);
-  if (inlineFinal?.[1]?.trim()) {
-    return { note, final: inlineFinal[1].trim() };
-  }
-  const inlineTool = text.match(/\bTOOL\s*:\s*([a-z_]+)/i);
-  if (inlineTool?.[1]) {
-    const inlineArgsMarker = text.match(/\bARGS\s*:\s*([\s\S]+)$/i);
-    let args = {};
-    if (inlineArgsMarker?.[1]) {
-      const argsText = inlineArgsMarker[1].trim();
-      const obj = extractFirstJsonObject(argsText);
-      if (obj) {
-        try {
-          args = JSON.parse(obj);
-        } catch {
-          args = {};
-        }
-      } else {
-        const pathMatch = argsText.match(/\bpath\b[^a-z0-9]*["'`]([^"'`]+)["'`]/i);
-        if (pathMatch?.[1]) args.path = pathMatch[1].trim();
-      }
-    }
-    return { note, tool: inlineTool[1].trim(), args };
-  }
-
-  // Legacy fallback for compatibility with old model outputs
-  try {
-    return parseJsonAction(text);
-  } catch {
-    throw new Error("Niepoprawny format akcji. Uzyj NOTE/FINAL/TOOL/ARGS.");
-  }
+  return parsed;
 }
 
-function inferActionFromNaturalText(raw) {
-  const text = String(raw || "").trim();
-  if (!text) return null;
-  // Strict fallback: infer tool only from explicit command-like marker.
-  const explicitToolMatch = text.match(/^(?:TOOL|NARZEDZIE)\s*:\s*([a-z_]+)/im);
-  if (!explicitToolMatch) return null;
-  const detectedTool = String(explicitToolMatch[1] || "").trim();
-  if (!ALLOWED_TOOLS.has(detectedTool)) return null;
-  let args = {};
-  const jsonCandidate = extractFirstJsonObject(text);
-  if (jsonCandidate) {
-    try {
-      const parsed = JSON.parse(jsonCandidate);
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        if (parsed.args && typeof parsed.args === "object" && !Array.isArray(parsed.args)) args = parsed.args;
-        else args = parsed;
+function sanitizeJsonCandidateText(raw) {
+  return String(raw || "")
+    .replace(/^\uFEFF/, "")
+    .replace(/\r\n/g, "\n")
+    .trim();
+}
+
+function autoCloseJsonObject(candidate) {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (const char of candidate) {
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === "\"") {
+        inString = false;
       }
+      continue;
+    }
+    if (char === "\"") {
+      inString = true;
+      continue;
+    }
+    if (char === "{") depth += 1;
+    if (char === "}") depth -= 1;
+  }
+  if (depth <= 0) return candidate;
+  return `${candidate}${"}".repeat(depth)}`;
+}
+
+function parsePartialActionFromRaw(raw) {
+  const text = sanitizeJsonCandidateText(raw);
+  if (!text) return null;
+  const firstBrace = text.indexOf("{");
+  if (firstBrace < 0) return null;
+  const rough = text.slice(firstBrace).trim();
+  const candidates = [
+    rough,
+    autoCloseJsonObject(rough),
+    autoCloseJsonObject(rough.replace(/,\s*([}\]])/g, "$1")),
+  ];
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
     } catch {
-      args = {};
+      // best-effort parser
     }
   }
-  return { note: "Auto-zinterpretowano intencje modelu.", tool: detectedTool, args };
+  return null;
 }
 
 function buildDuckDuckGoSearchUrl(query) {
@@ -3511,83 +3515,57 @@ function extractSearchQueryFromPlannerText(text) {
   return compactWhitespace(stripped).slice(0, 220);
 }
 
-function inferActionFromPlannerText(raw) {
+function extractUserPromptFromPlannerRaw(raw) {
+  const text = String(raw || "");
+  const quoted = text.match(/user wants:\s*"([^"]+)"/i);
+  if (quoted?.[1]) return compactWhitespace(quoted[1]).slice(0, 220);
+  const singleQuoted = text.match(/user wants:\s*'([^']+)'/i);
+  if (singleQuoted?.[1]) return compactWhitespace(singleQuoted[1]).slice(0, 220);
+  return "";
+}
+
+function recoverActionFromNaturalText(raw, options = {}) {
   const text = String(raw || "").trim();
   if (!text) return null;
-  const lower = text.toLowerCase();
-  const hasPlannerTone = /\b(we need|we should|let'?s|we will|we'll|powinnismy|trzeba|nalezy)\b/.test(lower);
-  const hasWebIntent =
-    /\b(wyszukaj|szukaj|search|internet|web|w necie|w internecie|sprawdz online|who is|co ostatnio zrobi[łl])\b/i.test(text);
+  const lowered = text.toLowerCase();
+  const intentClass = options.intentClass || "general";
+  const userPrompt = compactWhitespace(String(options.userPrompt || "").trim());
 
-  if (hasWebIntent && /\b(fetch_url|duckduckgo|google|brave|url)\b/i.test(text)) {
-    const directUrl = text.match(/\bhttps?:\/\/[^\s"'`<>)]+/i)?.[0] || "";
-    if (directUrl) {
-      return { note: "Auto: wykryto web lookup, pobieram URL.", tool: "fetch_url", args: { url: directUrl, timeout: 20, raw: false } };
-    }
-    const query = extractSearchQueryFromPlannerText(text);
-    const lookupUrl = buildDuckDuckGoSearchUrl(query);
-    if (lookupUrl) {
-      return { note: "Auto: wykryto web lookup, uruchamiam wyszukiwanie.", tool: "fetch_url", args: { url: lookupUrl, timeout: 20, raw: false } };
-    }
-  }
-  if (hasWebIntent) {
-    const query = extractSearchQueryFromPlannerText(text);
-    const lookupUrl = buildDuckDuckGoSearchUrl(query);
-    if (lookupUrl) {
-      return { note: "Auto: zamieniono plan web na fetch_url.", tool: "fetch_url", args: { url: lookupUrl, timeout: 20, raw: false } };
-    }
+  if (
+    intentClass === "web"
+    || /\b(fetch_url|internet|online|search|wyszukaj|duckduckgo)\b/i.test(text)
+  ) {
+    const hintedPrompt = extractUserPromptFromPlannerRaw(text);
+    const query = hintedPrompt || userPrompt || extractSearchQueryFromPlannerText(text);
+    if (!query) return null;
+    return {
+      note: "Auto-recover: parsed natural-text planner output into fetch action.",
+      tool: "fetch_url",
+      args: {
+        url: buildDuckDuckGoSearchUrl(query),
+        timeout: 20,
+        raw: false,
+      },
+    };
   }
 
-  // Common planner phrasing: "use ls", "let's list", "check current folder"
-  if (/\buse\s+ls\b|\blist\b.*\bfolder\b|\bcheck\b.*\bcurrent folder\b|\bsprawdz\b.*\bfolder\b|\bls\b/.test(lower)) {
-    return { note: "Auto: zamieniono plan na akcje narzedzia.", tool: "ls", args: { path: ".", maxEntries: 120 } };
+  if (intentClass === "filesystem" && /\b(write_file|create file|utworz plik)\b/.test(lowered)) {
+    if (/\b(html|strona)\b/i.test(text) || /\b(html|strona)\b/i.test(userPrompt)) {
+      return {
+        note: "Auto-recover: planner requested simple HTML file.",
+        tool: "write_file",
+        args: {
+          path: "index.html",
+          mode: "overwrite",
+          content: "<!doctype html>\n<html lang=\"pl\">\n<head>\n  <meta charset=\"UTF-8\" />\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />\n  <title>Prosta strona</title>\n</head>\n<body>\n  <h1>Witaj!</h1>\n  <p>To jest prosta strona HTML wygenerowana przez EndoCode.</p>\n</body>\n</html>\n",
+        },
+      };
+    }
   }
-  if (/\buse\s+pwd\b|\bcurrent\s+directory\b|\bbiezac[ya]\s+katalog\b/.test(lower)) {
-    return { note: "Auto: zamieniono plan na akcje narzedzia.", tool: "pwd", args: {} };
-  }
-  if (/\brespond\s+with\s+a\s+tool\s+call\b|\bneed\s+to\s+respond\s+with\s+a\s+tool\b/.test(lower)) {
-    if (/\bpwd\b/.test(lower)) return { note: "Auto: zamieniono plan na akcje narzedzia.", tool: "pwd", args: {} };
-    if (/\bls\b/.test(lower)) return { note: "Auto: zamieniono plan na akcje narzedzia.", tool: "ls", args: { path: ".", maxEntries: 120 } };
-  }
-  if (/\buse\b[\s:,-]*`?write_file`?\b|\bwrite_file\b/.test(lower) && (/\bhtml\b/.test(lower) || /\bindex\.html\b/.test(lower) || /\bstron[ae]\b/.test(lower))) {
-    const htmlPathMatch = text.match(/\b([a-z0-9._/-]+\.html)\b/i);
-    return {
-      note: "Auto: zamieniono plan na akcje narzedzia.",
-      tool: "write_file",
-      args: {
-        path: htmlPathMatch?.[1] || "index.html",
-        mode: "overwrite",
-        content: "<!doctype html>\n<html lang=\"pl\">\n<head>\n  <meta charset=\"UTF-8\" />\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />\n  <title>Prosta strona</title>\n</head>\n<body>\n  <h1>Witaj!</h1>\n  <p>To jest prosta strona HTML.</p>\n</body>\n</html>\n",
-      },
-    };
-  }
-  if (hasPlannerTone && /\bhtml\b/.test(lower)) {
-    return {
-      note: "Auto: wykryto plan wykonania, zaczynam od akcji.",
-      tool: "write_file",
-      args: {
-        path: "index.html",
-        mode: "overwrite",
-        content: "<!doctype html>\n<html lang=\"pl\">\n<head>\n  <meta charset=\"UTF-8\" />\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />\n  <title>Prosta strona</title>\n</head>\n<body>\n  <h1>Witaj!</h1>\n  <p>To jest prosta strona HTML.</p>\n</body>\n</html>\n",
-      },
-    };
-  }
-  if (/\buse\s+read_file\b|\bread\b.*\bfile\b|\bprzeczytaj\b.*\bplik\b/.test(lower)) {
-    const fileMatch = text.match(/["'`](.+?\.[a-z0-9]{1,8})["'`]/i);
-    return { note: "Auto: zamieniono plan na akcje narzedzia.", tool: "read_file", args: { path: fileMatch?.[1] || ".", maxBytes: 30000 } };
-  }
-  if (/\buse\s+write_file\b|\bcreate\b.*\.html\b|\butw[oó]rz\b.*\.html\b|\bstron[ae]\s+html\b/.test(lower)) {
-    const htmlPathMatch = text.match(/\b([a-z0-9._/-]+\.html)\b/i);
-    return {
-      note: "Auto: zamieniono plan na akcje narzedzia.",
-      tool: "write_file",
-      args: {
-        path: htmlPathMatch?.[1] || "index.html",
-        mode: "overwrite",
-        content: "<!doctype html>\n<html lang=\"pl\">\n<head>\n  <meta charset=\"UTF-8\" />\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />\n  <title>Prosta strona</title>\n</head>\n<body>\n  <h1>Witaj!</h1>\n  <p>To jest prosta strona HTML.</p>\n</body>\n</html>\n",
-      },
-    };
-  }
+  return null;
+}
+
+function inferActionFromPlannerText() {
   return null;
 }
 
@@ -3995,9 +3973,10 @@ async function getNextActionWithRepair(abortSignal, failedModelIds, step = null)
   let actionRawReasoning = "";
   let lastError = null;
   let lastRaw = "";
-  const retryLimit = Math.max(1, getJsonRepairRetryLimit());
+  const retryLimit = Math.max(ACTION_REFLECTION_MIN, getJsonRepairRetryLimit());
   for (let attempt = 0; attempt <= retryLimit; attempt += 1) {
     if (attempt > 0) {
+      bumpAgentRecoveryMetric("repairAttempts");
       emit("status", {
         status: "action-schema-retry",
         detail: `Naprawiam format akcji (${attempt}/${retryLimit}).`,
@@ -4028,92 +4007,69 @@ async function getNextActionWithRepair(abortSignal, failedModelIds, step = null)
       parsed = parseActionEnvelope(raw);
     } catch (error) {
       lastError = error;
-      const inferred = inferActionFromNaturalText(raw);
-      if (inferred) {
-        const inferredValidated = validateModelAction(inferred);
-        if (inferredValidated.ok) return { action: inferredValidated.action, reasoning: actionRawReasoning };
+      bumpAgentRecoveryMetric("parseErrors");
+      const recovered = recoverActionFromNaturalText(raw, {
+        intentClass: currentAgentIntentClass,
+        userPrompt: currentAgentUserPrompt,
+      });
+      if (recovered) {
+        const recoveredValidation = validateAction(recovered, {
+          intentClass: currentAgentIntentClass,
+        });
+        if (recoveredValidation.ok) {
+          bumpAgentRecoveryMetric("naturalTextRecoveries");
+          emit("status", {
+            status: "action-auto-recover",
+            detail: "Model zwrocil prose; zastosowano awaryjna konwersje do poprawnej akcji JSON.",
+            step,
+          });
+          return { action: recoveredValidation.action, reasoning: actionRawReasoning };
+        }
       }
-      const inferredFromPlan = inferActionFromPlannerText(raw);
-      if (inferredFromPlan) {
-        const inferredValidated = validateModelAction(inferredFromPlan);
-        if (inferredValidated.ok) return { action: inferredValidated.action, reasoning: actionRawReasoning };
+      const partial = parsePartialActionFromRaw(raw);
+      if (partial) {
+        const partialValidation = validateAction(partial, {
+          intentClass: currentAgentIntentClass,
+        });
+        if (partialValidation.ok) {
+          bumpAgentRecoveryMetric("partialJsonRecoveries");
+          emit("status", {
+            status: "action-partial-json-recover",
+            detail: "Odzyskano obciety JSON akcji z odpowiedzi modelu.",
+            step,
+          });
+          return { action: partialValidation.action, reasoning: actionRawReasoning };
+        }
       }
       if (attempt >= retryLimit) break;
-      const guidance = `Popraw format odpowiedzi. Uzyj tylko:\nNOTE: ... (opcjonalnie)\nFINAL: ...\nalbo\nNOTE: ...\nTOOL: ${allowedToolNamesList().split(", ")[0]}\nARGS: {"key":"value"}\n\nPoprzednia odpowiedz:\n${textPreview(raw, 1200)}`;
+      const guidance = makeJsonRepairPrompt(error, raw, { step, attempt, retryLimit });
       if (agentCore?.memory) {
         agentCore.memory.append("assistant", `Format error: ${error.message}`);
         agentCore.memory.append("user", guidance);
       }
       continue;
     }
-    const validated = validateModelAction(parsed);
+    const validated = validateAction(parsed, {
+      intentClass: currentAgentIntentClass,
+    });
     if (!validated.ok) {
-      lastError = new Error(validated.error);
-      const inferred = inferActionFromNaturalText(raw);
-      if (inferred) {
-        const inferredValidated = validateModelAction(inferred);
-        if (inferredValidated.ok) return { action: inferredValidated.action, reasoning: actionRawReasoning };
-      }
-      const inferredFromPlan = inferActionFromPlannerText(raw);
-      if (inferredFromPlan) {
-        const inferredValidated = validateModelAction(inferredFromPlan);
-        if (inferredValidated.ok) return { action: inferredValidated.action, reasoning: actionRawReasoning };
-      }
+      lastError = new Error(validated.error || "action validation failed");
+      bumpAgentRecoveryMetric("schemaErrors");
       if (attempt >= retryLimit) break;
-      const guidance = `Kontrakt akcji niepoprawny: ${validated.error}\nPopraw tylko NOTE/FINAL/TOOL/ARGS bez zmiany celu zadania.`;
+      const guidance = makeActionSchemaRepairPrompt(
+        `${validated.errorCode || "invalid_action"} ${validated.error || ""}`.trim(),
+        raw,
+        { step, attempt, retryLimit },
+      );
       if (agentCore?.memory) {
-        agentCore.memory.append("assistant", `Schema error: ${validated.error}`);
+        agentCore.memory.append("assistant", `Schema error: ${validated.errorCode || "invalid_action"} ${validated.error}`);
         agentCore.memory.append("user", guidance);
       }
       continue;
     }
     return { action: validated.action, reasoning: actionRawReasoning };
   }
-  const fallbackText = String(lastRaw || "").trim();
-  if (fallbackText) {
-    const inferredFromPlan = inferActionFromPlannerText(fallbackText);
-    if (inferredFromPlan) {
-      const inferredValidated = validateModelAction(inferredFromPlan);
-      if (inferredValidated.ok) {
-        return {
-          action: inferredValidated.action,
-          reasoning: actionRawReasoning,
-        };
-      }
-    }
-    if (/\b(wyszukaj|szukaj|search|internet|web|w necie|w internecie|who is|co ostatnio zrobi[łl])\b/i.test(fallbackText)) {
-      const query = extractSearchQueryFromPlannerText(fallbackText);
-      const lookupUrl = buildDuckDuckGoSearchUrl(query);
-      if (lookupUrl) {
-        return {
-          action: {
-            note: "Wykryto plan web bez formalnej akcji. Kontynuuje fetch_url zamiast finala.",
-            tool: "fetch_url",
-            args: { url: lookupUrl, timeout: 20, raw: false },
-          },
-          reasoning: actionRawReasoning,
-        };
-      }
-    }
-    if (/\b(we need|we should|let'?s|we will|we'll|powinnismy|trzeba|nalezy)\b/i.test(fallbackText)) {
-      return {
-        action: {
-          note: "Wykryto plan wykonania bez formalnej akcji. Kontynuuje narzedziem zamiast finala.",
-          tool: "ls",
-          args: { path: ".", maxEntries: 120 },
-        },
-        reasoning: actionRawReasoning,
-      };
-    }
-    return {
-      action: {
-        note: "Model zwrocil naturalna odpowiedz bez formalnej akcji. Traktuje jako final.",
-        final: fallbackText,
-      },
-      reasoning: actionRawReasoning,
-    };
-  }
-  throw new Error(`Model zwrocil niepoprawny format akcji: ${lastError?.message || "nieznany blad"}`);
+  throw new Error(`Model zwrocil niepoprawny format akcji po ${retryLimit + 1} probach: ${lastError?.message || String(lastRaw || "nieznany blad")}`);
 }
 
 
@@ -5332,6 +5288,7 @@ function getAgentCore() {
     const toolExecutor = createToolExecutor({
       executeTool,
       onToolResult: (payload) => emit("tool-result", payload),
+      validateAction: (action) => validateAction(action, { intentClass: currentAgentIntentClass }),
     });
     const orchestrator = createTurnOrchestrator({
       planner,
@@ -5341,6 +5298,20 @@ function getAgentCore() {
       compactMessages,
       appendSourcesSection,
       buildRepeatedActionBlock,
+      onRecoverableError: async ({ step, action, toolPayload }) => {
+        if (!agentCore?.memory) return;
+        bumpAgentRecoveryMetric("toolErrors");
+        const repairHint = buildMachineRepairPrompt(
+          { errorCode: toolPayload?.errorCode || "tool_error", error: toolPayload?.error || "Tool failed." },
+          JSON.stringify(action || {}),
+        );
+        emit("status", {
+          status: "action-recover",
+          detail: `Recovery step ${step}: ${String(toolPayload?.error || "tool error").slice(0, 160)}`,
+        });
+        agentCore.memory.append("assistant", `Execution failed: ${toolPayload?.error || "unknown error"}`);
+        agentCore.memory.append("user", repairHint);
+      },
     });
     agentCore = { memory, planner, toolExecutor, orchestrator };
   }
@@ -5354,6 +5325,7 @@ async function runAgent(userText) {
   const startedAt = Date.now();
   const signal = runAbortController.signal;
   try {
+    resetAgentRecoveryMetrics();
     await validateCurrentWorkspaceRoot();
     await ensureServer(DEFAULT_PORT);
     const core = getAgentCore();
@@ -5384,6 +5356,9 @@ async function runAgent(userText) {
       content = String(userText || "");
       emit("run-start", { text: content });
     }
+    currentAgentIntentClass = classifyIntent(content);
+    currentAgentUserPrompt = content;
+    emit("agent-phase", { phase: "understand", intentClass: currentAgentIntentClass });
     messages.push({ role: "user", content });
 
     const model = getModelConfig();
@@ -5421,7 +5396,8 @@ async function runAgent(userText) {
   } finally {
     runInProgress = false;
     runAbortController = null;
-    emit("run-end", {});
+    emit("agent-recovery-metrics", { ...agentRecoveryMetrics });
+    emit("run-end", { recoveryMetrics: { ...agentRecoveryMetrics } });
   }
 }
 
@@ -5667,6 +5643,7 @@ function getState() {
     customModelSettings: modelSettings,
     customModelSettingsByModelId,
     maxMessages: getActiveMaxMessages(),
+    agentRuntime,
     accessLevel,
   };
 }
@@ -5709,6 +5686,9 @@ app.whenReady().then(async () => {
   loadChatHistory();
   const settings = loadAppSettings();
   if (settings.accessLevel) accessLevel = settings.accessLevel;
+  if (settings.agentRuntime === "legacy" || settings.agentRuntime === "v2") {
+    agentRuntime = settings.agentRuntime;
+  }
   if (settings.customModelSettingsByModelId && typeof settings.customModelSettingsByModelId === "object") {
     customModelSettingsByModelId = { ...settings.customModelSettingsByModelId };
   }
