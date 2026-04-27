@@ -3,6 +3,7 @@ function createSessionMemory(options = {}) {
     maxTaskMessages = 8,
     summarize = (messages) => messages.slice(-2).map((m) => `${m.role}: ${String(m.content || "").slice(0, 180)}`).join("\n"),
     detectIntentKey = (text) => String(text || "").trim().toLowerCase().slice(0, 120),
+    shouldResetOnIntentChange = () => false,
   } = options;
 
   let currentIntentKey = "";
@@ -18,7 +19,12 @@ function createSessionMemory(options = {}) {
   function beginTurn(userText) {
     const nextIntentKey = detectIntentKey(userText);
     if (!currentIntentKey) currentIntentKey = nextIntentKey;
-    if (nextIntentKey && currentIntentKey && nextIntentKey !== currentIntentKey) {
+    if (
+      nextIntentKey
+      && currentIntentKey
+      && nextIntentKey !== currentIntentKey
+      && shouldResetOnIntentChange(currentIntentKey, nextIntentKey, userText)
+    ) {
       hardReset(nextIntentKey);
     }
     if (nextIntentKey && !currentIntentKey) currentIntentKey = nextIntentKey;

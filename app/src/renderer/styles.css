@@ -921,6 +921,96 @@ select:focus { border-color: var(--border-focus); }
   background: var(--bg);
 }
 
+.prompt-queue {
+  max-width: 760px;
+  margin: 0 auto 10px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  background: var(--surface);
+  padding: 8px 10px;
+}
+
+.prompt-queue-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
+
+.prompt-queue-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 140px;
+  overflow-y: auto;
+}
+
+.prompt-queue-item {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+  align-items: center;
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  padding: 6px 8px;
+  background: var(--bg-deep);
+  font-size: 12px;
+}
+
+.prompt-queue-item.running {
+  border-color: var(--accent);
+}
+
+.prompt-queue-item.error {
+  border-color: var(--danger);
+}
+
+.prompt-queue-text {
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.prompt-queue-meta {
+  color: var(--text-muted);
+  font-size: 10px;
+  font-family: var(--mono);
+}
+
+.prompt-queue-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.prompt-queue-actions button {
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text-secondary);
+  border-radius: 6px;
+  padding: 2px 6px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.prompt-queue-actions button:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+.prompt-queue-item input {
+  width: 100%;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 4px 6px;
+  font-size: 12px;
+}
+
 .composer {
   max-width: 760px;
   margin: 0 auto;

@@ -10,6 +10,9 @@ const composer = document.getElementById("composer");
 const promptEl = document.getElementById("prompt");
 const sendBtn = document.getElementById("send");
 const stopBtn = document.getElementById("stopBtn");
+const promptQueueBox = document.getElementById("promptQueue");
+const promptQueueList = document.getElementById("promptQueueList");
+const promptQueueCount = document.getElementById("promptQueueCount");
 const modelSelect = document.getElementById("modelSelect");
 const reasoningSelect = document.getElementById("reasoningSelect");
 const accessToggle = document.getElementById("accessToggle");
@@ -116,6 +119,9 @@ let liveDurationTicker = null;
 let activeRunStartedAtMs = null;
 let currentThinkingSegment = null;
 const activeToolSegments = [];
+let promptQueueItems = [];
+let promptQueueSeq = 0;
+let promptQueueProcessing = false;
 const skillsModule = window.EndoModules?.createSkillsModule?.({
   skillsList,
   skillsCount,
@@ -270,14 +276,146 @@ function stopAllLiveDurations() {
 // ── Busy State ──
 function setBusy(nextBusy) {
   appBusy = nextBusy;
-  sendBtn.disabled = nextBusy;
-  promptEl.disabled = nextBusy;
+  sendBtn.disabled = false;
   modelSelect.disabled = nextBusy;
   reasoningSelect.disabled = nextBusy;
   if (nextBusy) {
     stopBtn.classList.remove("hidden");
   } else {
     stopBtn.classList.add("hidden");
+    if (promptQueueItems.some((item) => item.status === "queued")) {
+      void processPromptQueue();
+    }
+  }
+}
+
+function promptQueuePreview(item) {
+  if (item.text) return item.text;
+  if (item.attachment?.name) return `[Załącznik: ${item.attachment.name}]`;
+  return "Obraz";
+}
+
+function addPromptToQueue(item) {
+  promptQueueItems.push({
+    id: `queued-${Date.now()}-${promptQueueSeq++}`,
+    status: "queued",
+    ...item,
+  });
+  renderPromptQueue();
+  void processPromptQueue();
+}
+
+async function sendPromptPayload(item) {
+  const payload = item.imageBase64
+    ? { text: item.text || "", imageBase64: item.imageBase64 }
+    : item.attachment
+      ? { text: item.text || "", attachment: item.attachment }
+      : item.text || "";
+  await window.endocode.send(payload);
+}
+
+function movePromptInQueue(id, direction) {
+  const currentIdx = promptQueueItems.findIndex((item) => item.id === id && item.status === "queued");
+  if (currentIdx < 0) return;
+  const targetIdx = direction === "up" ? currentIdx - 1 : currentIdx + 1;
+  if (targetIdx < 0 || targetIdx >= promptQueueItems.length) return;
+  const target = promptQueueItems[targetIdx];
+  if (!target || target.status !== "queued") return;
+  const [item] = promptQueueItems.splice(currentIdx, 1);
+  promptQueueItems.splice(targetIdx, 0, item);
+  renderPromptQueue();
+}
+
+function setPromptPriorityNow(id) {
+  const idx = promptQueueItems.findIndex((item) => item.id === id && item.status === "queued");
+  if (idx < 0) return;
+  const firstQueuedIdx = promptQueueItems.findIndex((item) => item.status === "queued");
+  if (firstQueuedIdx < 0 || idx === firstQueuedIdx) return;
+  const [item] = promptQueueItems.splice(idx, 1);
+  promptQueueItems.splice(firstQueuedIdx, 0, item);
+  renderPromptQueue();
+}
+
+function deletePromptFromQueue(id) {
+  const idx = promptQueueItems.findIndex((item) => item.id === id && item.status !== "running");
+  if (idx < 0) return;
+  promptQueueItems.splice(idx, 1);
+  renderPromptQueue();
+}
+
+function editPromptInQueue(id) {
+  const item = promptQueueItems.find((entry) => entry.id === id && entry.status === "queued");
+  if (!item) return;
+  const updated = window.prompt("Edytuj prompt:", item.text || "");
+  if (updated === null) return;
+  const trimmed = String(updated).trim();
+  if (!trimmed && !item.imageBase64 && !item.attachment) {
+    deletePromptFromQueue(id);
+    return;
+  }
+  item.text = trimmed;
+  renderPromptQueue();
+}
+
+function renderPromptQueue() {
+  if (!promptQueueBox || !promptQueueList || !promptQueueCount) return;
+  const pendingCount = promptQueueItems.filter((item) => item.status !== "done").length;
+  promptQueueCount.textContent = `${pendingCount}`;
+  if (pendingCount === 0) {
+    promptQueueBox.classList.add("hidden");
+    promptQueueList.innerHTML = "";
+    return;
+  }
+  promptQueueBox.classList.remove("hidden");
+  promptQueueList.innerHTML = promptQueueItems
+    .filter((item) => item.status !== "done")
+    .map((item) => {
+      const statusLabel = item.status === "running" ? "Wysyłanie" : item.status === "error" ? "Błąd" : "Oczekuje";
+      return `
+        <div class="prompt-queue-item ${item.status}">
+          <div>
+            <div class="prompt-queue-text">${escapeHtml(promptQueuePreview(item))}</div>
+            <div class="prompt-queue-meta">${statusLabel}</div>
+          </div>
+          <div class="prompt-queue-actions">
+            ${item.status === "queued" ? `<button data-queue-action="now" data-queue-id="${item.id}" title="Uruchom jako następny">Teraz</button>` : ""}
+            ${item.status === "queued" ? `<button data-queue-action="up" data-queue-id="${item.id}" title="Przesuń wyżej">↑</button>` : ""}
+            ${item.status === "queued" ? `<button data-queue-action="down" data-queue-id="${item.id}" title="Przesuń niżej">↓</button>` : ""}
+            ${item.status === "queued" ? `<button data-queue-action="edit" data-queue-id="${item.id}" title="Edytuj">Edytuj</button>` : ""}
+            ${item.status !== "running" ? `<button data-queue-action="delete" data-queue-id="${item.id}" title="Usuń">Usuń</button>` : ""}
+          </div>
+        </div>
+      `;
+    })
+    .join("");
+}
+
+async function processPromptQueue() {
+  if (promptQueueProcessing || appBusy) return;
+  const next = promptQueueItems.find((item) => item.status === "queued");
+  if (!next) return;
+  promptQueueProcessing = true;
+  next.status = "running";
+  renderPromptQueue();
+  setBusy(true);
+  try {
+    await sendPromptPayload(next);
+    next.status = "done";
+  } catch (e) {
+    next.status = "error";
+    addInlineEvent("error", "Błąd", e.message || String(e));
+  } finally {
+    setBusy(false);
+    hideLive();
+    promptEl.focus();
+    promptQueueProcessing = false;
+    promptQueueItems = promptQueueItems.filter((item) => item.status !== "done");
+    renderPromptQueue();
+    await saveChatSession(firstUserMessage);
+    await updateContextInfo();
+    if (promptQueueItems.some((item) => item.status === "queued")) {
+      void processPromptQueue();
+    }
   }
 }
 
@@ -400,6 +538,21 @@ function updateStreamingAssistantMessage(deltaText = "", fullText = null) {
 function hasStreamingAssistantContent() {
   const fullText = String(streamingAssistantMessage?.fullText || "").trim();
   return fullText.length > 0;
+}
+
+function extractLiveAnswerFromDelta(fullText = "") {
+  const text = String(fullText || "");
+  if (!text.trim()) return "";
+  const finalMatch = text.match(/\bFINAL\s*:\s*([\s\S]*)$/i);
+  if (finalMatch?.[1]) return finalMatch[1].trimStart();
+  const jsonFinalMatch = text.match(/"final"\s*:\s*"([\s\S]*?)"/i);
+  if (jsonFinalMatch?.[1]) {
+    return jsonFinalMatch[1]
+      .replace(/\\"/g, "\"")
+      .replace(/\\n/g, "\n")
+      .replace(/\\t/g, "\t");
+  }
+  return "";
 }
 
 function finalizeStreamingAssistantMessage(finalText = "", options = {}) {
@@ -723,8 +876,16 @@ function renderChatHistory() {
     `;
     btn.querySelector(".chat-item-delete").addEventListener("click", async (e) => {
       e.stopPropagation();
+      const wasActive = session.id === activeChatId;
       await window.endocode.deleteChat(session.id);
       await loadChatHistory();
+      if (wasActive) {
+        if (chatSessions.length > 0) {
+          await switchToChat(chatSessions[0].id);
+        } else {
+          await startNewChat();
+        }
+      }
     });
     btn.addEventListener("click", () => {
       switchToChat(session.id).catch((e) => addInlineEvent("error", "Czat", e.message || String(e)));
@@ -782,6 +943,10 @@ async function startNewChat() {
   await window.endocode.resetChat();
   const newId = generateId();
   activeChatId = newId;
+  firstUserMessage = null;
+  promptQueueItems = [];
+  promptQueueProcessing = false;
+  renderPromptQueue();
   chatTitle.textContent = "Nowy czat";
   conversation.innerHTML = "";
   // Re-add welcome screen
@@ -1188,7 +1353,13 @@ reasoningSelect.addEventListener("change", async () => {
 });
 
 stopBtn.addEventListener("click", async () => {
-  try { await window.endocode.abort(); } catch (e) {
+  try {
+    await window.endocode.abort();
+    if (hasStreamingAssistantContent()) {
+      finalizeStreamingAssistantMessage("", { overwriteText: false });
+      await saveChatSession(firstUserMessage);
+    }
+  } catch (e) {
     addInlineEvent("error", "Stop", e.message || String(e));
   }
 });
@@ -1344,6 +1515,21 @@ promptEl.addEventListener("paste", (e) => {
 // ── Submit ──
 let firstUserMessage = null;
 
+if (promptQueueList) {
+  promptQueueList.addEventListener("click", (event) => {
+    const target = event.target.closest("button[data-queue-action]");
+    if (!target) return;
+    const action = target.dataset.queueAction;
+    const id = target.dataset.queueId;
+    if (!action || !id) return;
+    if (action === "up") movePromptInQueue(id, "up");
+    else if (action === "down") movePromptInQueue(id, "down");
+    else if (action === "edit") editPromptInQueue(id);
+    else if (action === "delete") deletePromptFromQueue(id);
+    else if (action === "now") setPromptPriorityNow(id);
+  });
+}
+
 composer.addEventListener("submit", async (event) => {
   event.preventDefault();
   const text = promptEl.value.trim();
@@ -1359,24 +1545,32 @@ composer.addEventListener("submit", async (event) => {
   if (!firstUserMessage) firstUserMessage = messagePreview;
   addMessage("user", messagePreview, attachedBase64);
   chatTitle.textContent = messagePreview.length > 40 ? messagePreview.slice(0, 40) + "..." : messagePreview;
-  setBusy(true);
+  await saveChatSession(firstUserMessage);
 
-  try {
-    const payload = attachedBase64
-      ? { text, imageBase64: attachedBase64.split(",")[1] }
-      : attachedFile
-        ? { text, attachment: attachedFile }
-        : text;
-    await window.endocode.send(payload);
-  } catch (e) {
-    addInlineEvent("error", "Błąd", e.message || String(e));
-  } finally {
-    setBusy(false);
-    hideLive();
-    promptEl.focus();
-    await saveChatSession(firstUserMessage);
-    await updateContextInfo();
+  const submission = {
+    text,
+    imageBase64: attachedBase64 ? attachedBase64.split(",")[1] : null,
+    attachment: attachedFile,
+  };
+
+  const hasQueuedWork = promptQueueItems.some((item) => item.status === "queued" || item.status === "running");
+  if (!appBusy && !hasQueuedWork) {
+    setBusy(true);
+    try {
+      await sendPromptPayload(submission);
+    } catch (e) {
+      addInlineEvent("error", "Błąd", e.message || String(e));
+      setBusy(false);
+      hideLive();
+      promptEl.focus();
+      await saveChatSession(firstUserMessage);
+      await updateContextInfo();
+    }
+    return;
   }
+
+  addPromptToQueue(submission);
+  promptEl.focus();
 });
 
 promptEl.addEventListener("keydown", (event) => {
@@ -1499,14 +1693,22 @@ window.endocode.onEvent(async (event) => {
     currentThinkingSegment = null;
     activeToolSegments.length = 0;
     removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
-    addInlineEvent("activity", "Model planuje", "Analiza promptu i plan działania.");
-    showLive("Przygotowuje...");
+    const rawInput = String(event.text || "").trim();
+    const shortInput = rawInput.length > 240 ? `${rawInput.slice(0, 240)}...` : rawInput;
+    const planningDetail = shortInput
+      ? `Start tury. Wejście użytkownika: ${shortInput}`
+      : "Start tury. Brak tekstu wejściowego (np. załącznik lub akcja systemowa).";
+    addInlineEvent("activity", "Model planuje", planningDetail);
+    showLive("Planowanie...", shortInput || "Przygotowanie kontekstu i kolejnych kroków.");
     return;
   }
   if (event.type === "run-end") {
     stopAllLiveDurations();
     activeToolSegments.length = 0;
     currentThinkingSegment = null;
+    if (hasStreamingAssistantContent()) {
+      finalizeStreamingAssistantMessage("", { overwriteText: false });
+    }
     hideLive();
     currentThinkingBubble = null;
     updateContextInfo();
@@ -1543,6 +1745,11 @@ window.endocode.onEvent(async (event) => {
 
   if (event.type === "thinking-end") {
     if (currentThinkingBubble) {
+      const content = currentThinkingBubble.querySelector(".thinking-content");
+      const hasContent = Boolean(content && String(content.textContent || "").trim());
+      if (!hasContent && typeof event.full === "string" && event.full.trim()) {
+        appendThinkingText(currentThinkingBubble, event.full);
+      }
       if (currentThinkingSegment?.key) stopLiveDuration(currentThinkingSegment.key, parseEventTimeMs(event));
       finalizeThinkingBubble(currentThinkingBubble);
       currentThinkingBubble = null;
@@ -1562,6 +1769,11 @@ window.endocode.onEvent(async (event) => {
       updateStreamingAssistantMessage(event.text || "", full);
     } else if (preview) {
       upsertInlineEvent(MODEL_WRITING_ACTIVITY_ID, "activity", writingLabel, preview);
+      const liveFinal = extractLiveAnswerFromDelta(full);
+      if (liveFinal) {
+        removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
+        updateStreamingAssistantMessage("", liveFinal);
+      }
     }
     showLive(livePhrase, preview.slice(-500));
     return;
@@ -1624,7 +1836,11 @@ window.endocode.onEvent(async (event) => {
   if (event.type === "final") {
     removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
     if (event.note) addInlineEvent("note", "Podsumowanie", event.note);
-    addMessage("assistant", event.text);
+    if (hasStreamingAssistantContent()) {
+      finalizeStreamingAssistantMessage(event.text || "");
+    } else if (String(event.text || "").trim()) {
+      addMessage("assistant", event.text);
+    }
     const sources = extractSourcesFromAnswer(event.text || "");
     if (sources.length) {
       addInlineEvent("activity", "Źródła", sources.map((url) => `- ${url}`).join("\n"));

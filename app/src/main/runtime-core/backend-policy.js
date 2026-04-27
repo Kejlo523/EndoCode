@@ -1,14 +1,23 @@
 "use strict";
 
 function detectInstallTarget(platform, gpuInfo = {}) {
-  const gpuVendor = String(gpuInfo?.gpuVendor || "unknown").toLowerCase();
+  const gpuVendorRaw = String(gpuInfo?.gpuVendor || "unknown").toLowerCase();
+  const gpuName = String(gpuInfo?.gpuName || "").toLowerCase();
+  const gpuVendor =
+    gpuVendorRaw.includes("nvidia") ? "nvidia"
+      : gpuVendorRaw.includes("amd") || gpuVendorRaw.includes("radeon") ? "amd"
+        : gpuVendorRaw.includes("intel") || gpuName.includes("arc") ? "intel"
+          : "unknown";
   let runtimePreference = ["cpu"];
   if (platform === "linux") {
     if (gpuVendor === "nvidia") runtimePreference = ["cuda", "vulkan", "cpu"];
-    else if (gpuVendor === "amd") runtimePreference = ["rocm", "vulkan", "cpu"];
+    else if (gpuVendor === "amd") runtimePreference = ["vulkan", "rocm", "cpu"];
+    else if (gpuVendor === "intel") runtimePreference = ["vulkan", "cpu"];
     else runtimePreference = ["vulkan", "cpu"];
   } else {
     if (gpuVendor === "nvidia") runtimePreference = ["cuda", "vulkan", "cpu"];
+    else if (gpuVendor === "amd") runtimePreference = ["vulkan", "cpu", "cuda"];
+    else if (gpuVendor === "intel") runtimePreference = ["vulkan", "cpu"];
     else runtimePreference = ["cpu", "vulkan", "cuda"];
   }
   return { platform, gpuVendor, runtimePreference };

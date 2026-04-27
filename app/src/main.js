@@ -56,6 +56,8 @@ const CHAT_WEB_SEARCH_RESULT_LIMIT = 12;
 const CHAT_WEB_HTML_SIGNAL_LIMIT = 10;
 const CHAT_WEB_SOURCE_GOOD_SNIPPET_CHARS = 120;
 const CHAT_WEB_SOURCE_WEAK_SNIPPET_CHARS = 45;
+const BRAVE_SEARCH_API_URL = "https://api.search.brave.com/res/v1/web/search";
+const BRAVE_SEARCH_API_KEY = String(process.env.BRAVE_SEARCH_API_KEY || "").trim();
 const CHAT_ATTACHMENT_MAX_BYTES = 6 * 1024 * 1024;
 const CHAT_ATTACHMENT_TEXT_LIMIT = 12000;
 const SAFE_RUNTIME_LIMITS = {
@@ -209,6 +211,7 @@ AUTONOMIA:
   TOOL: <nazwa_narzedzia>
   ARGS: <JSON obiektu>
 - Dopuszczalna jest tez odpowiedz JSON legacy {"tool":"...","args":{...}} albo {"final":"..."}.
+- Gdy potrzebujesz doprecyzowania od uzytkownika, zwroc to jako FINAL (pytanie), nie jako sam NOTE.
 - Gdy odpowiedz ma byc finalna, podaj jasny final dla uzytkownika.
 
 DOSTEPNE NARZEDZIA:
@@ -338,6 +341,8 @@ let serverOwned = false;
 let runningModelId = null;
 let runInProgress = false;
 let runAbortController = null;
+const runQueue = [];
+let runQueueActive = false;
 let runtimeEngine = null;
 let agentCore = null;
 let lastChatLookupQuery = "";
@@ -384,7 +389,60 @@ let customModelSettingsByModelId = {};
 const chatWebLookupCache = new Map();
 const runtimeRecoveryStateByModelId = new Map();
 
+function appendAgentDebugLog(type, payload = {}) {
+  try {
+    const interesting = new Set([
+      "run-start",
+      "thinking-start",
+      "thinking-delta",
+      "thinking-end",
+      "model-raw",
+      "parse-error",
+      "tool-start",
+      "tool-result",
+      "note",
+      "final",
+      "run-end",
+    ]);
+    if (!interesting.has(type)) return;
+    const candidateDirs = [];
+    if (ENDOCODE_HOME) candidateDirs.push(path.join(ENDOCODE_HOME, "logs"));
+    if (workspaceRoot) candidateDirs.push(path.join(workspaceRoot, ".endocode", "logs"));
+    if (!candidateDirs.length) return;
+    const compactPayload = { ...payload };
+    if (typeof compactPayload.raw === "string" && compactPayload.raw.length > 4000) {
+      compactPayload.raw = `${compactPayload.raw.slice(0, 4000)}\n...[truncated]`;
+    }
+    if (typeof compactPayload.full === "string" && compactPayload.full.length > 4000) {
+      compactPayload.full = `${compactPayload.full.slice(0, 4000)}\n...[truncated]`;
+    }
+    if (typeof compactPayload.text === "string" && compactPayload.text.length > 2000) {
+      compactPayload.text = `${compactPayload.text.slice(0, 2000)}...[truncated]`;
+    }
+    const line = `${JSON.stringify({
+      at: new Date().toISOString(),
+      type,
+      modelId: selectedModelId,
+      cwd: (() => {
+        try { return relativeToRoot(cwd); } catch { return String(cwd || ""); }
+      })(),
+      payload: compactPayload,
+    })}\n`;
+    for (const logsDir of candidateDirs) {
+      try {
+        fs.mkdirSync(logsDir, { recursive: true });
+        fs.appendFileSync(path.join(logsDir, "agent-think.log"), line, "utf8");
+      } catch {
+        // try next location
+      }
+    }
+  } catch {
+    // ignore debug logging errors
+  }
+}
+
 function emit(type, payload = {}) {
+  appendAgentDebugLog(type, payload);
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send("agent:event", {
       id: crypto.randomUUID(),
@@ -1917,6 +1975,43 @@ async function searchWebLinks(query) {
   }
 }
 
+async function searchBraveWeb(query) {
+  if (!BRAVE_SEARCH_API_KEY) return { links: [], sources: [] };
+  const q = normalizeWebQuery(query);
+  if (!q) return { links: [], sources: [] };
+  const url = `${BRAVE_SEARCH_API_URL}?q=${encodeURIComponent(q)}&count=${Math.min(10, CHAT_WEB_SEARCH_RESULT_LIMIT)}`;
+  try {
+    const response = await fetchWithRetry(url, {
+      headers: {
+        Accept: "application/json",
+        "X-Subscription-Token": BRAVE_SEARCH_API_KEY,
+        "User-Agent": "EndoCode-Desktop-App",
+      },
+    }, [CHAT_WEB_LOOKUP_TIMEOUT_MS, CHAT_WEB_LOOKUP_RETRY_TIMEOUT_MS]);
+    if (!response.ok) return { links: [], sources: [] };
+    const data = await response.json().catch(() => ({}));
+    const results = Array.isArray(data?.web?.results) ? data.web.results : [];
+    const links = [];
+    const sources = [];
+    const seen = new Set();
+    for (const entry of results) {
+      const link = String(entry?.url || "").trim();
+      if (!isHttpUrl(link) || seen.has(link)) continue;
+      seen.add(link);
+      links.push(link);
+      sources.push({
+        title: compactWebSnippet(entry?.title || "Brave result"),
+        url: link,
+        snippet: compactWebSnippet(entry?.description || ""),
+      });
+      if (links.length >= CHAT_WEB_SEARCH_RESULT_LIMIT) break;
+    }
+    return { links, sources };
+  } catch {
+    return { links: [], sources: [] };
+  }
+}
+
 function collectRelatedTopics(topics = [], out = []) {
   for (const topic of topics) {
     if (!topic) continue;
@@ -1971,6 +2066,7 @@ ${signalLines.join("\n")}`;
         sourceDiagnostics,
         quality,
         lookupUrl: "",
+        provider: "domain-first",
         fromCache: false,
         skipped: false,
         query: normalized,
@@ -2028,6 +2124,18 @@ ${signalLines.join("\n")}`;
         .map((source) => String(source?.url || "").trim())
         .filter((url) => isHttpUrl(url))
         .slice(0, CHAT_WEB_PAGE_FETCH_MAX_SOURCES);
+      if (!candidateUrls.length && BRAVE_SEARCH_API_KEY) {
+        const brave = await searchBraveWeb(candidateQuery);
+        if (Array.isArray(brave.sources) && brave.sources.length) {
+          for (const source of brave.sources) {
+            if (!source?.url) continue;
+            if (!dedupedSources.some((entry) => entry.url === source.url)) dedupedSources.push(source);
+          }
+        }
+        if (Array.isArray(brave.links) && brave.links.length) {
+          candidateUrls = brave.links.slice(0, CHAT_WEB_PAGE_FETCH_MAX_SOURCES);
+        }
+      }
       if (!candidateUrls.length) {
         candidateUrls = (await searchWebLinks(candidateQuery)).slice(0, CHAT_WEB_PAGE_FETCH_MAX_SOURCES);
       }
@@ -2072,6 +2180,7 @@ ${lines.join("\n")}`
         sourceDiagnostics,
         quality,
         lookupUrl,
+        provider: BRAVE_SEARCH_API_KEY ? "brave+ddg" : "ddg",
         fromCache: false,
         skipped: false,
         query: normalized,
@@ -2090,6 +2199,7 @@ ${lines.join("\n")}`
         sourceDiagnostics: [],
         quality: { confidence: "low", total: 0, usable: 0, counts: { ok: 0, slaby: 0, niedostepny: 0 } },
         lookupUrl,
+        provider: BRAVE_SEARCH_API_KEY ? "brave+ddg" : "ddg",
         fromCache: false,
         skipped: false,
         query: normalized,
@@ -2104,6 +2214,7 @@ ${lines.join("\n")}`
     visitedUrls: [],
     sourceDiagnostics: [],
     quality: { confidence: "low", total: 0, usable: 0, counts: { ok: 0, slaby: 0, niedostepny: 0 } },
+    provider: BRAVE_SEARCH_API_KEY ? "brave+ddg" : "ddg",
     fromCache: false,
     skipped: false,
     query: normalized,
@@ -3323,6 +3434,32 @@ function parseActionEnvelope(raw) {
     return { note, tool, args };
   }
 
+  // Inline fallback: model often writes "Use TOOL: write_file. ARGS: {...}" inside prose.
+  const inlineFinal = text.match(/\bFINAL\s*:\s*([\s\S]+)$/i);
+  if (inlineFinal?.[1]?.trim()) {
+    return { note, final: inlineFinal[1].trim() };
+  }
+  const inlineTool = text.match(/\bTOOL\s*:\s*([a-z_]+)/i);
+  if (inlineTool?.[1]) {
+    const inlineArgsMarker = text.match(/\bARGS\s*:\s*([\s\S]+)$/i);
+    let args = {};
+    if (inlineArgsMarker?.[1]) {
+      const argsText = inlineArgsMarker[1].trim();
+      const obj = extractFirstJsonObject(argsText);
+      if (obj) {
+        try {
+          args = JSON.parse(obj);
+        } catch {
+          args = {};
+        }
+      } else {
+        const pathMatch = argsText.match(/\bpath\b[^a-z0-9]*["'`]([^"'`]+)["'`]/i);
+        if (pathMatch?.[1]) args.path = pathMatch[1].trim();
+      }
+    }
+    return { note, tool: inlineTool[1].trim(), args };
+  }
+
   // Legacy fallback for compatibility with old model outputs
   try {
     return parseJsonAction(text);
@@ -3334,17 +3471,11 @@ function parseActionEnvelope(raw) {
 function inferActionFromNaturalText(raw) {
   const text = String(raw || "").trim();
   if (!text) return null;
-  const lower = text.toLowerCase();
-  const toolNames = [...ALLOWED_TOOLS].sort((a, b) => b.length - a.length);
-  let detectedTool = null;
-  for (const tool of toolNames) {
-    const re = new RegExp(`\\b${tool.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i");
-    if (re.test(lower)) {
-      detectedTool = tool;
-      break;
-    }
-  }
-  if (!detectedTool) return null;
+  // Strict fallback: infer tool only from explicit command-like marker.
+  const explicitToolMatch = text.match(/^(?:TOOL|NARZEDZIE)\s*:\s*([a-z_]+)/im);
+  if (!explicitToolMatch) return null;
+  const detectedTool = String(explicitToolMatch[1] || "").trim();
+  if (!ALLOWED_TOOLS.has(detectedTool)) return null;
   let args = {};
   const jsonCandidate = extractFirstJsonObject(text);
   if (jsonCandidate) {
@@ -3359,6 +3490,105 @@ function inferActionFromNaturalText(raw) {
     }
   }
   return { note: "Auto-zinterpretowano intencje modelu.", tool: detectedTool, args };
+}
+
+function buildDuckDuckGoSearchUrl(query) {
+  const normalized = compactWhitespace(String(query || ""));
+  if (!normalized) return "";
+  return `https://duckduckgo.com/html/?q=${encodeURIComponent(normalized)}`;
+}
+
+function extractSearchQueryFromPlannerText(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return "";
+  const markerMatch = raw.match(/\b(?:query|fraza|zapytanie|search)\s*[:=]\s*["'`]?(.+?)["'`]?$/i);
+  if (markerMatch?.[1]) return compactWhitespace(markerMatch[1]);
+  const stripped = raw
+    .replace(/\b(?:we need|we should|let'?s|we will|we'll|powinnismy|trzeba|nalezy)\b/gi, " ")
+    .replace(/\b(?:use|uzyj(?:my)?|wyszukaj|szukaj|search|in(?: the)? web|w necie|w internecie)\b/gi, " ")
+    .replace(/\b(?:fetch_url|duckduckgo|google|brave)\b/gi, " ")
+    .replace(/[.:;()[\]{}]/g, " ");
+  return compactWhitespace(stripped).slice(0, 220);
+}
+
+function inferActionFromPlannerText(raw) {
+  const text = String(raw || "").trim();
+  if (!text) return null;
+  const lower = text.toLowerCase();
+  const hasPlannerTone = /\b(we need|we should|let'?s|we will|we'll|powinnismy|trzeba|nalezy)\b/.test(lower);
+  const hasWebIntent =
+    /\b(wyszukaj|szukaj|search|internet|web|w necie|w internecie|sprawdz online|who is|co ostatnio zrobi[łl])\b/i.test(text);
+
+  if (hasWebIntent && /\b(fetch_url|duckduckgo|google|brave|url)\b/i.test(text)) {
+    const directUrl = text.match(/\bhttps?:\/\/[^\s"'`<>)]+/i)?.[0] || "";
+    if (directUrl) {
+      return { note: "Auto: wykryto web lookup, pobieram URL.", tool: "fetch_url", args: { url: directUrl, timeout: 20, raw: false } };
+    }
+    const query = extractSearchQueryFromPlannerText(text);
+    const lookupUrl = buildDuckDuckGoSearchUrl(query);
+    if (lookupUrl) {
+      return { note: "Auto: wykryto web lookup, uruchamiam wyszukiwanie.", tool: "fetch_url", args: { url: lookupUrl, timeout: 20, raw: false } };
+    }
+  }
+  if (hasWebIntent) {
+    const query = extractSearchQueryFromPlannerText(text);
+    const lookupUrl = buildDuckDuckGoSearchUrl(query);
+    if (lookupUrl) {
+      return { note: "Auto: zamieniono plan web na fetch_url.", tool: "fetch_url", args: { url: lookupUrl, timeout: 20, raw: false } };
+    }
+  }
+
+  // Common planner phrasing: "use ls", "let's list", "check current folder"
+  if (/\buse\s+ls\b|\blist\b.*\bfolder\b|\bcheck\b.*\bcurrent folder\b|\bsprawdz\b.*\bfolder\b|\bls\b/.test(lower)) {
+    return { note: "Auto: zamieniono plan na akcje narzedzia.", tool: "ls", args: { path: ".", maxEntries: 120 } };
+  }
+  if (/\buse\s+pwd\b|\bcurrent\s+directory\b|\bbiezac[ya]\s+katalog\b/.test(lower)) {
+    return { note: "Auto: zamieniono plan na akcje narzedzia.", tool: "pwd", args: {} };
+  }
+  if (/\brespond\s+with\s+a\s+tool\s+call\b|\bneed\s+to\s+respond\s+with\s+a\s+tool\b/.test(lower)) {
+    if (/\bpwd\b/.test(lower)) return { note: "Auto: zamieniono plan na akcje narzedzia.", tool: "pwd", args: {} };
+    if (/\bls\b/.test(lower)) return { note: "Auto: zamieniono plan na akcje narzedzia.", tool: "ls", args: { path: ".", maxEntries: 120 } };
+  }
+  if (/\buse\b[\s:,-]*`?write_file`?\b|\bwrite_file\b/.test(lower) && (/\bhtml\b/.test(lower) || /\bindex\.html\b/.test(lower) || /\bstron[ae]\b/.test(lower))) {
+    const htmlPathMatch = text.match(/\b([a-z0-9._/-]+\.html)\b/i);
+    return {
+      note: "Auto: zamieniono plan na akcje narzedzia.",
+      tool: "write_file",
+      args: {
+        path: htmlPathMatch?.[1] || "index.html",
+        mode: "overwrite",
+        content: "<!doctype html>\n<html lang=\"pl\">\n<head>\n  <meta charset=\"UTF-8\" />\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />\n  <title>Prosta strona</title>\n</head>\n<body>\n  <h1>Witaj!</h1>\n  <p>To jest prosta strona HTML.</p>\n</body>\n</html>\n",
+      },
+    };
+  }
+  if (hasPlannerTone && /\bhtml\b/.test(lower)) {
+    return {
+      note: "Auto: wykryto plan wykonania, zaczynam od akcji.",
+      tool: "write_file",
+      args: {
+        path: "index.html",
+        mode: "overwrite",
+        content: "<!doctype html>\n<html lang=\"pl\">\n<head>\n  <meta charset=\"UTF-8\" />\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />\n  <title>Prosta strona</title>\n</head>\n<body>\n  <h1>Witaj!</h1>\n  <p>To jest prosta strona HTML.</p>\n</body>\n</html>\n",
+      },
+    };
+  }
+  if (/\buse\s+read_file\b|\bread\b.*\bfile\b|\bprzeczytaj\b.*\bplik\b/.test(lower)) {
+    const fileMatch = text.match(/["'`](.+?\.[a-z0-9]{1,8})["'`]/i);
+    return { note: "Auto: zamieniono plan na akcje narzedzia.", tool: "read_file", args: { path: fileMatch?.[1] || ".", maxBytes: 30000 } };
+  }
+  if (/\buse\s+write_file\b|\bcreate\b.*\.html\b|\butw[oó]rz\b.*\.html\b|\bstron[ae]\s+html\b/.test(lower)) {
+    const htmlPathMatch = text.match(/\b([a-z0-9._/-]+\.html)\b/i);
+    return {
+      note: "Auto: zamieniono plan na akcje narzedzia.",
+      tool: "write_file",
+      args: {
+        path: htmlPathMatch?.[1] || "index.html",
+        mode: "overwrite",
+        content: "<!doctype html>\n<html lang=\"pl\">\n<head>\n  <meta charset=\"UTF-8\" />\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />\n  <title>Prosta strona</title>\n</head>\n<body>\n  <h1>Witaj!</h1>\n  <p>To jest prosta strona HTML.</p>\n</body>\n</html>\n",
+      },
+    };
+  }
+  return null;
 }
 
 function stableJson(value) {
@@ -3677,6 +3907,11 @@ function validateModelAction(parsed) {
   }
   const hasFinal = typeof parsed.final === "string" && parsed.final.trim() !== "";
   const toolName = typeof parsed.tool === "string" ? parsed.tool.trim() : null;
+  const noteOnly = !hasFinal && !toolName && typeof parsed.note === "string" && parsed.note.trim() !== "";
+  if (noteOnly) {
+    // Treat clarification/notes as final user-facing question instead of hard-failing.
+    return { ok: true, action: { ...parsed, final: parsed.note.trim() } };
+  }
   if (hasFinal && toolName) {
     return {
       ok: false,
@@ -3700,7 +3935,28 @@ function validateModelAction(parsed) {
   if (parsed.args !== undefined && (typeof parsed.args !== "object" || parsed.args === null || Array.isArray(parsed.args))) {
     return { ok: false, error: "Pole 'args' musi byc obiektem JSON (albo pomin, wtedy traktujemy jako {}). " };
   }
-  return { ok: true, action: { ...parsed, tool: toolName, args: parsed.args !== undefined ? parsed.args : {} } };
+  let args = parsed.args !== undefined ? parsed.args : {};
+  if (toolName === "fetch_url") {
+    const rawUrl = String(args.url || "").trim();
+    if (!rawUrl) {
+      const query = compactWhitespace(String(args.query || args.search || args.q || "").trim());
+      if (query) {
+        args = { ...args, url: buildDuckDuckGoSearchUrl(query), timeout: args.timeout ?? 20, raw: args.raw ?? false };
+      } else {
+        return { ok: false, error: "Narzędzie fetch_url wymaga args.url (http/https) lub args.query do automatycznego wyszukania." };
+      }
+    } else if (!/^https?:\/\//i.test(rawUrl) && compactWhitespace(rawUrl)) {
+      args = { ...args, url: buildDuckDuckGoSearchUrl(rawUrl), timeout: args.timeout ?? 20, raw: args.raw ?? false };
+    }
+  }
+  const requiredPathTools = new Set(["write_file", "read_file", "replace_text", "create_pdf", "create_pptx", "create_docx", "analyze_image", "mkdir", "cd"]);
+  if (requiredPathTools.has(toolName)) {
+    const p = String(args.path || "").trim();
+    if (!p || p === "." || p === "./") {
+      return { ok: false, error: `Narzędzie ${toolName} wymaga poprawnego args.path wskazującego plik/folder (nie '.' ani pusty).` };
+    }
+  }
+  return { ok: true, action: { ...parsed, tool: toolName, args } };
 }
 
 function makeActionSchemaRepairPrompt(schemaError, raw, options = {}) {
@@ -3747,9 +4003,22 @@ async function getNextActionWithRepair(abortSignal, failedModelIds, step = null)
         detail: `Naprawiam format akcji (${attempt}/${retryLimit}).`,
       });
     }
-    const promptMessages = agentCore?.memory
+    let promptMessages = agentCore?.memory
       ? [...createInitialMessages(), ...agentCore.memory.getModelContext()]
       : messages;
+    const model = getModelConfig();
+    const modelSettings = getModelSettingsForId(model?.id || selectedModelId);
+    const contextTokensLimit = clampContextTokens(modelSettings.contextTokens ?? model?.contextTokens ?? 8192);
+    const plannerPromptLimit = Math.max(MIN_CONTEXT_TOKENS, Math.floor(contextTokensLimit * 0.78));
+    if (estimateTokens(promptMessages) > plannerPromptLimit && promptMessages.length > 3) {
+      const head = promptMessages[0];
+      const tail = promptMessages.slice(-6).map((msg, index, arr) => {
+        const isLatest = index === arr.length - 1;
+        const maxChars = isLatest ? 2600 : 1200;
+        return shrinkRetainedMessageForCompaction(msg, maxChars);
+      });
+      promptMessages = [head, ...tail];
+    }
     const { content: raw, reasoning } = await callModelWithRecovery(promptMessages, abortSignal, failedModelIds, {}, step);
     lastRaw = String(raw || "");
     if (reasoning) actionRawReasoning = reasoning;
@@ -3762,6 +4031,11 @@ async function getNextActionWithRepair(abortSignal, failedModelIds, step = null)
       const inferred = inferActionFromNaturalText(raw);
       if (inferred) {
         const inferredValidated = validateModelAction(inferred);
+        if (inferredValidated.ok) return { action: inferredValidated.action, reasoning: actionRawReasoning };
+      }
+      const inferredFromPlan = inferActionFromPlannerText(raw);
+      if (inferredFromPlan) {
+        const inferredValidated = validateModelAction(inferredFromPlan);
         if (inferredValidated.ok) return { action: inferredValidated.action, reasoning: actionRawReasoning };
       }
       if (attempt >= retryLimit) break;
@@ -3780,6 +4054,11 @@ async function getNextActionWithRepair(abortSignal, failedModelIds, step = null)
         const inferredValidated = validateModelAction(inferred);
         if (inferredValidated.ok) return { action: inferredValidated.action, reasoning: actionRawReasoning };
       }
+      const inferredFromPlan = inferActionFromPlannerText(raw);
+      if (inferredFromPlan) {
+        const inferredValidated = validateModelAction(inferredFromPlan);
+        if (inferredValidated.ok) return { action: inferredValidated.action, reasoning: actionRawReasoning };
+      }
       if (attempt >= retryLimit) break;
       const guidance = `Kontrakt akcji niepoprawny: ${validated.error}\nPopraw tylko NOTE/FINAL/TOOL/ARGS bez zmiany celu zadania.`;
       if (agentCore?.memory) {
@@ -3792,6 +4071,40 @@ async function getNextActionWithRepair(abortSignal, failedModelIds, step = null)
   }
   const fallbackText = String(lastRaw || "").trim();
   if (fallbackText) {
+    const inferredFromPlan = inferActionFromPlannerText(fallbackText);
+    if (inferredFromPlan) {
+      const inferredValidated = validateModelAction(inferredFromPlan);
+      if (inferredValidated.ok) {
+        return {
+          action: inferredValidated.action,
+          reasoning: actionRawReasoning,
+        };
+      }
+    }
+    if (/\b(wyszukaj|szukaj|search|internet|web|w necie|w internecie|who is|co ostatnio zrobi[łl])\b/i.test(fallbackText)) {
+      const query = extractSearchQueryFromPlannerText(fallbackText);
+      const lookupUrl = buildDuckDuckGoSearchUrl(query);
+      if (lookupUrl) {
+        return {
+          action: {
+            note: "Wykryto plan web bez formalnej akcji. Kontynuuje fetch_url zamiast finala.",
+            tool: "fetch_url",
+            args: { url: lookupUrl, timeout: 20, raw: false },
+          },
+          reasoning: actionRawReasoning,
+        };
+      }
+    }
+    if (/\b(we need|we should|let'?s|we will|we'll|powinnismy|trzeba|nalezy)\b/i.test(fallbackText)) {
+      return {
+        action: {
+          note: "Wykryto plan wykonania bez formalnej akcji. Kontynuuje narzedziem zamiast finala.",
+          tool: "ls",
+          args: { path: ".", maxEntries: 120 },
+        },
+        reasoning: actionRawReasoning,
+      };
+    }
     return {
       action: {
         note: "Model zwrocil naturalna odpowiedz bez formalnej akcji. Traktuje jako final.",
@@ -5005,7 +5318,11 @@ function getAgentCore() {
     const memory = createSessionMemory({
       maxTaskMessages: 8,
       summarize: (batch) => batch.map(summarizeMessageForCompaction).join("\n"),
-      detectIntentKey: (text) => compactWhitespace(String(text || "")).toLowerCase().slice(0, 140),
+      detectIntentKey: (text) => compactWhitespace(String(text || "")).toLowerCase().slice(0, 220),
+      shouldResetOnIntentChange: (_currentKey, _nextKey, userText) => {
+        const text = String(userText || "").toLowerCase();
+        return /\b(nowe zadanie|od nowa|zresetuj|reset kontekstu|zacznij od zera|new task|start over)\b/.test(text);
+      },
     });
     const planner = createAgentPlanner({
       nextAction: getNextActionWithRepair,
@@ -5111,6 +5428,39 @@ async function runAgent(userText) {
 async function dispatchUserRequest(payload) {
   // Unified autonomous mode: model plans and executes in one pipeline.
   return runAgent(payload);
+}
+
+function processRunQueue() {
+  if (runQueueActive) return;
+  if (!runQueue.length) return;
+  runQueueActive = true;
+  const item = runQueue.shift();
+  const queueSize = runQueue.length;
+  emit("status", {
+    status: "queue-processing",
+    detail: queueSize > 0 ? `Przetwarzam zadanie z kolejki. Pozostalo: ${queueSize}.` : "Przetwarzam zadanie.",
+  });
+  dispatchUserRequest(item.payload)
+    .then(item.resolve)
+    .catch(item.reject)
+    .finally(() => {
+      runQueueActive = false;
+      processRunQueue();
+    });
+}
+
+function enqueueUserRequest(payload) {
+  return new Promise((resolve, reject) => {
+    runQueue.push({ payload, resolve, reject });
+    const pos = runQueue.length;
+    if (pos > 1 || runQueueActive) {
+      emit("status", {
+        status: "queue-enqueued",
+        detail: `Dodano zadanie do kolejki (pozycja ${pos}).`,
+      });
+    }
+    processRunQueue();
+  });
 }
 
 async function runSimpleChat(userText) {
@@ -5426,6 +5776,7 @@ ipcMain.handle("app:select-workspace", async () => {
 ipcMain.handle("app:restore-workspace", async (_event, root) => restoreWorkspaceRoot(root));
 ipcMain.handle("app:reset-chat", () => {
   messages = createInitialMessages();
+  if (agentCore?.memory) agentCore.memory.hardReset("");
   currentChatId = null;
   emit("status", { status: "chat-reset", detail: "Wyczyszczono kontekst rozmowy." });
 });
@@ -5452,6 +5803,7 @@ ipcMain.handle("app:set-model", async (_event, modelId) => {
   }
   saveAppSettings();
   messages = createInitialMessages();
+  if (agentCore?.memory) agentCore.memory.hardReset("");
   if (serverOwned) await stopOwnedServer();
   emit("status", { status: "model-selected", detail: `Wybrano model: ${model.displayName}` });
   return getState();
@@ -5461,16 +5813,24 @@ ipcMain.handle("app:set-reasoning", (_event, level) => {
   selectedReasoning = level;
   saveAppSettings();
   messages = createInitialMessages();
+  if (agentCore?.memory) agentCore.memory.hardReset("");
   emit("status", { status: "reasoning-selected", detail: `Intensywnosc: ${REASONING_LEVELS[level].label}` });
   return getState();
 });
 registerAgentIpcHandlers(ipcMain, {
-  runAgent: (payload) => dispatchUserRequest(payload),
-  runSimpleChat: (text) => dispatchUserRequest(text),
+  runAgent: (payload) => enqueueUserRequest(payload),
+  runSimpleChat: (text) => enqueueUserRequest(text),
   abortRun: () => {
     if (runAbortController) {
       runAbortController.abort();
       return { aborted: true };
+    }
+    if (runQueue.length) {
+      while (runQueue.length) {
+        const pending = runQueue.shift();
+        pending?.reject?.(new Error("Anulowano zadanie z kolejki."));
+      }
+      return { aborted: true, clearedQueue: true };
     }
     return { aborted: false };
   },

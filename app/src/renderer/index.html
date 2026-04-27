@@ -186,6 +186,13 @@
 
       <!-- ── COMPOSER ── -->
       <div class="composer-wrapper">
+        <div class="prompt-queue hidden" id="promptQueue">
+          <div class="prompt-queue-header">
+            <strong>Kolejka promptów</strong>
+            <span id="promptQueueCount">0</span>
+          </div>
+          <div class="prompt-queue-list" id="promptQueueList"></div>
+        </div>
         <form class="composer" id="composer">
           <div class="attachment-preview hidden" id="attachmentPreview">
              <img src="" id="attachmentImage" alt="Załącznik">
