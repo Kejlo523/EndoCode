@@ -106,6 +106,24 @@ function validateAction(rawAction, options = {}) {
 }
 
 function buildMachineRepairPrompt(validationError, rawResponse) {
+  const errText = String(validationError?.error || "unknown");
+  if (/SEARCH_REPLACE_NO_EXACT_MATCH/i.test(errText)) {
+    return [
+      "ACTION_FORMAT_ERROR",
+      `error_code=${validationError?.errorCode || "tool_error"}`,
+      `error=${errText.slice(0, 260)}`,
+      "PATCH_BLOCK_REPAIR_REQUIRED",
+      "Napraw TEN SAM patch (bez zmiany celu).",
+      "1) Uzyj read_file dla wskazanego pliku i skopiuj fragment 1:1 do SEARCH (z whitespace).",
+      "2) Zwroc patch_batch albo patch_edit z mniejszymi blokami.",
+      "3) Nie uzywaj write_file overwrite dla istniejacego pliku.",
+      "Dopuszczalne odpowiedzi:",
+      "- {\"tool\":\"read_file\",\"args\":{\"path\":\"...\",\"maxBytes\":30000}}",
+      "- {\"tool\":\"patch_batch\",\"args\":{\"patch\":\"...\"}}",
+      "- {\"tool\":\"patch_edit\",\"args\":{\"path\":\"...\",\"search\":\"...\",\"replace\":\"...\",\"count\":1}}",
+      `last_raw=${String(rawResponse || "").slice(0, 700)}`,
+    ].join("\n");
+  }
   return [
     "ACTION_FORMAT_ERROR",
     `error_code=${validationError?.errorCode || "unknown"}`,

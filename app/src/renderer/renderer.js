@@ -92,6 +92,7 @@ let streamingAssistantMessage = null;
 const modelRenderCacheLibrary = new Map();
 const modelRenderCacheInstalled = new Map();
 const STREAM_RENDER_THROTTLE_MS = 50;
+const SHOW_MODEL_THINKING_TRACE = false;
 const liveDurationTrackers = new Map();
 let liveDurationTicker = null;
 let activeRunStartedAtMs = null;
@@ -658,6 +659,9 @@ function removeInlineEventByActivityId(activityId) {
 }
 
 const MODEL_WRITING_ACTIVITY_ID = "model-writing";
+const AGENT_PHASE_ACTIVITY_ID = "agent-phase";
+const AGENT_NOTE_ACTIVITY_ID = "agent-note";
+let lastAgentPhaseSignature = "";
 
 function upsertInlineEvent(activityId, kind, title, body = "") {
   const safeBody = String(body ?? "").slice(0, 50000);
@@ -821,6 +825,7 @@ function createThinkingBubble(step = null) {
     </button>
     <div class="thinking-content"></div>
   `;
+  bubble.classList.add("expanded");
 
   bubble.querySelector(".thinking-toggle").addEventListener("click", () => {
     bubble.classList.toggle("expanded");
@@ -1649,7 +1654,10 @@ window.endocode.onEvent(async (event) => {
     stopAllLiveDurations();
     currentThinkingSegment = null;
     activeToolSegments.length = 0;
+    lastAgentPhaseSignature = "";
     removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
+    removeInlineEventByActivityId(AGENT_PHASE_ACTIVITY_ID);
+    removeInlineEventByActivityId(AGENT_NOTE_ACTIVITY_ID);
     const rawInput = String(event.text || "").trim();
     const shortInput = rawInput.length > 240 ? `${rawInput.slice(0, 240)}...` : rawInput;
     const planningDetail = shortInput
@@ -1663,6 +1671,9 @@ window.endocode.onEvent(async (event) => {
     stopAllLiveDurations();
     activeToolSegments.length = 0;
     currentThinkingSegment = null;
+    lastAgentPhaseSignature = "";
+    removeInlineEventByActivityId(AGENT_PHASE_ACTIVITY_ID);
+    removeInlineEventByActivityId(AGENT_NOTE_ACTIVITY_ID);
     if (hasStreamingAssistantContent()) {
       finalizeStreamingAssistantMessage("", { overwriteText: false });
     }
@@ -1674,7 +1685,7 @@ window.endocode.onEvent(async (event) => {
   }
   if (event.type === "note") {
     removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
-    addInlineEvent("activity", "Model planuje", event.note);
+    upsertInlineEvent(AGENT_NOTE_ACTIVITY_ID, "activity", "Model planuje", event.note);
     showLive("Notatka", event.note);
     return;
   }
@@ -1695,8 +1706,12 @@ window.endocode.onEvent(async (event) => {
       event.reason ? `reason=${event.reason}` : "",
       event.step ? `step=${event.step}` : "",
     ].filter(Boolean).join(" · ");
-    addInlineEvent("activity", `Model planuje: ${phaseLabel}`, detail || "Przetwarzanie etapu.");
-    showLive(`Etap: ${phaseLabel}`, detail || "Przetwarzanie");
+    const signature = `${phase}|${detail}`;
+    if (signature !== lastAgentPhaseSignature) {
+      lastAgentPhaseSignature = signature;
+      upsertInlineEvent(AGENT_PHASE_ACTIVITY_ID, "activity", `Model planuje: ${phaseLabel}`, detail || "Przetwarzanie etapu.");
+      showLive(`Etap: ${phaseLabel}`, detail || "Przetwarzanie");
+    }
     return;
   }
   if (event.type === "model-raw") {
@@ -1704,6 +1719,10 @@ window.endocode.onEvent(async (event) => {
     return;
   }
   if (event.type === "thinking-start") {
+    if (!SHOW_MODEL_THINKING_TRACE) {
+      showLive(event.step ? `Krok ${event.step}: Myślenie...` : "Model myśli...");
+      return;
+    }
     const startedAtMs = parseEventTimeMs(event);
     currentThinkingBubble = createThinkingBubble(event.step);
     const durationEl = currentThinkingBubble.querySelector(".thinking-duration");
@@ -1715,6 +1734,11 @@ window.endocode.onEvent(async (event) => {
   }
 
   if (event.type === "thinking-delta") {
+    if (!SHOW_MODEL_THINKING_TRACE) {
+      const stepLabel = event.step ? `Krok ${event.step}: ` : "";
+      showLive(`${stepLabel}Myślenie...`);
+      return;
+    }
     if (currentThinkingBubble) appendThinkingText(currentThinkingBubble, event.text);
     const lastLine = (event.full || "").split("\n").filter(Boolean).pop() || "";
     const stepLabel = event.step ? `Krok ${event.step}: ` : "";
@@ -1723,6 +1747,7 @@ window.endocode.onEvent(async (event) => {
   }
 
   if (event.type === "thinking-end") {
+    if (!SHOW_MODEL_THINKING_TRACE) return;
     if (currentThinkingBubble) {
       const content = currentThinkingBubble.querySelector(".thinking-content");
       const hasContent = Boolean(content && String(content.textContent || "").trim());

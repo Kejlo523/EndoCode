@@ -211,6 +211,7 @@ AUTONOMIA:
 - Tryb runtime v2: zwracaj TYLKO jeden obiekt JSON akcji:
   {"tool":"nazwa","args":{...}} albo {"final":"odpowiedz po polsku"}.
 - Zero prose poza JSON. Zero markdown. Zero tablic.
+- Wyjatek dla patch-first: przy zadaniach filesystem mozesz zwrocic bezposrednio surowe bloki SEARCH/REPLACE (Aider-style), a runtime zamieni je na patch_batch.
 - Gdy potrzebujesz doprecyzowania od uzytkownika, zwroc to jako {"final":"pytanie"}.
 - Gdy odpowiedz ma byc finalna, zwroc jasny final dla uzytkownika.
 
@@ -248,6 +249,7 @@ ARTEFAKTY:
 - Artefakty tworz lokalnie i trzymaj je w workspace.
 - Dla dokumentow i prezentacji zachowaj zrodlo Markdown/HTML, gdy ulatwia to poprawki.
 - Estetyka ma pasowac do zadania: narzedzia operacyjne maja byc czytelne i zwarte; prezentacje i strony moga byc bardziej dopracowane wizualnie.
+- Gdy uzytkownik prosi o "ladna", "rozbudowana", "obszerna" strone: NIE koncz na minimalnym placeholderze. Dostarcz co najmniej komplet index.html + style.css (+ opcjonalnie script.js) i sensowna strukture sekcji.
 
 ODZYSK PO PROBLEMACH:
 - Brak narzedzia/dependency: sprawdz PATH albo lokalne skrypty; zaproponuj lub wykonaj lokalna instalacje tylko gdy to uzasadnione.
@@ -256,6 +258,7 @@ ODZYSK PO PROBLEMACH:
 - Jesli nie da sie kontynuowac, final musi podac konkretna przyczyne i najblizszy mozliwy nastepny krok.`;
 
 const AGENT_GUIDANCE_MAX_CHARS = 18000;
+const ENABLE_AGENT_DEBUG_LOG = false;
 
 const SKILL_CATALOG = [];
 
@@ -372,6 +375,7 @@ function buildQuickChoicesForFinal(finalText = "", intentClass = "general", metr
 }
 
 function appendAgentDebugLog(type, payload = {}) {
+  if (!ENABLE_AGENT_DEBUG_LOG) return;
   try {
     const interesting = new Set([
       "run-start",
@@ -3276,6 +3280,16 @@ function parseActionEnvelope(raw) {
   if (text.startsWith("```")) {
     text = text.replace(/^```(?:[a-z0-9_-]+)?\s*/i, "").replace(/\s*```$/i, "").trim();
   }
+  if (text.includes("<<<<<<< SEARCH") && text.includes(">>>>>>> REPLACE")) {
+    const blocks = parsePatchBatchText(text, "");
+    if (Array.isArray(blocks) && blocks.length) {
+      return {
+        note: "Aider-style SEARCH/REPLACE blocks detected.",
+        tool: "patch_batch",
+        args: { blocks },
+      };
+    }
+  }
   const parsed = parseJsonAction(text);
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error("Action v2 requires a single JSON object.");
@@ -3391,19 +3405,8 @@ function recoverActionFromNaturalText(raw, options = {}) {
     };
   }
 
-  if (intentClass === "filesystem" && /\b(write_file|create file|utworz plik)\b/.test(lowered)) {
-    if (/\b(html|strona)\b/i.test(text) || /\b(html|strona)\b/i.test(userPrompt)) {
-      return {
-        note: "Auto-recover: planner requested simple HTML file.",
-        tool: "write_file",
-        args: {
-          path: "index.html",
-          mode: "overwrite",
-          content: "<!doctype html>\n<html lang=\"pl\">\n<head>\n  <meta charset=\"UTF-8\" />\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />\n  <title>Prosta strona</title>\n</head>\n<body>\n  <h1>Witaj!</h1>\n  <p>To jest prosta strona HTML wygenerowana przez EndoCode.</p>\n</body>\n</html>\n",
-        },
-      };
-    }
-  }
+  // Intentionally no auto-generated "simple HTML page" fallback here.
+  // It caused under-delivery for broader website requests.
   return null;
 }
 
@@ -3808,6 +3811,30 @@ Odrzucona odpowiedz (fragment):
 ${String(raw || "").slice(0, 1600)}`;
 }
 
+function getPreferredEditFormat(modelId = "", intentClass = "general") {
+  const id = String(modelId || "").toLowerCase();
+  if (intentClass !== "filesystem") return "json_action";
+  if (/\bgpt-oss\b|\bdeepseek\b|\bqwen\b|\bcoder\b/.test(id)) return "search_replace";
+  return "search_replace";
+}
+
+function buildFilesystemPatchFirstReminder() {
+  return [
+    "PATCH_FIRST_REMINDER",
+    "Dla tego kroku preferuj Aider-style patch-first.",
+    "Priorytet: patch_batch z blokami SEARCH/REPLACE albo patch_edit.",
+    "Dla nowych plikow write_file jest OK.",
+    "Dla istniejacych plikow preferuj patch_edit/patch_batch, ale gdy trzeba mozesz uzyc write_file.",
+    "Mozesz zwrocic surowe bloki SEARCH/REPLACE bez JSON.",
+  ].join("\n");
+}
+
+function enforceFilesystemPatchFirst(validatedAction) {
+  const action = validatedAction?.action || null;
+  if (!action || action.final) return null;
+  return null;
+}
+
 async function getNextActionWithRepair(abortSignal, failedModelIds, step = null) {
   let actionRawReasoning = "";
   let lastError = null;
@@ -3826,6 +3853,7 @@ async function getNextActionWithRepair(abortSignal, failedModelIds, step = null)
       : messages;
     const model = getModelConfig();
     const modelSettings = getModelSettingsForId(model?.id || selectedModelId);
+    const preferredEditFormat = getPreferredEditFormat(model?.id || selectedModelId, currentAgentIntentClass);
     const contextTokensLimit = clampContextTokens(modelSettings.contextTokens ?? model?.contextTokens ?? 8192);
     const plannerPromptLimit = Math.max(MIN_CONTEXT_TOKENS, Math.floor(contextTokensLimit * 0.78));
     if (estimateTokens(promptMessages) > plannerPromptLimit && promptMessages.length > 3) {
@@ -3837,6 +3865,12 @@ async function getNextActionWithRepair(abortSignal, failedModelIds, step = null)
       });
       promptMessages = [head, ...tail];
     }
+    if (preferredEditFormat === "search_replace") {
+      promptMessages = [
+        ...promptMessages,
+        { role: "user", content: buildFilesystemPatchFirstReminder() },
+      ];
+    }
     const { content: raw, reasoning } = await callModelWithRecovery(promptMessages, abortSignal, failedModelIds, {}, step);
     lastRaw = String(raw || "");
     if (reasoning) actionRawReasoning = reasoning;
@@ -3847,6 +3881,21 @@ async function getNextActionWithRepair(abortSignal, failedModelIds, step = null)
     } catch (error) {
       lastError = error;
       bumpAgentRecoveryMetric("parseErrors");
+      const recoveredFromBlocks = recoverActionFromSearchReplaceBlocks(raw);
+      if (recoveredFromBlocks) {
+        const recoveredValidation = validateAction(recoveredFromBlocks, {
+          intentClass: currentAgentIntentClass,
+        });
+        if (recoveredValidation.ok) {
+          bumpAgentRecoveryMetric("naturalTextRecoveries");
+          emit("status", {
+            status: "action-auto-recover",
+            detail: "Model zwrocil surowe bloki SEARCH/REPLACE; zastosowano konwersje do patch_batch.",
+            step,
+          });
+          return { action: recoveredValidation.action, reasoning: actionRawReasoning };
+        }
+      }
       const recovered = recoverActionFromNaturalText(raw, {
         intentClass: currentAgentIntentClass,
         userPrompt: currentAgentUserPrompt,
@@ -3905,6 +3954,24 @@ async function getNextActionWithRepair(abortSignal, failedModelIds, step = null)
         agentCore.memory.append("user", guidance);
       }
       continue;
+    }
+    if (currentAgentIntentClass === "filesystem") {
+      const patchFirstGate = enforceFilesystemPatchFirst(validated);
+      if (patchFirstGate) {
+        lastError = new Error(patchFirstGate.error);
+        bumpAgentRecoveryMetric("schemaErrors");
+        if (attempt >= retryLimit) break;
+        const guidance = makeActionSchemaRepairPrompt(
+          `${patchFirstGate.errorCode} ${patchFirstGate.error}`.trim(),
+          raw,
+          { step, attempt, retryLimit },
+        );
+        if (agentCore?.memory) {
+          agentCore.memory.append("assistant", `Schema error: ${patchFirstGate.errorCode} ${patchFirstGate.error}`);
+          agentCore.memory.append("user", guidance);
+        }
+        continue;
+      }
     }
     return { action: validated.action, reasoning: actionRawReasoning };
   }
@@ -4123,22 +4190,34 @@ const blockedShellPatterns = [
   { re: /(^|[\s"'])\.\.([\\/]|[\s"']|$)/, reason: "wyjscie przez .. jest zablokowane" },
 ];
 
-async function runPowerShell(command, timeoutSeconds) {
+function getShellPolicyWarnings(command = "") {
+  const cmd = String(command || "");
+  const warnings = [];
   for (const item of blockedShellPatterns) {
-    if (item.re.test(command)) throw new Error(item.reason);
+    if (item.re.test(cmd)) warnings.push(item.reason);
   }
+  return [...new Set(warnings)];
+}
+
+async function runPowerShell(command, timeoutSeconds) {
+  const policyWarnings = getShellPolicyWarnings(command);
+  const commandForApproval = policyWarnings.length
+    ? `${command}\n\n[Ostrzezenia sandbox]\n- ${policyWarnings.join("\n- ")}\nUruchomic mimo ostrzezen?`
+    : command;
   const approved = await askApproval({
-    title: "Model prosi o uruchomienie komendy",
+    title: policyWarnings.length
+      ? "Model prosi o uruchomienie komendy (ostrzezenia sandbox)"
+      : "Model prosi o uruchomienie komendy",
     cwd: relativeToRoot(cwd),
-    command,
+    command: commandForApproval,
   });
   if (!approved) throw new Error("Uzytkownik odrzucil komende.");
 
   return new Promise((resolve) => {
     const timeout = Math.max(1, Math.min(Number(timeoutSeconds) || 60, 300)) * 1000;
-    const wrappedCommand = `$env:PATH = [System.Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path','User') + ';' + $env:PATH\n${command}`;
-    const child = spawn("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", wrappedCommand], {
+    const child = spawn(command, {
       cwd,
+      shell: true,
       env: {
         ...process.env,
         TEMP: path.join(workspaceRoot, ".tmp"),
@@ -4149,15 +4228,30 @@ async function runPowerShell(command, timeoutSeconds) {
     });
     let stdout = "";
     let stderr = "";
+    let settled = false;
+    const finalize = (payload) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(payload);
+    };
     const timer = setTimeout(() => {
       child.kill();
       stderr += "\n[timeout]";
     }, timeout);
     child.stdout.on("data", (data) => { stdout += data.toString(); });
     child.stderr.on("data", (data) => { stderr += data.toString(); });
+    child.on("error", (err) => {
+      stderr += `\n[spawn-error] ${err?.message || String(err)}`;
+      finalize({
+        cwd: relativeToRoot(cwd),
+        exitCode: 1,
+        stdout: textPreview(stdout),
+        stderr: textPreview(stderr),
+      });
+    });
     child.on("close", (code) => {
-      clearTimeout(timer);
-      resolve({
+      finalize({
         cwd: relativeToRoot(cwd),
         exitCode: code,
         stdout: textPreview(stdout),
@@ -4317,6 +4411,69 @@ function replaceByExactMatch(content, search, replace, count = 1) {
   return { updated, replaced: Math.min(occurrences, count), strategy: "exact" };
 }
 
+function replaceByRelativeIndent(content, search, replace, count = 1) {
+  const contentLines = String(content).replace(/\r\n/g, "\n").split("\n");
+  const searchLines = String(search).replace(/\r\n/g, "\n").split("\n");
+  const replaceLines = String(replace).replace(/\r\n/g, "\n").split("\n");
+  if (!searchLines.length || !contentLines.length || searchLines.length > contentLines.length) return null;
+
+  const normalizedSearch = searchLines.map((line) => line.trimStart());
+  let replaced = 0;
+  for (let start = 0; start <= contentLines.length - searchLines.length; start += 1) {
+    const windowLines = contentLines.slice(start, start + searchLines.length);
+    const normalizedWindow = windowLines.map((line) => line.trimStart());
+    let match = true;
+    for (let i = 0; i < normalizedSearch.length; i += 1) {
+      if (normalizedSearch[i] !== normalizedWindow[i]) {
+        match = false;
+        break;
+      }
+    }
+    if (!match) continue;
+    const indents = windowLines
+      .filter((line) => line.trim().length > 0)
+      .map((line) => (line.match(/^\s*/)?.[0] || "").length);
+    const minIndent = indents.length ? Math.min(...indents) : 0;
+    const indentPrefix = " ".repeat(minIndent);
+    const adaptedReplace = replaceLines.map((line) => {
+      if (!line.trim()) return line;
+      return `${indentPrefix}${line.trimStart()}`;
+    });
+    const before = contentLines.slice(0, start);
+    const after = contentLines.slice(start + searchLines.length);
+    const updatedLines = [...before, ...adaptedReplace, ...after];
+    replaced += 1;
+    const updated = updatedLines.join("\n");
+    if (replaced >= Math.max(1, count)) {
+      return { updated, replaced, strategy: "relative_indent" };
+    }
+  }
+  return null;
+}
+
+function replaceByDotDotDots(content, search, replace, count = 1) {
+  const s = String(search);
+  const r = String(replace);
+  if (!s.includes("\n...\n")) return null;
+  const sParts = s.split(/\n\.\.\.\n/g);
+  const rParts = r.split(/\n\.\.\.\n/g);
+  if (sParts.length !== rParts.length) return null;
+  let updated = String(content);
+  let replaced = 0;
+  for (let i = 0; i < sParts.length; i += 1) {
+    const sPart = sParts[i];
+    const rPart = rParts[i];
+    if (!sPart.trim() && !rPart.trim()) continue;
+    const exact = replaceByExactMatch(updated, sPart, rPart, 1);
+    if (!exact) return null;
+    updated = exact.updated;
+    replaced += 1;
+    if (replaced >= Math.max(1, count)) break;
+  }
+  if (!replaced) return null;
+  return { updated, replaced, strategy: "dotdotdot_segments" };
+}
+
 function applyPatchStyleSearchReplace(content, search, replace, count = 1) {
   const exact = replaceByExactMatch(content, search, replace, count);
   if (exact) return exact;
@@ -4327,6 +4484,10 @@ function applyPatchStyleSearchReplace(content, search, replace, count = 1) {
     count,
   );
   if (lfNormalized) return { ...lfNormalized, strategy: "exact_lf_normalized" };
+  const relativeIndent = replaceByRelativeIndent(content, search, replace, count);
+  if (relativeIndent) return relativeIndent;
+  const dotDotDots = replaceByDotDotDots(content, search, replace, count);
+  if (dotDotDots) return dotDotDots;
   return null;
 }
 
@@ -4371,6 +4532,39 @@ function parsePatchBatchText(patchText = "", defaultPath = "") {
     idx += 1;
   }
   return blocks;
+}
+
+function recoverActionFromSearchReplaceBlocks(raw) {
+  const text = String(raw || "").trim();
+  if (!text || !text.includes("<<<<<<< SEARCH") || !text.includes(">>>>>>> REPLACE")) return null;
+  try {
+    const blocks = parsePatchBatchText(text, "");
+    if (!Array.isArray(blocks) || !blocks.length) return null;
+    return {
+      note: "Auto-recover: parsed SEARCH/REPLACE blocks into patch_batch action.",
+      tool: "patch_batch",
+      args: { blocks },
+    };
+  } catch {
+    return null;
+  }
+}
+
+function isSuspiciousStatusOverwrite(targetPath, content, mode = "overwrite") {
+  if (String(mode || "overwrite") === "append") return false;
+  const ext = path.extname(String(targetPath || "")).toLowerCase();
+  const guardedExts = new Set([
+    ".html", ".htm", ".css", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
+    ".json", ".md", ".py", ".java", ".go", ".rs", ".php", ".rb", ".c", ".cpp", ".h", ".hpp",
+  ]);
+  if (!guardedExts.has(ext)) return false;
+  const text = String(content ?? "").trim();
+  if (!text) return false;
+  const shortish = text.length <= 220;
+  const lowLineCount = text.split(/\r?\n/).length <= 4;
+  const noCodeMarkers = !/[<>{}[\];=]/.test(text) && !/\b(function|class|import|export|const|let|var|def|SELECT|INSERT)\b/i.test(text);
+  const looksLikeStatus = /\b(zapisano|gotowe|pomyslnie|pomyślnie|utworzono|zaktualizowano|wykonano|all done|done|saved)\b/i.test(text);
+  return shortish && lowLineCount && noCodeMarkers && looksLikeStatus;
 }
 
 async function executeTool(action) {
@@ -4433,6 +4627,11 @@ async function executeTool(action) {
   } else if (tool === "write_file") {
     const target = normalizeInsideRoot(args.path);
     const before = await readTextIfExists(target);
+    if (isSuspiciousStatusOverwrite(target, args.content, args.mode)) {
+      throw new Error(
+        "Odrzucono podejrzany overwrite: tresc wyglada jak komunikat statusu modelu, a nie zawartosc pliku. Zakoncz przez final zamiast zapisywac komunikat do pliku.",
+      );
+    }
     await fsp.mkdir(path.dirname(target), { recursive: true });
     if ((args.mode || "overwrite") === "append") {
       await fsp.appendFile(target, String(args.content ?? ""), "utf8");
@@ -4456,7 +4655,7 @@ async function executeTool(action) {
     if (!oldText) throw new Error("search nie moze byc puste.");
     const count = Number.isInteger(Number(args.count)) ? Number(args.count) : 1;
     const patched = applyPatchStyleSearchReplace(before, oldText, newText, count);
-    if (!patched) throw new Error("SEARCH block failed to exactly match lines w pliku.");
+    if (!patched) throw new Error(`SEARCH_REPLACE_NO_EXACT_MATCH path=${relativeToRoot(target)} :: SEARCH block failed to exactly match lines w pliku.`);
     const after = patched.updated;
     await fsp.writeFile(target, after, "utf8");
     result = { path: relativeToRoot(target), replaced: patched.replaced, strategy: patched.strategy };
@@ -4484,7 +4683,7 @@ async function executeTool(action) {
       const patched = applyPatchStyleSearchReplace(before, block.search, block.replace, 1);
       if (!patched) {
         throw new Error(
-          `SEARCH block failed to exactly match lines w pliku ${block.path}. Uzyj read_file i podaj dokladny fragment SEARCH.`,
+          `SEARCH_REPLACE_NO_EXACT_MATCH path=${block.path} :: SEARCH block failed to exactly match lines w pliku ${block.path}. Uzyj read_file i podaj dokladny fragment SEARCH.`,
         );
       }
       const after = patched.updated;
@@ -4563,7 +4762,6 @@ async function executeTool(action) {
     throw new Error(`Wewnetrzny blad: brak implementacji narzedzia ${tool}.`);
   }
 
-  emit("tool-result", { tool, ok: true, result });
   return result;
 }
 
