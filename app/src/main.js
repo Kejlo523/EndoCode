@@ -226,8 +226,11 @@ PODSTAWOWY LOOP:
 6. Final po polsku: co zmieniono, jakie pliki, jaka weryfikacja.
 
 ZASADY EDYCJI:
+- Preferuj mechanike patch-first: patch_edit lub patch_batch z malymi, precyzyjnymi blokami.
+- SEARCH musi byc dokladnym fragmentem z pliku (zachowaj whitespace i wciecia).
+- Gdy SEARCH nie pasuje, najpierw read_file i popraw blok SEARCH, zamiast przepisywac caly plik.
 - Dla nowych plikow mozna uzyc write_file overwrite.
-- Dla istniejacych plikow preferuj replace_text z precyzyjnym starym tekstem.
+- Dla istniejacych plikow preferuj patch_edit/patch_batch z precyzyjnym SEARCH.
 - Append stosuj do celowych dopisek albo dzielenia duzego pliku na fragmenty.
 - Pelny overwrite istniejacego pliku tylko gdy plik jest generowany, bardzo maly, albo uzytkownik wyraznie chce przepisania.
 - SyntaxError/build error: nie panikuj. Odczytaj plik i linie z bledu, popraw minimalny region, rerun tego samego checka.
@@ -267,7 +270,7 @@ const SKILL_CATALOG = [
     name: "DOCX",
     category: "Dokumenty",
     summary: "Tworzenie, edycja i ekstrakcja tresci z plikow Word.",
-    instructions: "Dla DOCX preferuj narzedzie create_docx (markdown) po pip install python-docx; alternatywnie skrypt przez run_powershell lub zrodlo HTML/Markdown.",
+    instructions: "Dla DOCX preferuj lokalny pipeline przez run_powershell i skrypty w workspace; trzymaj zrodlo w Markdown/HTML.",
   },
   {
     id: "pdf",
@@ -281,7 +284,7 @@ const SKILL_CATALOG = [
     name: "Slides",
     category: "Prezentacje",
     summary: "Konspekty, slajdy, speaker notes i eksport deckow.",
-    instructions: "Dla prezentacji dobierz pipeline do celu. Szybki funkcjonalny PPTX: create_pptx. Bogaty wizualnie deck: przygotuj Markdown/HTML i eksportuj lokalnym Marp/Slidev, jesli narzedzie jest dostepne. Zachowaj zrodlo obok wyniku.",
+    instructions: "Dla prezentacji dobierz pipeline do celu. Przygotuj Markdown/HTML i eksportuj lokalnym Marp/Slidev lub skryptem przez run_powershell. Zachowaj zrodlo obok wyniku.",
   },
   {
     id: "sheets",
@@ -329,8 +332,8 @@ const SKILL_CATALOG = [
     id: "vision",
     name: "Vision (VLM Support)",
     category: "Zdolności Agenta",
-    summary: "Włącza obsługę załączników obrazów na czacie oraz narzędzie analyze_image. Podczas instalacji pobiera lekki model VLM.",
-    instructions: "Gdy używasz analyze_image lub wiesz, że użytkownik dostarczył obraz, polegasz na zewnętrznym asystencie wizji (Moondream2). Pamiętaj, aby opierać się na jego odczytach i przekazywać wnioski użytkownikowi wprost, ponieważ główny model działa bez obsługi obrazów.",
+    summary: "Włącza obsługę załączników obrazów na czacie. Podczas instalacji pobiera lekki model VLM.",
+    instructions: "Gdy użytkownik dostarczył obraz, polegaj na zewnętrznym asystencie wizji (Moondream2) i przekazuj wnioski użytkownikowi wprost.",
   },
 ];
 
@@ -3617,7 +3620,7 @@ function actionSignature(action) {
 function getActionRepeatLimit(action) {
   const tool = action?.tool;
   if (["fetch_url", "extract_media", "download_file"].includes(tool)) return 1;
-  if (["write_file", "replace_text", "create_pdf", "create_pptx", "create_docx"].includes(tool)) return 1;
+  if (["write_file", "patch_edit", "patch_batch"].includes(tool)) return 1;
   if (["run_powershell"].includes(tool)) return 2;
   return 3;
 }
@@ -3875,15 +3878,12 @@ function normalizeToolArgsFromRoot(parsed, toolName) {
     read_file: ["path", "maxBytes"],
     write_file: ["path", "content", "mode"],
     mkdir: ["path"],
-    replace_text: ["path", "old", "new", "count"],
-    create_pdf: ["path", "title", "markdown", "html", "content"],
-    create_pptx: ["path", "title", "markdown", "content"],
-    create_docx: ["path", "title", "markdown", "content"],
+    patch_edit: ["path", "search", "replace", "count"],
+    patch_batch: ["patch", "defaultPath", "blocks"],
     run_powershell: ["command", "timeout"],
     fetch_url: ["url", "timeout", "raw"],
     extract_media: ["url", "timeout"],
     download_file: ["url", "path"],
-    analyze_image: ["path"],
   };
   const keys = argKeysByTool[toolName] || [];
   const args = {};
@@ -3960,7 +3960,7 @@ function validateModelAction(parsed) {
       args = { ...args, url: buildDuckDuckGoSearchUrl(rawUrl), timeout: args.timeout ?? 20, raw: args.raw ?? false };
     }
   }
-  const requiredPathTools = new Set(["write_file", "read_file", "replace_text", "create_pdf", "create_pptx", "create_docx", "analyze_image", "mkdir", "cd"]);
+  const requiredPathTools = new Set(["write_file", "read_file", "patch_edit", "mkdir", "cd"]);
   if (requiredPathTools.has(toolName)) {
     const p = String(args.path || "").trim();
     if (!p || p === "." || p === "./") {
@@ -4419,7 +4419,7 @@ function getToolRecoveryHint(error, action) {
     return "Brak uprawnien. Zapisz alternatywny plik w workspace, np. output/ lub exports/, i poinformuj uzytkownika o obejściu.";
   }
   if (/does not support vision|image_url|multimodal/i.test(message)) {
-    return "Model nie obsługuje analizy obrazów (brak modułu Vision). Przerwij próbę analyze_image i w 'final' przeproś użytkownika, informując, że Twój obecny model nie ma zdolności widzenia.";
+    return "Model nie obsługuje analizy obrazów (brak modułu Vision). Przerwij próbę i w 'final' przeproś użytkownika, informując, że Twój obecny model nie ma zdolności widzenia.";
   }
   if (/URL za dlugi|Nieprawidlowy format URL|Dozwolone sa tylko URL http/i.test(message)) {
     return "Skroc URL do prawdziwego linku (max ok. 2048 znakow). Wejdz na strone glowna domeny przez fetch_url, potem extract_media aby wyciagnac konkretne href z HTML — nie wklejaj sztucznego dlugiego ciagu.";
@@ -4439,27 +4439,15 @@ function getToolRecoveryHint(error, action) {
   if (/(403|404)/.test(message) && (tool === "fetch_url" || tool === "download_file")) {
     return "Błąd 404/403. PRZESTAŃ ZGADYWAĆ linki URL w ciemno! Twoja hipoteza o adresie jest błędna. Natychmiast wróć na stronę główną domeny (lub do Google) i użyj narzędzia extract_media, aby odczytać PRAWDZIWE adresy z kodu HTML lub wyników wyszukiwania. Nie powtarzaj prób na podobnych linkach.";
   }
-  if (tool === "write_file" || tool === "replace_text") {
+  if (tool === "write_file" || tool === "patch_edit" || tool === "patch_batch") {
     return "Jesli zapis nie jest mozliwy (np. tekst za dlugi), zacznij od nowa zapisujac partiami przez mode 'append' w konkretnych miejscach. Jesli to nowy skrypt, sprawdz potem przez run_powershell czy sie wykonuje/otwiera poprawnie. W ostatecznosci utworz plik obok w exports/.";
   }
   if (/Nieznane narzedzie|undefined/i.test(message)) {
     return "Uzyto zlego lub nieistniejacego (undefined) narzedzia. Zmien na poprawne narzedzie z listy 'Dostepne narzedzia'.";
   }
-  if (tool === "create_pdf") {
-    return "Jesli PDF nie powstal, zapisz zrodlo HTML/Markdown w workspace i sprobuj ponownie create_pdf z prostszym HTML.";
-  }
-  if (tool === "create_pptx" || tool === "create_docx") {
-    if (/pip install python-pptx|pip install python-docx|Brak biblioteki|No module named|ModuleNotFoundError/i.test(message)) {
-      const pkg = tool === "create_pptx" ? "python-pptx" : "python-docx";
-      return `Brak biblioteki Python. Uruchom (po znalezieniu interpretera): py -3 -m pip install ${pkg} albo python -m pip install ${pkg}. Potem ponow ${tool}.`;
-    }
-    if (/Nie znaleziono Pythona|Brak skryptu pomocniczego/i.test(message)) {
-      return "Najpierw run_powershell: Get-Command python,py,python3 lub where.exe — wybierz dzialajacy interpreter. Zainstaluj Python w PATH, potem pip install.";
-    }
-  }
   if (tool === "run_powershell") {
     if (/SyntaxError|Unexpected token|Unexpected end|Expected .* after|missing \)|missing \}|unterminated/i.test(message)) {
-      return "To blad skladni w konkretnym pliku, nie powod do przepisywania projektu. Odczytaj stack trace/linie, read_file okolicy bledu, popraw minimalny fragment przez replace_text, potem uruchom ten sam check ponownie.";
+      return "To blad skladni w konkretnym pliku, nie powod do przepisywania projektu. Odczytaj stack trace/linie, read_file okolicy bledu, popraw minimalny fragment przez patch_edit, potem uruchom ten sam check ponownie.";
     }
     if (/ModuleNotFoundError|No module named|ImportError|DLL load failed/i.test(message)) {
       return "Brak modulu Python lub DLL. Najpierw upewnij sie ktory interpreter dziala (Get-Command python,py,python3). Instalacja: czesto py -3 -m pip install NAZWA albo python -m pip install NAZWA. W 'final' podaj dokladna komende i pros o 'kontynuuj' po instalacji.";
@@ -4684,6 +4672,75 @@ function appendSourcesSection(text, sourceUrls = []) {
   return `${body}\n\nŹródła:\n${urls.map((url) => `- ${url}`).join("\n")}`;
 }
 
+function replaceByExactMatch(content, search, replace, count = 1) {
+  const occurrences = content.split(search).length - 1;
+  if (!occurrences) return null;
+  if (count < 0) return { updated: content.split(search).join(replace), replaced: occurrences, strategy: "exact_all" };
+  let remaining = count;
+  const updated = content.replaceAll(search, () => {
+    if (remaining <= 0) return search;
+    remaining -= 1;
+    return replace;
+  });
+  return { updated, replaced: Math.min(occurrences, count), strategy: "exact" };
+}
+
+function applyPatchStyleSearchReplace(content, search, replace, count = 1) {
+  const exact = replaceByExactMatch(content, search, replace, count);
+  if (exact) return exact;
+  const lfNormalized = replaceByExactMatch(
+    String(content).replace(/\r\n/g, "\n"),
+    String(search).replace(/\r\n/g, "\n"),
+    String(replace).replace(/\r\n/g, "\n"),
+    count,
+  );
+  if (lfNormalized) return { ...lfNormalized, strategy: "exact_lf_normalized" };
+  return null;
+}
+
+function parsePatchBatchText(patchText = "", defaultPath = "") {
+  const lines = String(patchText || "").replace(/\r\n/g, "\n").split("\n");
+  const blocks = [];
+  let idx = 0;
+  let currentPath = String(defaultPath || "").trim();
+  while (idx < lines.length) {
+    const line = lines[idx];
+    if (!line) {
+      idx += 1;
+      continue;
+    }
+    if (line.trim() === "<<<<<<< SEARCH") {
+      if (!currentPath) throw new Error("Brak sciezki pliku przed blokiem SEARCH/REPLACE.");
+      idx += 1;
+      const searchLines = [];
+      while (idx < lines.length && lines[idx].trim() !== "=======") {
+        searchLines.push(lines[idx]);
+        idx += 1;
+      }
+      if (idx >= lines.length) throw new Error("Brak separatora ======= w bloku SEARCH/REPLACE.");
+      idx += 1;
+      const replaceLines = [];
+      while (idx < lines.length && lines[idx].trim() !== ">>>>>>> REPLACE") {
+        replaceLines.push(lines[idx]);
+        idx += 1;
+      }
+      if (idx >= lines.length) throw new Error("Brak znacznika >>>>>>> REPLACE w bloku SEARCH/REPLACE.");
+      blocks.push({
+        path: currentPath,
+        search: searchLines.join("\n"),
+        replace: replaceLines.join("\n"),
+      });
+      idx += 1;
+      continue;
+    }
+    if (!line.trim().startsWith("```") && !line.includes("<<<<<<< SEARCH")) {
+      currentPath = line.trim().replace(/:$/, "");
+    }
+    idx += 1;
+  }
+  return blocks;
+}
+
 async function executeTool(action) {
   const tool = action.tool;
   if (typeof tool !== "string" || !tool.trim() || !ALLOWED_TOOLS.has(tool)) {
@@ -4759,62 +4816,57 @@ async function executeTool(action) {
       before: textPreview(before ?? ""),
       after: textPreview(after ?? ""),
     });
-  } else if (tool === "replace_text") {
+  } else if (tool === "patch_edit") {
     const target = normalizeInsideRoot(args.path);
     const before = await fsp.readFile(target, "utf8");
-    const oldText = String(args.old ?? "");
-    const newText = String(args.new ?? "");
-    if (!oldText) throw new Error("old nie moze byc puste.");
-    const occurrences = before.split(oldText).length - 1;
-    if (!occurrences) throw new Error("Nie znaleziono tekstu do zamiany.");
+    const oldText = String(args.search ?? "");
+    const newText = String(args.replace ?? "");
+    if (!oldText) throw new Error("search nie moze byc puste.");
     const count = Number.isInteger(Number(args.count)) ? Number(args.count) : 1;
-    let after;
-    if (count < 0) {
-      after = before.split(oldText).join(newText);
-    } else {
-      let remaining = count;
-      after = before.replaceAll(oldText, () => {
-        if (remaining <= 0) return oldText;
-        remaining -= 1;
-        return newText;
-      });
-    }
+    const patched = applyPatchStyleSearchReplace(before, oldText, newText, count);
+    if (!patched) throw new Error("SEARCH block failed to exactly match lines w pliku.");
+    const after = patched.updated;
     await fsp.writeFile(target, after, "utf8");
-    result = { path: relativeToRoot(target), replaced: count < 0 ? occurrences : Math.min(occurrences, count) };
+    result = { path: relativeToRoot(target), replaced: patched.replaced, strategy: patched.strategy };
     emit("file-change", {
       path: relativeToRoot(target),
-      action: "replace_text",
+      action: "patch_edit",
       diff: makeLineDiff(before, after),
       before: textPreview(before),
       after: textPreview(after),
     });
-  } else if (tool === "create_pdf") {
-    result = await createPdfFile(args);
-    emit("file-change", {
-      path: result.path,
-      action: "create_pdf",
-      diff: [],
-      before: "",
-      after: `PDF: ${result.title} (${result.bytes} bytes)`,
-    });
-  } else if (tool === "create_pptx") {
-    result = await createPptxFile(args);
-    emit("file-change", {
-      path: result.path,
-      action: "create_pptx",
-      diff: [],
-      before: "",
-      after: `PPTX: ${result.title} (${result.bytes} bytes)`,
-    });
-  } else if (tool === "create_docx") {
-    result = await createDocxFile(args);
-    emit("file-change", {
-      path: result.path,
-      action: "create_docx",
-      diff: [],
-      before: "",
-      after: `DOCX: ${result.title} (${result.bytes} bytes)`,
-    });
+  } else if (tool === "patch_batch") {
+    const blocks = Array.isArray(args.blocks) && args.blocks.length
+      ? args.blocks.map((block) => ({
+        path: String(block?.path || args.defaultPath || "").trim(),
+        search: String(block?.search ?? ""),
+        replace: String(block?.replace ?? ""),
+      }))
+      : parsePatchBatchText(String(args.patch || ""), String(args.defaultPath || ""));
+    if (!blocks.length) throw new Error("Brak blokow SEARCH/REPLACE do zastosowania.");
+    const applied = [];
+    for (const block of blocks) {
+      if (!block.path) throw new Error("Blok SEARCH/REPLACE nie ma poprawnej sciezki pliku.");
+      const target = normalizeInsideRoot(block.path);
+      const before = await fsp.readFile(target, "utf8");
+      const patched = applyPatchStyleSearchReplace(before, block.search, block.replace, 1);
+      if (!patched) {
+        throw new Error(
+          `SEARCH block failed to exactly match lines w pliku ${block.path}. Uzyj read_file i podaj dokladny fragment SEARCH.`,
+        );
+      }
+      const after = patched.updated;
+      await fsp.writeFile(target, after, "utf8");
+      applied.push({ path: relativeToRoot(target), strategy: patched.strategy });
+      emit("file-change", {
+        path: relativeToRoot(target),
+        action: "patch_edit",
+        diff: makeLineDiff(before, after),
+        before: textPreview(before),
+        after: textPreview(after),
+      });
+    }
+    result = { appliedCount: applied.length, applied };
   } else if (tool === "run_powershell") {
     result = await runPowerShell(String(args.command ?? ""), args.timeout);
     const blob = `${result.stderr || ""}\n${result.stdout || ""}`;
@@ -4875,15 +4927,6 @@ async function executeTool(action) {
       before: "",
       after: `Pobrano ${result.bytes} bajtow z ${dlUrl}`,
     });
-  } else if (tool === "analyze_image") {
-    const store = loadSkillStore();
-    if (!store.installed.includes("vision")) {
-      throw new Error("Narzędzie analyze_image wymaga zainstalowanego skilla 'Vision (VLM Support)'. Zainstaluj go w panelu Skills.");
-    }
-    const target = normalizeInsideRoot(args.path);
-    emit("activity", { detail: `Pomocniczy model VLM analizuje obraz: ${args.path}` });
-    const description = await runVisionSupport(target, "Describe this image in detail.");
-    result = { description, status: `Analiza obrazu zakończona pomyślnie. Tekstowy opis załączono w pole description.` };
   } else {
     throw new Error(`Wewnetrzny blad: brak implementacji narzedzia ${tool}.`);
   }

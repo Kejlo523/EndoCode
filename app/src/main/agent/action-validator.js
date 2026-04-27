@@ -47,6 +47,17 @@ function classifyIntent(userText = "") {
 }
 
 function validateRequiredArgs(tool, args) {
+  if (tool === "patch_batch") {
+    const hasPatch = typeof args?.patch === "string" && args.patch.trim().length > 0;
+    const hasBlocks = Array.isArray(args?.blocks) && args.blocks.length > 0;
+    if (!hasPatch && !hasBlocks) {
+      return {
+        ok: false,
+        errorCode: "missing_required_arg",
+        error: "Tool 'patch_batch' requires args.patch or args.blocks.",
+      };
+    }
+  }
   const required = REQUIRED_ARGS_BY_TOOL[tool] || [];
   for (const key of required) {
     const value = args[key];

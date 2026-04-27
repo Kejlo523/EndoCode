@@ -751,10 +751,8 @@ function toolActionDetail(tool, args, note = "") {
   if (note) parts.push(note);
   if (tool === "run_powershell" && args?.command) parts.push(args.command);
   else if (tool === "write_file" && args?.path) parts.push(`plik: ${args.path}`);
-  else if (tool === "replace_text" && args?.path) parts.push(`plik: ${args.path}`);
-  else if (tool === "create_pdf" && args?.path) parts.push(`PDF: ${args.path}`);
-  else if (tool === "create_pptx" && args?.path) parts.push(`PPTX: ${args.path}`);
-  else if (tool === "create_docx" && args?.path) parts.push(`DOCX: ${args.path}`);
+  else if (tool === "patch_edit" && args?.path) parts.push(`plik: ${args.path}`);
+  else if (tool === "patch_batch") parts.push("pakiet blokow SEARCH/REPLACE");
   else if (args && Object.keys(args).length) parts.push(compactJsonPreview(args));
   return parts.join("\n");
 }
@@ -766,14 +764,12 @@ function toolActionLabel(tool, args) {
   switch (tool) {
     case "read_file": return `Czyta: ${args?.path || ""}`;
     case "write_file": return `Zapisuje: ${args?.path || ""}`;
-    case "replace_text": return `Edytuje: ${args?.path || ""}`;
+    case "patch_edit": return `Patch edit: ${args?.path || ""}`;
+    case "patch_batch": return "Patch batch: pakiet zmian";
     case "ls": return `Listuje: ${args?.path || "."}`;
     case "cd": return `cd ${args?.path || ""}`;
     case "pwd": return "Sprawdza ścieżkę";
     case "mkdir": return `mkdir ${args?.path || ""}`;
-    case "create_pdf": return `Tworzy PDF: ${args?.path || ""}`;
-    case "create_pptx": return `Tworzy PPTX: ${args?.path || ""}`;
-    case "create_docx": return `Tworzy DOCX: ${args?.path || ""}`;
     case "run_powershell": return `Komenda PowerShell`;
     default: return `Narzędzie: ${tool}`;
   }
@@ -1778,6 +1774,7 @@ window.endocode.onEvent(async (event) => {
     if (hasStreamingAssistantContent()) {
       finalizeStreamingAssistantMessage("", { overwriteText: false });
     }
+    setBusy(false);
     hideLive();
     currentThinkingBubble = null;
     updateContextInfo();
@@ -1902,17 +1899,10 @@ window.endocode.onEvent(async (event) => {
     const actionLabel =
       event.action === "write_file"
         ? "Zapisano"
-        : event.action === "create_pdf"
-          ? "Utworzono PDF"
-          : event.action === "create_pptx"
-            ? "Utworzono PPTX"
-            : event.action === "create_docx"
-              ? "Utworzono DOCX"
+        : event.action === "patch_edit"
+          ? "Zastosowano patch"
               : "Edycja";
-    const body =
-      event.action === "create_pdf" || event.action === "create_pptx" || event.action === "create_docx"
-        ? (event.after || "")
-        : "";
+    const body = "";
     addInlineEvent("change", `${actionLabel}: ${event.path}`, body, renderDiff(event.diff));
     showLive(`Zapisano: ${event.path}`);
     return;
