@@ -33,34 +33,13 @@ const attachmentPreview = document.getElementById("attachmentPreview");
 const attachmentImage = document.getElementById("attachmentImage");
 const attachmentFileMeta = document.getElementById("attachmentFileMeta");
 const attachmentRemove = document.getElementById("attachmentRemove");
-let currentAttachmentBase64 = null;
 let currentAttachmentFile = null;
-let visionEnabled = false;
-
-async function checkVisionSkill() {
-  try {
-    const skills = await window.endocode.listSkills();
-    visionEnabled = skills.some(s => s.id === "vision" && s.installed);
-    attachBtn.classList.remove("hidden");
-    attachBtn.title = visionEnabled
-      ? "Załącz plik (obrazy działają też w trybie agenta)"
-      : "Załącz plik (obrazy w agencie wymagają skill Vision)";
-  } catch (e) {
-    console.error("Błąd podczas sprawdzania skilla vision:", e);
-  }
-}
 const approvalModal = document.getElementById("approvalModal");
 const approvalCwd = document.getElementById("approvalCwd");
 const approvalCommand = document.getElementById("approvalCommand");
 const approveCommand = document.getElementById("approveCommand");
 const rejectCommand = document.getElementById("rejectCommand");
-const skillsBtn = document.getElementById("skillsBtn");
-const skillsModal = document.getElementById("skillsModal");
-const closeSkills = document.getElementById("closeSkills");
 const killServerBtn = document.getElementById("killServerBtn");
-const skillsList = document.getElementById("skillsList");
-const skillsCount = document.getElementById("skillsCount");
-const installRecommendedSkillsBtn = document.getElementById("installRecommendedSkills");
 const modelsBtn = document.getElementById("modelsBtn");
 const modelsModal = document.getElementById("modelsModal");
 const closeModels = document.getElementById("closeModels");
@@ -112,7 +91,6 @@ let updateSystemInFlight = false;
 let streamingAssistantMessage = null;
 const modelRenderCacheLibrary = new Map();
 const modelRenderCacheInstalled = new Map();
-const skillRenderCache = new Map();
 const STREAM_RENDER_THROTTLE_MS = 50;
 const liveDurationTrackers = new Map();
 let liveDurationTicker = null;
@@ -122,15 +100,6 @@ const activeToolSegments = [];
 let promptQueueItems = [];
 let promptQueueSeq = 0;
 let promptQueueProcessing = false;
-const skillsModule = window.EndoModules?.createSkillsModule?.({
-  skillsList,
-  skillsCount,
-  skillRenderCache,
-  escapeHtml,
-  api: {
-    listSkills: () => window.endocode.listSkills(),
-  },
-});
 const modelsModule = window.EndoModules?.createModelsModule?.({
   modelsList,
   modelsInstalledList,
@@ -306,11 +275,9 @@ function addPromptToQueue(item) {
 }
 
 async function sendPromptPayload(item) {
-  const payload = item.imageBase64
-    ? { text: item.text || "", imageBase64: item.imageBase64 }
-    : item.attachment
-      ? { text: item.text || "", attachment: item.attachment }
-      : item.text || "";
+  const payload = item.attachment
+    ? { text: item.text || "", attachment: item.attachment }
+    : item.text || "";
   await window.endocode.send(payload);
 }
 
@@ -349,7 +316,7 @@ function editPromptInQueue(id) {
   const updated = window.prompt("Edytuj prompt:", item.text || "");
   if (updated === null) return;
   const trimmed = String(updated).trim();
-  if (!trimmed && !item.imageBase64 && !item.attachment) {
+  if (!trimmed && !item.attachment) {
     deletePromptFromQueue(id);
     return;
   }
@@ -665,7 +632,7 @@ async function submitQuickChoicePrompt(text) {
   addMessage("user", prompt);
   chatTitle.textContent = prompt.length > 40 ? `${prompt.slice(0, 40)}...` : prompt;
   await saveChatSession(firstUserMessage);
-  const submission = { text: prompt, imageBase64: null, attachment: null };
+  const submission = { text: prompt, attachment: null };
   const hasQueuedWork = promptQueueItems.some((item) => item.status === "queued" || item.status === "running");
   if (!appBusy && !hasQueuedWork) {
     setBusy(true);
@@ -1089,9 +1056,16 @@ async function updateSystemMonitor() {
 async function updateContextInfo() {
   try {
     const info = await window.endocode.getContextInfo();
-    
-    const tokensLabel = (info.estimatedTokens / 1000).toFixed(1) + "k";
-    const maxTokensLabel = (info.maxTokens / 1000).toFixed(1) + "k";
+
+    const formatTokenLabel = (value) => {
+      const n = Number(value || 0);
+      if (n < 1000) return `${n}`;
+      if (n < 10000) return `${(n / 1000).toFixed(2)}k`;
+      return `${(n / 1000).toFixed(1)}k`;
+    };
+
+    const tokensLabel = formatTokenLabel(info.estimatedTokens);
+    const maxTokensLabel = formatTokenLabel(info.maxTokens);
     contextText.textContent = `${tokensLabel} / ${maxTokensLabel} tok. (${info.messageCount} wiad.)`;
 
     const percent = Math.min(1, Math.max(0, info.estimatedTokens / (info.maxTokens || 1)));
@@ -1214,15 +1188,6 @@ function renderReasoningSelect(state) {
   }
 }
 
-// ══════════════ SKILLS ══════════════
-function renderSkills(skills = []) {
-  skillsModule?.renderSkills(skills);
-}
-
-async function loadSkills() {
-  await skillsModule?.loadSkills?.();
-}
-
 // ══════════════ MODELS ══════════════
 function renderModels(models = [], targetEl = modelsList, cacheMap = modelRenderCacheLibrary) {
   modelsModule?.renderModels(models, targetEl, cacheMap);
@@ -1296,12 +1261,6 @@ chooseWorkspaceBtn.addEventListener("click", async () => {
 
 newChatBtn.addEventListener("click", () => startNewChat());
 
-skillsBtn.addEventListener("click", async () => {
-  skillsModal.classList.remove("hidden");
-  await loadSkills();
-});
-closeSkills.addEventListener("click", () => skillsModal.classList.add("hidden"));
-
 modelsBtn.addEventListener("click", async () => {
   modelsModal.classList.remove("hidden");
   await loadModels();
@@ -1322,40 +1281,6 @@ if (addHfModel) {
       alert(e.message);
     } finally {
       addHfModel.disabled = false;
-    }
-  });
-}
-
-if (skillsList) {
-  skillsList.addEventListener("click", async (event) => {
-    const btn = event.target.closest(".skill-install-btn");
-    if (!btn) return;
-    btn.disabled = true;
-    const skillId = btn.getAttribute("data-skill-id");
-    const action = btn.getAttribute("data-action");
-    try {
-      const skills = action === "uninstall"
-        ? await window.endocode.uninstallSkill(skillId)
-        : await window.endocode.installSkill(skillId);
-      renderSkills(skills);
-    } catch (e) {
-      addInlineEvent("error", "Skills", e.message || String(e));
-      await loadSkills();
-    }
-    checkVisionSkill(); // Update UI after install/uninstall
-  });
-}
-
-if (installRecommendedSkillsBtn) {
-  installRecommendedSkillsBtn.addEventListener("click", async () => {
-    installRecommendedSkillsBtn.disabled = true;
-    try {
-      renderSkills(await window.endocode.installRecommendedSkills());
-      addInlineEvent("note", "Skills", "Zainstalowano 10 lokalnych skilli.");
-    } catch (e) {
-      addInlineEvent("error", "Skills", e.message || String(e));
-    } finally {
-      installRecommendedSkillsBtn.disabled = false;
     }
   });
 }
@@ -1461,18 +1386,6 @@ promptEl.addEventListener("input", () => {
 });
 
 // ── Attachments ──
-function setAttachment(base64DataUrl) {
-  currentAttachmentBase64 = base64DataUrl;
-  currentAttachmentFile = null;
-  attachmentImage.src = base64DataUrl;
-  attachmentImage.classList.remove("hidden");
-  if (attachmentFileMeta) {
-    attachmentFileMeta.textContent = "Obraz";
-    attachmentFileMeta.classList.add("hidden");
-  }
-  attachmentPreview.classList.remove("hidden");
-}
-
 function setFileAttachment(file, dataBase64) {
   currentAttachmentFile = {
     name: file?.name || "plik",
@@ -1480,7 +1393,6 @@ function setFileAttachment(file, dataBase64) {
     size: Number(file?.size || 0),
     dataBase64: dataBase64 || "",
   };
-  currentAttachmentBase64 = null;
   attachmentImage.src = "";
   attachmentImage.classList.add("hidden");
   if (attachmentFileMeta) {
@@ -1492,7 +1404,6 @@ function setFileAttachment(file, dataBase64) {
 }
 
 function clearAttachment() {
-  currentAttachmentBase64 = null;
   currentAttachmentFile = null;
   attachmentImage.src = "";
   attachmentImage.classList.remove("hidden");
@@ -1524,13 +1435,6 @@ function fileToBase64(file) {
 fileInput.addEventListener("change", (e) => {
   const file = e.target.files[0];
   if (!file) return;
-  const isImage = /^image\//i.test(file.type || "");
-  if (isImage) {
-    const reader = new FileReader();
-    reader.onload = (evt) => setAttachment(evt.target.result);
-    reader.readAsDataURL(file);
-    return;
-  }
   fileToBase64(file).then((base64) => setFileAttachment(file, base64)).catch((err) => {
     addInlineEvent("error", "Załącznik", err.message || String(err));
   });
@@ -1543,15 +1447,9 @@ promptEl.addEventListener("paste", (e) => {
       e.preventDefault();
       const file = item.getAsFile();
       if (!file) continue;
-      if (/^image\//i.test(file.type || "")) {
-        const reader = new FileReader();
-        reader.onload = (ev) => setAttachment(ev.target.result);
-        reader.readAsDataURL(file);
-      } else {
-        fileToBase64(file).then((base64) => setFileAttachment(file, base64)).catch((err) => {
-          addInlineEvent("error", "Załącznik", err.message || String(err));
-        });
-      }
+      fileToBase64(file).then((base64) => setFileAttachment(file, base64)).catch((err) => {
+        addInlineEvent("error", "Załącznik", err.message || String(err));
+      });
       break;
     }
   }
@@ -1598,23 +1496,21 @@ conversation.addEventListener("click", (event) => {
 composer.addEventListener("submit", async (event) => {
   event.preventDefault();
   const text = promptEl.value.trim();
-  if (!text && !currentAttachmentBase64 && !currentAttachmentFile) return;
+  if (!text && !currentAttachmentFile) return;
   promptEl.value = "";
   promptEl.style.height = "auto";
 
-  const attachedBase64 = currentAttachmentBase64;
   const attachedFile = currentAttachmentFile ? { ...currentAttachmentFile } : null;
   clearAttachment();
 
   const messagePreview = text || (attachedFile ? `[Załączono plik: ${attachedFile.name}]` : "Obraz");
   if (!firstUserMessage) firstUserMessage = messagePreview;
-  addMessage("user", messagePreview, attachedBase64);
+  addMessage("user", messagePreview, null);
   chatTitle.textContent = messagePreview.length > 40 ? messagePreview.slice(0, 40) + "..." : messagePreview;
   await saveChatSession(firstUserMessage);
 
   const submission = {
     text,
-    imageBase64: attachedBase64 ? attachedBase64.split(",")[1] : null,
     attachment: attachedFile,
   };
 
@@ -1661,14 +1557,10 @@ window.endocode.onEvent(async (event) => {
       refreshState();
     } else if (event.status === "model-fallback-failed") {
       addInlineEvent("error", "Fallback modelu", event.detail || "Model zapasowy nie wystartował.");
-    } else if (event.status === "skills-changed") {
-      showLive("Skills", event.detail || "");
     } else if (event.status === "context-compacted") {
       addInlineEvent("note", "Kontekst", event.detail || "Skompaktowano kontekst rozmowy.");
       showLive("Kontekst", event.detail || "");
       updateContextInfo();
-    } else if (event.status === "vision-analysis") {
-      showLive("Vision", event.detail || "Analizuję obraz...");
     } else if (event.status === "downloading") {
       showLive("Pobieranie", event.detail || "");
     } else if (event.status === "runtime-install") {
@@ -1940,7 +1832,6 @@ window.endocode.onEvent(async (event) => {
 
 // ══════════════ INIT ══════════════
 async function init() {
-  await checkVisionSkill();
   await refreshState();
   await loadChatHistory();
   await updateSystemMonitor();

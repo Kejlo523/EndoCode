@@ -199,7 +199,7 @@ const REASONING_LEVELS = {
     maxSteps: 36,
     maxTokens: 16384,
     temperature: 0.25,
-    instruction: "Maksymalna starannosc: rozpoznanie zaleznosci, etapowe wdrozenie, odzysk po bledach i mocniejsza weryfikacja. Jesli generujesz duze dokumenty (PDF/PPTX), rob to partiami: najpierw zapisz tresc w pliku .md/.html przez write_file (append), a na koncu wywolaj create_... podajac 'inputPath' do tego pliku.",
+    instruction: "Maksymalna starannosc: rozpoznanie zaleznosci, etapowe wdrozenie, odzysk po bledach i mocniejsza weryfikacja.",
   },
 };
 
@@ -245,7 +245,7 @@ ZASADY NARZEDZI I SIECI:
 - Gdy korzystasz z internetu, final ma zawierac sekcje "Źródła:" z URL-ami faktycznie uzytymi do odpowiedzi.
 
 ARTEFAKTY:
-- Dokumenty, PDF, PPTX, arkusze i obrazy tworz lokalnie.
+- Artefakty tworz lokalnie i trzymaj je w workspace.
 - Dla dokumentow i prezentacji zachowaj zrodlo Markdown/HTML, gdy ulatwia to poprawki.
 - Estetyka ma pasowac do zadania: narzedzia operacyjne maja byc czytelne i zwarte; prezentacje i strony moga byc bardziej dopracowane wizualnie.
 
@@ -257,89 +257,10 @@ ODZYSK PO PROBLEMACH:
 
 const AGENT_GUIDANCE_MAX_CHARS = 18000;
 
-const SKILL_CATALOG = [
-  {
-    id: "documents",
-    name: "Documents",
-    category: "Dokumenty",
-    summary: "Raporty, notatki, briefy i dokumenty z lokalnych plikow.",
-    instructions: "Do ogolnej pracy z dokumentami preferuj Markdown lub HTML jako zrodlo, zapisuj artefakty w workspace i opisz uzytkownikowi finalne pliki. Nie uzywaj uslug chmurowych.",
-  },
-  {
-    id: "docx",
-    name: "DOCX",
-    category: "Dokumenty",
-    summary: "Tworzenie, edycja i ekstrakcja tresci z plikow Word.",
-    instructions: "Dla DOCX preferuj lokalny pipeline przez run_powershell i skrypty w workspace; trzymaj zrodlo w Markdown/HTML.",
-  },
-  {
-    id: "pdf",
-    name: "PDF",
-    category: "Dokumenty",
-    summary: "Czytanie, skladanie i eksport PDF bez zewnetrznych API.",
-    instructions: "Dla PDF pracuj lokalnie: ekstrakcja tekstu, tworzenie HTML jako zrodla, scalanie lub eksport przez dostepne lokalne narzedzia. Nie wysylaj dokumentow poza maszyne.",
-  },
-  {
-    id: "slides",
-    name: "Slides",
-    category: "Prezentacje",
-    summary: "Konspekty, slajdy, speaker notes i eksport deckow.",
-    instructions: "Dla prezentacji dobierz pipeline do celu. Przygotuj Markdown/HTML i eksportuj lokalnym Marp/Slidev lub skryptem przez run_powershell. Zachowaj zrodlo obok wyniku.",
-  },
-  {
-    id: "sheets",
-    name: "Sheets / CSV",
-    category: "Dane",
-    summary: "Arkusze, CSV, tabele, kalkulacje i proste wykresy.",
-    instructions: "Dla danych tabelarycznych uzywaj CSV/TSV/XLSX w workspace, zachowuj typy danych i podsumowuj transformacje. Formuly i wykresy opisuj tak, zeby byly odtwarzalne lokalnie.",
-  },
-  {
-    id: "image-gen",
-    name: "Image Gen",
-    category: "Media",
-    summary: "Prompty, assety i lokalne pipeline'y obrazow.",
-    instructions: "Dla obrazow pracuj lokalnie: SVG dla ikon/diagramow, HTML/CSS/canvas dla UI, albo lokalny generator jesli istnieje. Nie zakladaj chmurowego image API bez wyraznej prosby uzytkownika.",
-  },
-  {
-    id: "figma-local",
-    name: "Figma Local",
-    category: "Design",
-    summary: "Praca na lokalnych eksportach z Figmy: SVG, PNG, JSON, CSS.",
-    instructions: "Dla Figmy pracuj na wyeksportowanych lokalnie plikach. Nie lacz sie z Figma API. Mapuj style, warstwy i komponenty na kod lub dokumentacje w workspace.",
-  },
-  {
-    id: "svg",
-    name: "SVG / Icons",
-    category: "Design",
-    summary: "Czyste SVG, ikony, diagramy i optymalizacja wektorow.",
-    instructions: "Dla SVG dbaj o viewBox, dostepnosc, skale i minimalny kod. Preferuj edytowalne pliki SVG zamiast bitmap, gdy obiekt jest ikoną, diagramem albo prostym assetem.",
-  },
-  {
-    id: "file-export",
-    name: "File Export",
-    category: "Eksport",
-    summary: "Eksport HTML, Markdown, ZIP, PDF-ready i paczek artefaktow.",
-    instructions: "Dla eksportow tworz przewidywalne foldery wyjsciowe, manifest plikow i formaty latwe do sprawdzenia lokalnie. Nie nadpisuj niepowiazanych plikow.",
-  },
-  {
-    id: "data-extract",
-    name: "Data Extract",
-    category: "Dane",
-    summary: "Ekstrakcja tekstu, tabel, metadanych i porzadkowanie plikow.",
-    instructions: "Dla ekstrakcji danych czytaj pliki lokalnie, zapisuj surowe i oczyszczone wyniki osobno, a transformacje opisuj w sposob audytowalny. Nie wysylaj danych do zewnetrznych serwisow.",
-  },
-  {
-    id: "vision",
-    name: "Vision (VLM Support)",
-    category: "Zdolności Agenta",
-    summary: "Włącza obsługę załączników obrazów na czacie. Podczas instalacji pobiera lekki model VLM.",
-    instructions: "Gdy użytkownik dostarczył obraz, polegaj na zewnętrznym asystencie wizji (Moondream2) i przekazuj wnioski użytkownikowi wprost.",
-  },
-];
+const SKILL_CATALOG = [];
 
 let mainWindow;
 let serverProcess = null;
-let visionServerProcess = null;
 let serverOwned = false;
 let runningModelId = null;
 let runInProgress = false;
@@ -364,7 +285,6 @@ const agentRecoveryMetrics = {
 let accessLevel = "sandbox"; // "sandbox" or "full"
 let chatHistory = [];
 let currentChatId = null;
-const VISION_PORT = 11435;
 const telemetryMonitor = createTelemetryMonitor();
 const baselineMetrics = createBaselineMetrics();
 let runtimeManifestStore = null;
@@ -1052,65 +972,8 @@ function saveChatHistory() {
   writeJsonFile(getChatHistoryPath(), chatHistory);
 }
 
-function getSkillStorePath() {
-  return path.join(ENDOCODE_HOME, "config", "skills.json");
-}
-
-function getSkillsRoot() {
-  return path.join(ENDOCODE_HOME, "config", "skills");
-}
-
-function loadSkillStore() {
-  const store = readJsonFile(getSkillStorePath(), { installed: [] });
-  return { installed: Array.isArray(store.installed) ? store.installed : [] };
-}
-
-function saveSkillStore(store) {
-  writeJsonFile(getSkillStorePath(), { installed: [...new Set(store.installed || [])] });
-}
-
-function getSkillById(skillId) {
-  return SKILL_CATALOG.find((skill) => skill.id === skillId);
-}
-
-function getSkillsForUi() {
-  const installed = new Set(loadSkillStore().installed);
-  return SKILL_CATALOG.map((skill) => ({
-    id: skill.id,
-    name: skill.name,
-    category: skill.category,
-    summary: skill.summary,
-    installed: installed.has(skill.id),
-    localOnly: true,
-    path: path.join(getSkillsRoot(), skill.id, "SKILL.md"),
-  }));
-}
-
 function getActiveSkillsPrompt() {
-  const installed = new Set(loadSkillStore().installed);
-  return SKILL_CATALOG
-    .map((skill) => {
-      const state = installed.has(skill.id) ? "aktywny" : "dostepny";
-      return `- ${skill.name} (${state}, local-only): ${skill.instructions}`;
-    })
-    .join("\n");
-}
-
-function createSkillMarkdown(skill) {
-  return `# ${skill.name}
-
-Category: ${skill.category}
-Local only: yes
-
-## Summary
-${skill.summary}
-
-## Agent Instructions
-${skill.instructions}
-
-## Local Runtime Rule
-Use only local files, local model reasoning and approved local commands. Do not call cloud APIs unless the user explicitly adds such integration later.
-`;
+  return "";
 }
 
 function refreshSystemPrompt() {
@@ -1119,52 +982,7 @@ function refreshSystemPrompt() {
   }
 }
 
-async function installSkill(skillId) {
-  const skill = getSkillById(skillId);
-  if (!skill) throw new Error(`Nieznany skill: ${skillId}`);
-  if (skillId === "vision") {
-    await ensureVisionSupport();
-  }
-  const store = loadSkillStore();
-  if (!store.installed.includes(skillId)) store.installed.push(skillId);
-  saveSkillStore(store);
-  const dir = path.join(getSkillsRoot(), skill.id);
-  await fsp.mkdir(dir, { recursive: true });
-  await fsp.writeFile(path.join(dir, "SKILL.md"), createSkillMarkdown(skill), "utf8");
-  refreshSystemPrompt();
-  emit("status", { status: "skills-changed", detail: `Zainstalowano skill: ${skill.name}` });
-  return getSkillsForUi();
-}
-
-async function uninstallSkill(skillId) {
-  const skill = getSkillById(skillId);
-  if (!skill) throw new Error(`Nieznany skill: ${skillId}`);
-  const store = loadSkillStore();
-  store.installed = store.installed.filter((id) => id !== skillId);
-  saveSkillStore(store);
-  await fsp.rm(path.join(getSkillsRoot(), skill.id), { recursive: true, force: true });
-  if (skillId === "vision") {
-    await fsp.rm(path.join(ENDOCODE_HOME, "models", "vision"), { recursive: true, force: true });
-  }
-  refreshSystemPrompt();
-  emit("status", { status: "skills-changed", detail: `Odinstalowano skill: ${skill.name}` });
-  return getSkillsForUi();
-}
-
-async function installRecommendedSkills() {
-  const store = loadSkillStore();
-  store.installed = [...new Set([...store.installed, ...SKILL_CATALOG.map((skill) => skill.id)])];
-  saveSkillStore(store);
-  await fsp.mkdir(getSkillsRoot(), { recursive: true });
-  for (const skill of SKILL_CATALOG) {
-    const dir = path.join(getSkillsRoot(), skill.id);
-    await fsp.mkdir(dir, { recursive: true });
-    await fsp.writeFile(path.join(dir, "SKILL.md"), createSkillMarkdown(skill), "utf8");
-  }
-  refreshSystemPrompt();
-  emit("status", { status: "skills-changed", detail: "Zainstalowano rekomendowany zestaw 10 lokalnych skilli." });
-  return getSkillsForUi();
-}
+// Skills management removed.
 
 function probeGpuInfo() {
   return telemetryMonitor.probeGpuInfo();
@@ -2585,7 +2403,7 @@ function loadAgentGuidancePrompt() {
 function createSystemPrompt() {
   const model = getModelConfig();
   const reasoning = getReasoningProfile();
-  const skillsPrompt = getActiveSkillsPrompt();
+  const skillsPrompt = "";
   const agentGuidance = loadAgentGuidancePrompt();
   return `${CORE_SYSTEM_PROMPT}
 
@@ -3184,10 +3002,6 @@ async function stopOwnedServer(options = {}) {
     }
   }
 
-  if (visionServerProcess) {
-    try { process.kill(visionServerProcess.pid, "SIGKILL"); } catch {}
-    visionServerProcess = null;
-  }
   if (force && options.killPort) {
     const pids = getListeningPidsOnPort(DEFAULT_PORT);
     for (const pid of pids) forceKillPid(pid);
@@ -3205,9 +3019,8 @@ async function killModelServerResources() {
   await stopOwnedServer({ force: true });
 
   const pids = getListeningPidsOnPort(DEFAULT_PORT);
-  const visionPids = getListeningPidsOnPort(VISION_PORT);
   const killedPids = [];
-  for (const pid of [...pids, ...visionPids]) {
+  for (const pid of pids) {
     if (forceKillPid(pid)) killedPids.push(pid);
   }
   for (let i = 0; i < 30; i += 1) {
@@ -3216,22 +3029,15 @@ async function killModelServerResources() {
   }
 
   const alive = await isServerReady(DEFAULT_PORT);
-  let visionAlive = false;
-  try {
-    const res = await fetch(`http://127.0.0.1:${VISION_PORT}/health`, { signal: AbortSignal.timeout(1000) });
-    visionAlive = res.ok;
-  } catch {
-    visionAlive = false;
-  }
   serverProcess = null;
   serverOwned = false;
   runningModelId = null;
-  const stillAlive = [alive ? DEFAULT_PORT : null, visionAlive ? VISION_PORT : null].filter(Boolean);
+  const stillAlive = [alive ? DEFAULT_PORT : null].filter(Boolean);
   const detail = stillAlive.length
     ? `Kill switch wykonany, ale nadal odpowiadaja porty: ${stillAlive.join(", ")}.`
-    : `Kill switch zakonczony. Zwolniono porty ${DEFAULT_PORT} i ${VISION_PORT}.`;
+    : `Kill switch zakonczony. Zwolniono port ${DEFAULT_PORT}.`;
   emit("status", { status: "server-killed", detail });
-  return { aborted: hadRun, ownedPid, killedPids, port: DEFAULT_PORT, visionPort: VISION_PORT, alive, visionAlive };
+  return { aborted: hadRun, ownedPid, killedPids, port: DEFAULT_PORT, alive };
 }
 
 async function callModel(messages, abortSignal, options = {}, step = null) {
@@ -3990,7 +3796,7 @@ Nigdy nie zwracaj JSON jako tablicy [...] — tylko jeden obiekt {...}.
 Jesli blad dotyczy zbyt dlugiego write_file w jednym kroku: zwroc krotszy poprawny write_file (overwrite lub append), reszte w nastepnych krokach.
 
 Jesli blad mowi o braku "final" / pustym "final", a uzytkownik pytal o mozliwosci („co potrafisz” itd.): zwroc np.
-{"note":"Mozliwosci agenta","final":"Pracuje w sandboxie plikow. Narzedzia: ${allowedToolNamesList()}. Odpowiadam po polsku; do PPTX/DOCX potrzebny Python z python-pptx / python-docx."}
+{"note":"Mozliwosci agenta","final":"Pracuje w sandboxie plikow. Narzedzia: ${allowedToolNamesList()}. Odpowiadam po polsku."}
 
 Jesli nie wiesz co dalej:
 {"note":"odzysk","final":"Nie udalo sie zwrocic poprawnej akcji — sprobuj ponownie lub zmien zadanie."}
@@ -4204,177 +4010,6 @@ function simpleMarkdownToHtml(markdown) {
   return html.join("\n");
 }
 
-async function createPdfFile(args) {
-  const target = normalizeInsideRoot(args.path || "output.pdf");
-  const pdfPath = target.toLowerCase().endsWith(".pdf") ? target : `${target}.pdf`;
-  await fsp.mkdir(path.dirname(pdfPath), { recursive: true });
-  await fsp.mkdir(path.join(workspaceRoot, ".tmp"), { recursive: true });
-
-  const title = String(args.title || path.basename(pdfPath, ".pdf"));
-  let rawContent = "";
-  if (args.inputPath) {
-    const src = normalizeInsideRoot(args.inputPath);
-    rawContent = await fsp.readFile(src, "utf8");
-  } else {
-    rawContent = args.markdown ?? args.content ?? "";
-  }
-
-  const contentHtml = args.html
-    ? String(args.html)
-    : simpleMarkdownToHtml(rawContent);
-
-  const pageHtml = `<!doctype html>
-<html lang="pl">
-<head>
-<meta charset="utf-8">
-<title>${htmlEscape(title)}</title>
-<style>
-  body { font-family: "Segoe UI", Arial, sans-serif; color: #111827; margin: 42px; font-size: 12.5px; line-height: 1.55; }
-  h1 { font-size: 25px; margin: 0 0 18px; color: #0f172a; }
-  h2 { font-size: 18px; margin: 22px 0 10px; color: #0f172a; }
-  h3 { font-size: 14px; margin: 16px 0 8px; color: #1f2937; }
-  p { margin: 0 0 9px; }
-  ul { margin: 0 0 10px 20px; padding: 0; }
-  li { margin: 0 0 5px; }
-  pre { background: #f3f4f6; border: 1px solid #d1d5db; border-radius: 6px; padding: 10px; white-space: pre-wrap; }
-  .spacer { height: 8px; }
-</style>
-</head>
-<body>${contentHtml}</body>
-</html>`;
-
-  const tempHtml = path.join(workspaceRoot, ".tmp", `pdf-${crypto.randomUUID()}.html`);
-  await fsp.writeFile(tempHtml, pageHtml, "utf8");
-  const pdfWindow = new BrowserWindow({
-    show: false,
-    webPreferences: { offscreen: true, contextIsolation: true, nodeIntegration: false },
-  });
-  try {
-    await pdfWindow.loadFile(tempHtml);
-    const data = await pdfWindow.webContents.printToPDF({
-      pageSize: args.pageSize || "A4",
-      printBackground: true,
-      margins: { marginType: "default" },
-    });
-    await fsp.writeFile(pdfPath, data);
-  } finally {
-    try { pdfWindow.destroy(); } catch { /* ignore */ }
-    try { await fsp.rm(tempHtml, { force: true }); } catch { /* ignore */ }
-  }
-  return { path: relativeToRoot(pdfPath), bytes: fs.statSync(pdfPath).size, title };
-}
-
-const OFFICE_MARKDOWN_MAX = 500000;
-
-function getPythonLauncherCandidates() {
-  if (process.platform === "win32") {
-    return [
-      { cmd: "py", pre: ["-3"] },
-      { cmd: "py", pre: [] },
-      { cmd: "python", pre: [] },
-      { cmd: "python3", pre: [] },
-    ];
-  }
-  return [
-    { cmd: "python3", pre: [] },
-    { cmd: "python", pre: [] },
-    { cmd: "py", pre: ["-3"] },
-  ];
-}
-
-function resolvePythonLauncher() {
-  for (const { cmd, pre } of getPythonLauncherCandidates()) {
-    const r = spawnSync(cmd, [...pre, "-c", "import sys; sys.exit(0)"], {
-      encoding: "utf8",
-      timeout: 15000,
-      windowsHide: true,
-      env: process.env,
-    });
-    if (r.status === 0 && !r.error) return { cmd, pre };
-  }
-  return null;
-}
-
-async function runPythonOfficeHelper(scriptName, payload) {
-  const launcher = resolvePythonLauncher();
-  if (!launcher) {
-    throw new Error(
-      "Nie znaleziono Pythona w PATH (probowano py -3, py, python, python3). Zainstaluj Python lub uzyj run_powershell z diagnostyka PATH.",
-    );
-  }
-  const scriptPath = path.join(__dirname, "office", scriptName);
-  if (!fs.existsSync(scriptPath)) {
-    throw new Error(`Brak skryptu pomocniczego EndoCode: ${scriptName}`);
-  }
-  await fsp.mkdir(path.join(workspaceRoot, ".tmp"), { recursive: true });
-  const jsonPath = path.join(workspaceRoot, ".tmp", `office-${crypto.randomUUID()}.json`);
-  await fsp.writeFile(jsonPath, JSON.stringify(payload), "utf8");
-  const args = [...launcher.pre, scriptPath, jsonPath];
-  const r = spawnSync(launcher.cmd, args, {
-    encoding: "utf8",
-    timeout: 120000,
-    windowsHide: true,
-    env: { ...process.env, PYTHONUTF8: "1" },
-    cwd: workspaceRoot,
-    maxBuffer: 20 * 1024 * 1024,
-  });
-  try {
-    await fsp.rm(jsonPath, { force: true });
-  } catch {
-    /* ignore */
-  }
-  if (r.error) throw r.error;
-  const errBlob = `${r.stderr || ""}\n${r.stdout || ""}`;
-  if (r.status === 2 && /pip install python-(pptx|docx)|Brak biblioteki/i.test(errBlob)) {
-    throw new Error(errBlob.trim().slice(0, 2000));
-  }
-  if (r.status !== 0) {
-    throw new Error(textPreview(errBlob.trim(), 2000));
-  }
-}
-
-async function createPptxFile(args) {
-  const target = normalizeInsideRoot(args.path || "slides.pptx");
-  const outPath = target.toLowerCase().endsWith(".pptx") ? target : `${target}.pptx`;
-  await fsp.mkdir(path.dirname(outPath), { recursive: true });
-  const title = String(args.title || path.basename(outPath, ".pptx"));
-  let markdown = "";
-  if (args.inputPath) {
-    const src = normalizeInsideRoot(args.inputPath);
-    markdown = await fsp.readFile(src, "utf8");
-  } else {
-    markdown = String(args.markdown ?? args.content ?? "");
-  }
-  if (!markdown.trim()) throw new Error("create_pptx wymaga niepustego pola markdown (lub content) lub inputPath.");
-  if (markdown.length > OFFICE_MARKDOWN_MAX) {
-    throw new Error(`Tresc za dluga (max ${OFFICE_MARKDOWN_MAX} znakow). Podziel zadanie na mniejsze pliki.`);
-  }
-  await runPythonOfficeHelper("gen_pptx.py", { out: outPath, title, markdown });
-
-  return { path: relativeToRoot(outPath), bytes: fs.statSync(outPath).size, title };
-}
-
-async function createDocxFile(args) {
-  const target = normalizeInsideRoot(args.path || "document.docx");
-  const outPath = target.toLowerCase().endsWith(".docx") ? target : `${target}.docx`;
-  await fsp.mkdir(path.dirname(outPath), { recursive: true });
-  const title = String(args.title || path.basename(outPath, ".docx"));
-  let markdown = "";
-  if (args.inputPath) {
-    const src = normalizeInsideRoot(args.inputPath);
-    markdown = await fsp.readFile(src, "utf8");
-  } else {
-    markdown = String(args.markdown ?? args.content ?? "");
-  }
-  if (!markdown.trim()) throw new Error("create_docx wymaga niepustego pola markdown (lub content) lub inputPath.");
-  if (markdown.length > OFFICE_MARKDOWN_MAX) {
-    throw new Error(`Tresc za dluga (max ${OFFICE_MARKDOWN_MAX} znakow). Podziel zadanie na mniejsze pliki.`);
-  }
-  await runPythonOfficeHelper("gen_docx.py", { out: outPath, title, markdown });
-
-  return { path: relativeToRoot(outPath), bytes: fs.statSync(outPath).size, title };
-}
-
 async function readTextIfExists(file) {
   try {
     const stat = await fsp.stat(file);
@@ -4417,9 +4052,6 @@ function getToolRecoveryHint(error, action) {
   }
   if (/EACCES|EPERM|access denied|odmowa/i.test(message)) {
     return "Brak uprawnien. Zapisz alternatywny plik w workspace, np. output/ lub exports/, i poinformuj uzytkownika o obejściu.";
-  }
-  if (/does not support vision|image_url|multimodal/i.test(message)) {
-    return "Model nie obsługuje analizy obrazów (brak modułu Vision). Przerwij próbę i w 'final' przeproś użytkownika, informując, że Twój obecny model nie ma zdolności widzenia.";
   }
   if (/URL za dlugi|Nieprawidlowy format URL|Dozwolone sa tylko URL http/i.test(message)) {
     return "Skroc URL do prawdziwego linku (max ok. 2048 znakow). Wejdz na strone glowna domeny przez fetch_url, potem extract_media aby wyciagnac konkretne href z HTML — nie wklejaj sztucznego dlugiego ciagu.";
@@ -4996,136 +4628,7 @@ async function downloadFileWithProgress(url, targetPath, label, onProgress = nul
   });
 }
 
-async function ensureVisionSupport() {
-  const visionDir = path.join(ENDOCODE_HOME, "models", "vision");
-  await fsp.mkdir(visionDir, { recursive: true });
-  
-  const textModelUrl = "https://huggingface.co/moondream/moondream2-gguf/resolve/main/moondream2-text-model-f16.gguf";
-  const mmprojUrl = "https://huggingface.co/moondream/moondream2-gguf/resolve/main/moondream2-mmproj-f16.gguf";
-  const textModelPath = path.join(visionDir, "moondream2-text-model-f16.gguf");
-  const mmprojPath = path.join(visionDir, "moondream2-mmproj-f16.gguf");
-  
-  if (!fs.existsSync(textModelPath)) {
-    emit("activity", { detail: `Pobieram Moondream2 Text Model (1GB, to potrwa chwilę)...` });
-    await downloadFileWithProgress(textModelUrl, textModelPath, "Pobieranie Moondream2");
-  }
-  if (!fs.existsSync(mmprojPath)) {
-    emit("activity", { detail: `Pobieram Moondream2 MMProj (800MB, to potrwa chwilę)...` });
-    await downloadFileWithProgress(mmprojUrl, mmprojPath, "Pobieranie projektora wizji");
-  }
-  return { textModelPath, mmprojPath };
-}
-
-async function ensureVisionServer() {
-  if (visionServerProcess) {
-    try {
-      const res = await fetch(`http://127.0.0.1:${VISION_PORT}/health`, { signal: AbortSignal.timeout(1500) });
-      if (res.ok) return;
-    } catch {
-      try { forceKillPid(visionServerProcess.pid); } catch {}
-      visionServerProcess = null;
-    }
-  }
-
-  const { textModelPath, mmprojPath } = await ensureVisionSupport();
-  const serverExe = getRuntimeServerExe();
-  if (!serverExe) throw new Error("Nie znaleziono llama-server.exe dla wizji.");
-
-  try {
-    const res = await fetch(`http://127.0.0.1:${VISION_PORT}/health`, { signal: AbortSignal.timeout(1500) });
-    if (res.ok) return;
-  } catch {
-    for (const pid of getListeningPidsOnPort(VISION_PORT)) forceKillPid(pid);
-  }
-
-  const logDir = path.join(ENDOCODE_HOME, "logs");
-  await fsp.mkdir(logDir, { recursive: true });
-  const outLogPath = path.join(logDir, "vision-server.out.log");
-  const errLogPath = path.join(logDir, "vision-server.err.log");
-  const outLog = fs.openSync(outLogPath, "a");
-  const errLog = fs.openSync(errLogPath, "a");
-
-  emit("status", { status: "vision-analysis", detail: "Uruchamiam pomocniczy serwer wizji..." });
-  const args = [
-    "-m", textModelPath,
-    "--mmproj", mmprojPath,
-    "--host", "127.0.0.1",
-    "--port", String(VISION_PORT),
-    "--threads", "4",
-    "--ctx-size", "2048",
-    "--parallel", "1",
-    "--no-jinja",
-    "--chat-template", "vicuna",
-    "-ngl", "0", // Na razie CPU, żeby nie gryzło się z głównym modelem
-  ];
-
-  let child;
-  try {
-    child = spawn(serverExe, args, {
-      cwd: path.dirname(serverExe),
-      stdio: ["ignore", outLog, errLog],
-      windowsHide: true,
-    });
-  } finally {
-    try { fs.closeSync(outLog); } catch { /* ignore */ }
-    try { fs.closeSync(errLog); } catch { /* ignore */ }
-  }
-
-  visionServerProcess = child;
-  child.on("exit", () => { if (visionServerProcess === child) visionServerProcess = null; });
-
-  for (let i = 0; i < 90; i++) {
-    if (child.exitCode !== null || child.signalCode !== null) {
-      const logTail = readLogTail(errLogPath) || readLogTail(outLogPath);
-      throw new Error(`Serwer wizji zakonczyl prace przed startem API (kod ${child.exitCode ?? child.signalCode}).${logTail ? `\n${textPreview(logTail, 1600)}` : ""}`);
-    }
-    try {
-      const res = await fetch(`http://127.0.0.1:${VISION_PORT}/health`, { signal: AbortSignal.timeout(1500) });
-      if (res.ok) return;
-    } catch {}
-    await sleep(1000);
-  }
-  const logTail = readLogTail(errLogPath) || readLogTail(outLogPath);
-  throw new Error(`Serwer wizji nie wystartował w terminie.${logTail ? `\n${textPreview(logTail, 1600)}` : ""}`);
-}
-
-async function runVisionSupport(imagePath, prompt) {
-  emit("status", { status: "vision-analysis", detail: "Pomocniczy VLM analizuje obraz..." });
-  await ensureVisionServer();
-
-  const imageBase64 = fs.readFileSync(imagePath).toString("base64");
-  const ext = path.extname(imagePath).toLowerCase();
-  const mimeType = ext === ".jpg" || ext === ".jpeg" ? "image/jpeg" : ext === ".webp" ? "image/webp" : "image/png";
-  const question = compactWhitespace(prompt) || "Describe this image.";
-
-  const response = await fetch(`http://127.0.0.1:${VISION_PORT}/v1/chat/completions`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "moondream2",
-      messages: [{
-        role: "user",
-        content: [
-          { type: "text", text: question },
-          { type: "image_url", image_url: { url: `data:${mimeType};base64,${imageBase64}` } },
-        ],
-      }],
-      max_tokens: 512,
-      temperature: 0.2,
-    }),
-    signal: AbortSignal.timeout(180000),
-  });
-
-  if (!response.ok) {
-    const body = await response.text().catch(() => "");
-    throw new Error(`Błąd serwera wizji: ${response.status}${body ? ` ${textPreview(body, 800)}` : ""}`);
-  }
-  const data = await response.json();
-  const content = data?.choices?.[0]?.message?.content ?? data?.content ?? "";
-  const description = String(content).trim();
-  if (!description) throw new Error("Serwer wizji zwrocil pusta odpowiedz.");
-  return description;
-}
+// Vision support removed.
 
 let messages = createInitialMessages();
 
@@ -5408,18 +4911,7 @@ async function runAgent(userText) {
 
     let content;
     if (typeof userText === "object" && userText !== null && userText.imageBase64) {
-      const promptText = userText.text || "Proszę przeanalizować załączony obraz.";
-      emit("run-start", { text: userText.text || "[Wysłano obraz]" });
-      const tempImgPath = path.join(os.tmpdir(), `endocode_vision_${Date.now()}.jpg`);
-      await fsp.writeFile(tempImgPath, Buffer.from(userText.imageBase64, "base64"));
-      try {
-        const description = await runVisionSupport(tempImgPath, promptText);
-        content = `${promptText}\n\nVision context:\n${description}`;
-      } catch (err) {
-        content = `${promptText}\n\nVision error: ${err.message}`;
-      } finally {
-        fs.unlink(tempImgPath, () => {});
-      }
+      throw new Error("Obrazy/Vision zostaly usuniete z aplikacji.");
     } else if (typeof userText === "object" && userText !== null && userText.attachment) {
       const text = String(userText.text || "").trim();
       const attachment = userText.attachment;
@@ -5946,11 +5438,6 @@ ipcMain.handle("app:delete-chat", (_event, chatId) => {
   saveChatHistory();
   return chatHistory;
 });
-ipcMain.handle("app:list-skills", () => getSkillsForUi());
-ipcMain.handle("app:install-skill", (_event, skillId) => installSkill(String(skillId ?? "")));
-ipcMain.handle("app:uninstall-skill", (_event, skillId) => uninstallSkill(String(skillId ?? "")));
-ipcMain.handle("app:install-recommended-skills", () => installRecommendedSkills());
-
 ipcMain.handle("app:list-models", async () => {
   const startedAt = Date.now();
   const catalog = loadModelCatalog();
