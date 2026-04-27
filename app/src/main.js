@@ -341,7 +341,7 @@ function bumpAgentRecoveryMetric(key) {
   agentRecoveryMetrics[key] += 1;
 }
 
-function buildQuickChoicesForFinal(finalText = "", intentClass = "general", metrics = {}) {
+function buildFallbackQuickChoicesForFinal(finalText = "", intentClass = "general", metrics = {}) {
   const text = String(finalText || "").trim();
   if (!text) return null;
   const isQuestionLike = /[?？]\s*$/.test(text) || /\b(czy|wybierz|chcesz|which|choose)\b/i.test(text);
@@ -372,6 +372,80 @@ function buildQuickChoicesForFinal(finalText = "", intentClass = "general", metr
     otherLabel: "Other: własna odpowiedź",
     reason: "question",
   };
+}
+
+function normalizeModelQuickChoices(raw, fallback = null) {
+  const parsed = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : null;
+  if (!parsed) return fallback;
+  const title = String(parsed.title || "Wybierz dalszy kierunek").trim() || "Wybierz dalszy kierunek";
+  const srcOptions = Array.isArray(parsed.options) ? parsed.options : [];
+  const letters = ["A", "B", "C", "D", "E", "F"];
+  const options = [];
+  for (const item of srcOptions) {
+    if (options.length >= 6) break;
+    const labelText = String(item?.label || "").trim();
+    const promptText = String(item?.prompt || "").trim();
+    if (!labelText || !promptText) continue;
+    const key = letters[options.length];
+    options.push({
+      key,
+      label: `${key}: ${labelText.replace(/^[A-F]\s*[:.)-]\s*/i, "").trim()}`,
+      prompt: promptText,
+    });
+  }
+  if (!options.length) return fallback;
+  return {
+    title,
+    options,
+    otherLabel: "Other: własna odpowiedź",
+    reason: "model_suggested",
+  };
+}
+
+async function deriveQuickChoicesWithModel(finalText, intentClass, history, abortSignal) {
+  const text = String(finalText || "").trim();
+  if (!text) return null;
+  const recent = Array.isArray(history)
+    ? history.slice(-6).map((msg) => `${msg.role}: ${String(msg.content || "").slice(0, 220)}`).join("\n")
+    : "";
+  const promptMessages = [
+    {
+      role: "system",
+      content: [
+        "Generujesz propozycje nastepnych krokow dla usera.",
+        "Zwroc TYLKO JSON w jednym obiekcie.",
+        "Format:",
+        "{\"title\":\"...\",\"options\":[{\"label\":\"...\",\"prompt\":\"...\"}]}",
+        "Liczba opcji: 1 do 6 (maks F).",
+        "Opcje maja byc konkretne i wykonawcze, bez ogolnikow.",
+        "Nie dodawaj prefiksow A/B/C w label (runtime doda je automatycznie).",
+      ].join("\n"),
+    },
+    ...(recent ? [{ role: "user", content: `Kontekst rozmowy:\n${recent}` }] : []),
+    {
+      role: "user",
+      content: `Intencja: ${intentClass}\nOstatnia odpowiedz agenta:\n${text}\n\nWygeneruj propozycje kolejnych krokow w JSON.`,
+    },
+  ];
+  try {
+    const failed = new Set();
+    const parsed = await callModelWithRecovery(promptMessages, abortSignal, failed, { plainChat: true, silent: true });
+    const raw = String(parsed?.content || "").trim();
+    if (!raw) return null;
+    const firstObj = extractFirstJsonObject(raw);
+    if (!firstObj) return null;
+    return JSON.parse(firstObj);
+  } catch {
+    return null;
+  }
+}
+
+async function buildQuickChoicesForFinal(finalText = "", intentClass = "general", metrics = {}, abortSignal = null) {
+  const fallback = buildFallbackQuickChoicesForFinal(finalText, intentClass, metrics);
+  const isQuestionLike = /[?？]\s*$/.test(String(finalText || "").trim()) || /\b(czy|wybierz|chcesz|which|choose)\b/i.test(String(finalText || ""));
+  if (!isQuestionLike) return null;
+  const modelChoices = await deriveQuickChoicesWithModel(finalText, intentClass, messages, abortSignal);
+  return normalizeModelQuickChoices(modelChoices, fallback);
 }
 
 function appendAgentDebugLog(type, payload = {}) {
@@ -5139,7 +5213,7 @@ async function runAgent(userText) {
       failedModelIds,
     });
     const finalText = String(result?.final || "");
-    const quickChoices = buildQuickChoicesForFinal(finalText, currentAgentIntentClass, agentRecoveryMetrics);
+    const quickChoices = await buildQuickChoicesForFinal(finalText, currentAgentIntentClass, agentRecoveryMetrics, signal);
     emit("final", { text: finalText });
     if (quickChoices) emit("quick-choices", quickChoices);
     messages.push({ role: "assistant", content: JSON.stringify({ final: finalText }) });

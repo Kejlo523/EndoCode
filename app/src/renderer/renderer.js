@@ -539,37 +539,72 @@ function finalizeStreamingAssistantMessage(finalText = "", options = {}) {
 }
 
 // ── Inline Events (replaces separate activity panel) ──
+const INLINE_EVENT_ICONS = {
+  tool: `<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M4 2l8 6-8 6V2z" fill="currentColor"/></svg>`,
+  note: `<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.3"/><path d="M8 5v4M8 11v.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>`,
+  error: `<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M8 1l7 13H1L8 1z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" fill="none"/></svg>`,
+  change: `<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M3 8l3 3 7-7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
+  activity: `<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="2" fill="currentColor"/><path d="M2 8h2M12 8h2M8 2v2M8 12v2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>`,
+};
+
+function setInlineEventIconKind(el, nextKind) {
+  const slot = el?.querySelector(".inline-event-icon");
+  if (!slot) return;
+  slot.innerHTML = INLINE_EVENT_ICONS[nextKind] || INLINE_EVENT_ICONS.note;
+}
+
+function syncInlineEventPersistAttrs(el) {
+  if (!el?.classList.contains("inline-event")) return;
+  const titleEl = el.querySelector(".inline-event-title");
+  const detailEl = el.querySelector(".inline-event-detail");
+  const expandEl = el.querySelector(".inline-event-expand");
+  if (titleEl) el.setAttribute("data-title", titleEl.textContent || "");
+  if (detailEl) el.setAttribute("data-body", detailEl.textContent || "");
+  el.setAttribute("data-extra-html", expandEl ? expandEl.innerHTML : "");
+}
+
 function addInlineEvent(kind, title, body = "", extraHtml = "", options = {}) {
-  const iconMap = {
-    tool: `<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M4 2l8 6-8 6V2z" fill="currentColor"/></svg>`,
-    note: `<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.3"/><path d="M8 5v4M8 11v.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>`,
-    error: `<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M8 1l7 13H1L8 1z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" fill="none"/></svg>`,
-    change: `<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M3 8l3 3 7-7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
-    activity: `<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="2" fill="currentColor"/><path d="M2 8h2M12 8h2M8 2v2M8 12v2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>`,
-  };
+  const iconMap = INLINE_EVENT_ICONS;
+  if (kind === "error" && options.defaultExpanded !== false) {
+    options = { ...options, defaultExpanded: true };
+  }
+
+  const variant = options.variant || "";
+  const isToolcard = variant === "toolcard";
+  const primaryHtml = options.primaryHtml || "";
+  const showPrimary = Boolean(primaryHtml) || isToolcard;
 
   const div = document.createElement("div");
-  div.className = `inline-event ${kind}`;
+  div.className = `inline-event ${kind}${isToolcard ? " inline-event--toolcard" : ""}`;
   div.setAttribute("data-kind", kind);
   div.setAttribute("data-title", title);
   div.setAttribute("data-body", body);
   div.setAttribute("data-extra-html", extraHtml || "");
-  div.setAttribute("data-expanded", "false");
+  const techOpen = Boolean(options.defaultExpanded);
+  div.setAttribute("data-expanded", techOpen ? "true" : "false");
+  if (isToolcard) div.setAttribute("data-variant", "toolcard");
   const eventTime = formatClockFromIso(options.eventAt);
   const durationHtml = options.showDuration
     ? `<span class="inline-event-duration">${escapeHtml(options.duration || "00:00")}</span>`
     : "";
   const hasDetail = Boolean(body || extraHtml);
   const detailId = `inline-event-detail-${crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36)}`;
-  const expandToggle = hasDetail ? `<span class="inline-event-expand-toggle">szczegóły</span>` : "";
+  const expandLabel = isToolcard && hasDetail ? "Szczegóły techniczne" : "szczegóły";
+  const expandToggle = hasDetail ? `<span class="inline-event-expand-toggle">${expandLabel}</span>` : "";
+  const primaryBlock = showPrimary
+    ? `<div class="inline-event-primary">${primaryHtml || (isToolcard ? "" : "")}</div>`
+    : "";
+  const detailHiddenClass = techOpen ? "" : " hidden";
+
   div.innerHTML = `
     <span class="inline-event-icon" aria-hidden="true">${iconMap[kind] || iconMap.note}</span>
     <div class="inline-event-body">
-      <button class="inline-event-summary ${hasDetail ? "" : "no-detail"}" type="button" ${hasDetail ? `aria-controls="${detailId}" aria-expanded="false"` : "disabled"}>
+      <button class="inline-event-summary ${hasDetail ? "" : "no-detail"}" type="button" ${hasDetail ? `aria-controls="${detailId}" aria-expanded="${techOpen ? "true" : "false"}"` : "disabled"}>
         <span class="inline-event-title">${escapeHtml(title)}</span>
         ${expandToggle}
       </button>
-      <div class="inline-event-detail-wrap hidden" id="${detailId}">
+      ${primaryBlock}
+      <div class="inline-event-detail-wrap${detailHiddenClass}" id="${detailId}">
         ${body ? `<div class="inline-event-detail">${escapeHtml(body)}</div>` : ""}
         ${extraHtml ? `<div class="inline-event-expand">${extraHtml}</div>` : ""}
       </div>
@@ -599,6 +634,7 @@ function addInlineEvent(kind, title, body = "", extraHtml = "", options = {}) {
     });
   }
   conversation.appendChild(div);
+  syncInlineEventPersistAttrs(div);
   smartScroll();
   updateWelcome();
   return div;
@@ -608,7 +644,7 @@ function buildQuickChoicesHtml(payload = {}) {
   const title = String(payload?.title || "Wybierz opcję");
   const options = Array.isArray(payload?.options) ? payload.options : [];
   const buttons = options
-    .slice(0, 4)
+    .slice(0, 6)
     .map((opt) => {
       const key = escapeAttr(opt?.key || "");
       const label = escapeHtml(opt?.label || key || "Opcja");
@@ -692,6 +728,7 @@ function upsertInlineEvent(activityId, kind, title, body = "") {
       summaryBtn.disabled = !hasDetailsNow && !hadDetailsBefore;
       summaryBtn.classList.toggle("no-detail", summaryBtn.disabled);
     }
+    syncInlineEventPersistAttrs(el);
     smartScroll();
   }
 }
@@ -746,22 +783,24 @@ function toolActionLabel(tool, args) {
   }
 }
 
-function extractSourcesFromAnswer(text = "") {
-  const raw = String(text || "");
-  const marker = raw.match(/(?:^|\n)Źródła:\s*([\s\S]*)$/i);
-  if (!marker?.[1]) return [];
-  const urls = marker[1]
-    .split(/\r?\n/)
-    .map((line) => line.replace(/^\s*-\s*/, "").trim())
-    .filter((line) => /^https?:\/\//i.test(line));
-  return [...new Set(urls)].slice(0, 12);
+function normalizePathForMatch(p) {
+  return String(p || "").replace(/\\/g, "/").toLowerCase().trim();
 }
 
-function renderDiff(diff) {
-  if (!Array.isArray(diff) || diff.length === 0) return "";
-  const added = diff.filter(r => r.type === "add").length;
-  const removed = diff.filter(r => r.type === "remove").length;
-  // Build hunks: groups of consecutive changes with 2 lines of surrounding context
+function toolSegmentPath(tool, args) {
+  if (!args) return "";
+  if (tool === "patch_batch") {
+    const blocks = Array.isArray(args.blocks) ? args.blocks : [];
+    const first = blocks[0]?.path || args.defaultPath;
+    return String(first || "").trim();
+  }
+  return String(args.path || "").trim();
+}
+
+function collectDiffHunks(diff) {
+  if (!Array.isArray(diff) || diff.length === 0) return { hunks: [], added: 0, removed: 0 };
+  const added = diff.filter((r) => r.type === "add").length;
+  const removed = diff.filter((r) => r.type === "remove").length;
   const hunks = [];
   let currentHunk = null;
   for (let i = 0; i < diff.length; i++) {
@@ -769,7 +808,6 @@ function renderDiff(diff) {
     if (row.type === "add" || row.type === "remove") {
       if (!currentHunk) {
         currentHunk = { startLine: i + 1, lines: [] };
-        // Add up to 2 context lines before
         for (let c = Math.max(0, i - 2); c < i; c++) {
           currentHunk.lines.push({ ...diff[c], lineNo: c + 1 });
           currentHunk.startLine = c + 1;
@@ -778,11 +816,9 @@ function renderDiff(diff) {
       currentHunk.lines.push({ ...row, lineNo: i + 1 });
     } else {
       if (currentHunk) {
-        // Add up to 2 context lines after
         currentHunk.lines.push({ ...row, lineNo: i + 1 });
-        // Check if next is also unchanged
         if (i + 1 < diff.length && (diff[i + 1].type === "add" || diff[i + 1].type === "remove")) {
-          continue; // keep extending the hunk
+          continue;
         }
         if (i + 2 < diff.length && diff[i + 1]?.type === "same" && (diff[i + 2]?.type === "add" || diff[i + 2]?.type === "remove")) {
           continue;
@@ -793,25 +829,177 @@ function renderDiff(diff) {
     }
   }
   if (currentHunk) hunks.push(currentHunk);
+  return { hunks, added, removed };
+}
 
-  // Build HTML: summary + collapsible hunks
-  const summaryHtml = `<span class="diff-stat-plus">+${added}</span> <span class="diff-stat-minus">−${removed}</span>`;
-  const hunkRows = hunks.map(hunk => {
-    const lines = hunk.lines.map(r => {
-      const prefix = r.type === "add" ? "+" : r.type === "remove" ? "−" : " ";
-      return `<div class="diff-row ${escapeHtml(r.type)}"><span class="diff-lineno">${r.lineNo}</span>${escapeHtml(prefix + " " + (r.text ?? ""))}</div>`;
-    }).join("");
-    return `<div class="diff-hunk"><div class="diff-hunk-header">@@ linia ${hunk.startLine} @@</div>${lines}</div>`;
-  }).join("");
+/** DOM diff block: stats in summary, hunks scrollable (native details, open by default). */
+function buildDiffDetailsElement(diff) {
+  const details = document.createElement("details");
+  details.className = "diff-details";
+  details.open = true;
+  const summary = document.createElement("summary");
+  summary.className = "diff-summary";
+  const { hunks, added, removed } = collectDiffHunks(diff);
+  if (hunks.length === 0) {
+    summary.textContent = "Brak zmian w diffie";
+    details.appendChild(summary);
+    return details;
+  }
+  summary.innerHTML = `<span class="diff-stat-plus">+${added}</span> <span class="diff-stat-minus">−${removed}</span><span class="diff-toggle-hint">▸ rozwiń / zwiń</span>`;
+  const inner = document.createElement("div");
+  inner.className = "diff diff--scroll";
+  for (const hunk of hunks) {
+    const hWrap = document.createElement("div");
+    hWrap.className = "diff-hunk";
+    const hh = document.createElement("div");
+    hh.className = "diff-hunk-header";
+    hh.textContent = `@@ linia ${hunk.startLine} @@`;
+    hWrap.appendChild(hh);
+    for (const r of hunk.lines) {
+      const row = document.createElement("div");
+      row.className = `diff-row ${r.type}`;
+      const ln = document.createElement("span");
+      ln.className = "diff-lineno";
+      ln.textContent = String(r.lineNo);
+      const prefix = r.type === "add" ? "+ " : r.type === "remove" ? "− " : "  ";
+      row.appendChild(ln);
+      row.appendChild(document.createTextNode(prefix + String(r.text ?? "")));
+      hWrap.appendChild(row);
+    }
+    inner.appendChild(hWrap);
+  }
+  details.appendChild(summary);
+  details.appendChild(inner);
+  return details;
+}
 
-  const id = "diff_" + Date.now() + "_" + Math.random().toString(36).slice(2, 6);
-  return `
-    <div class="diff-summary" onclick="document.getElementById('${id}').classList.toggle('hidden')">
-      ${summaryHtml}
-      <span class="diff-toggle-hint">▸ pokaż zmiany</span>
-    </div>
-    <div class="diff hidden" id="${id}">${hunkRows}</div>
-  `;
+function renderDiff(diff) {
+  const el = buildDiffDetailsElement(diff);
+  return el.outerHTML;
+}
+
+function findSegmentForFileChange(event) {
+  const p = normalizePathForMatch(event.path);
+  for (let i = activeToolSegments.length - 1; i >= 0; i--) {
+    const seg = activeToolSegments[i];
+    if (!seg?.el?.classList.contains("inline-event--toolcard")) continue;
+    if (seg.tool === "patch_batch") return seg;
+    const mergeTools = new Set(["write_file", "patch_edit", "download_file"]);
+    if (mergeTools.has(seg.tool) && normalizePathForMatch(seg.path) === p) return seg;
+  }
+  return null;
+}
+
+function mergeFileChangeIntoToolCard(segment, event) {
+  const primary = segment.el.querySelector(".inline-event-primary");
+  if (!primary) return;
+  const ph = primary.querySelector(".tool-run-placeholder");
+  if (ph) ph.remove();
+  let bucket = primary.querySelector(".tool-file-changes");
+  if (!bucket) {
+    bucket = document.createElement("div");
+    bucket.className = "tool-file-changes";
+    primary.appendChild(bucket);
+  }
+  const block = document.createElement("div");
+  block.className = "tool-file-change-block";
+  const head = document.createElement("div");
+  head.className = "tool-file-change-path";
+  head.textContent = String(event.path || "");
+  block.appendChild(head);
+  block.appendChild(buildDiffDetailsElement(Array.isArray(event.diff) ? event.diff : []));
+  bucket.appendChild(block);
+  syncInlineEventPersistAttrs(segment.el);
+}
+
+function finalizeToolCardSuccess(segment, event) {
+  const el = segment?.el;
+  if (!el || !el.classList.contains("inline-event--toolcard")) return false;
+  const tool = event.tool;
+  const result = event.result || {};
+  const titleEl = el.querySelector(".inline-event-title");
+  const primary = el.querySelector(".inline-event-primary");
+  const detailEl = el.querySelector(".inline-event-detail");
+
+  const ph = primary?.querySelector(".tool-run-placeholder");
+  if (ph) ph.remove();
+
+  if (tool === "read_file") {
+    if (titleEl) titleEl.textContent = `Odczytano: ${result.path || segment.path || ""}`;
+    if (primary) {
+      const trunc = result.truncated ? `<div class="file-truncated-hint">Plik skrócony do limitu bajtów (maxBytes).</div>` : "";
+      primary.innerHTML = `${trunc}<pre class="file-read-preview">${escapeHtml(String(result.content || ""))}</pre>`;
+    }
+    if (detailEl) detailEl.textContent = compactJsonPreview(result);
+  } else if (tool === "patch_edit" || tool === "write_file" || tool === "patch_batch" || tool === "download_file") {
+    const labels = {
+      patch_edit: "Zastosowano zmiany",
+      write_file: "Zapisano plik",
+      patch_batch: "Zastosowano paczkę patchy",
+      download_file: "Pobrano plik",
+    };
+    if (titleEl) {
+      if (tool === "patch_batch" && Number.isFinite(Number(result.appliedCount))) {
+        titleEl.textContent = `${labels.patch_batch} · ${result.appliedCount} plik(ów)`;
+      } else {
+        const pathHint = result.path || (Array.isArray(result.applied) && result.applied[0]?.path) || segment.path || "";
+        titleEl.textContent = `${labels[tool] || "Gotowe"}: ${pathHint}`;
+      }
+    }
+    if (primary && !primary.querySelector(".tool-file-changes") && !primary.querySelector(".file-read-preview")) {
+      primary.innerHTML = `<div class="tool-run-note">Zakończono (brak wizualnego diff w tej karcie).</div>`;
+    }
+    if (detailEl) detailEl.textContent = compactJsonPreview(result);
+  } else {
+    if (titleEl) titleEl.textContent = `Gotowe: ${tool}`;
+    if (primary) {
+      const snippet = compactJsonPreview(result).slice(0, 12000);
+      primary.innerHTML = `<pre class="tool-result-snippet">${escapeHtml(snippet)}</pre>`;
+    }
+    if (detailEl) detailEl.textContent = compactJsonPreview(result);
+  }
+
+  el.classList.add("inline-event--toolcard-done");
+  syncInlineEventPersistAttrs(el);
+  return true;
+}
+
+function finalizeToolCardError(segment, event) {
+  const el = segment?.el;
+  if (!el || !el.classList.contains("inline-event--toolcard")) return false;
+  const msg = `${event.error || ""}${event.recoveryHint ? `\nObejście: ${event.recoveryHint}` : ""}`;
+  el.classList.remove("tool", "inline-event--toolcard", "inline-event--toolcard-done");
+  el.classList.add("error", "inline-event--toolcard-error");
+  el.setAttribute("data-kind", "error");
+  setInlineEventIconKind(el, "error");
+  const titleEl = el.querySelector(".inline-event-title");
+  if (titleEl) titleEl.textContent = `Błąd: ${event.tool}`;
+  const primary = el.querySelector(".inline-event-primary");
+  if (primary) {
+    primary.innerHTML = `<pre class="tool-error-body">${escapeHtml(msg)}</pre>`;
+  }
+  const detailWrap = el.querySelector(".inline-event-detail-wrap");
+  if (detailWrap) {
+    detailWrap.classList.remove("hidden");
+    const summaryBtn = el.querySelector(".inline-event-summary");
+    if (summaryBtn) summaryBtn.setAttribute("aria-expanded", "true");
+    el.setAttribute("data-expanded", "true");
+  }
+  const detailEl = el.querySelector(".inline-event-detail");
+  if (detailEl) detailEl.textContent = compactJsonPreview({ tool: event.tool, error: event.error, recoveryHint: event.recoveryHint });
+  syncInlineEventPersistAttrs(el);
+  return true;
+}
+
+function extractSourcesFromAnswer(text = "") {
+  const raw = String(text || "");
+  const marker = raw.match(/(?:^|\n)Źródła:\s*([\s\S]*)$/i);
+  if (!marker?.[1]) return [];
+  const urls = marker[1]
+    .split(/\r?\n/)
+    .map((line) => line.replace(/^\s*-\s*/, "").trim())
+    .filter((line) => /^https?:\/\//i.test(line));
+  return [...new Set(urls)].slice(0, 12);
 }
 
 // ── Thinking Bubble ──
@@ -938,7 +1126,11 @@ async function switchToChat(chatId) {
       if (entry.type === "message") {
         addMessage(entry.role, entry.text);
       } else if (entry.type === "event") {
-        addInlineEvent(entry.kind, entry.title, entry.body || "", entry.extraHtml || "");
+        addInlineEvent(entry.kind, entry.title, entry.body || "", entry.extraHtml || "", {
+          variant: entry.variant || "",
+          primaryHtml: entry.primaryHtml || "",
+          defaultExpanded: entry.techExpanded === true,
+        });
       }
     }
     // Fallback: if no entries but has messages (old format)
@@ -1000,13 +1192,24 @@ async function saveChatSession(firstMessage = null) {
         text: el.getAttribute("data-raw-text") ?? el.textContent,
       });
     } else if (el.classList.contains("inline-event")) {
-      entries.push({
+      const expand = el.querySelector(".inline-event-expand");
+      const extraFromDom = expand ? expand.innerHTML : (el.getAttribute("data-extra-html") || "");
+      const primaryEl = el.querySelector(".inline-event-primary");
+      const primaryHtml = primaryEl ? primaryEl.innerHTML : "";
+      const techWrap = el.querySelector(".inline-event-detail-wrap");
+      const techExpanded = Boolean(techWrap && !techWrap.classList.contains("hidden"));
+      const variant = el.getAttribute("data-variant") || "";
+      const payload = {
         type: "event",
         kind: el.getAttribute("data-kind") || "note",
-        title: el.getAttribute("data-title") || "",
-        body: el.getAttribute("data-body") || "",
-        extraHtml: el.getAttribute("data-extra-html") || "",
-      });
+        title: el.querySelector(".inline-event-title")?.textContent || el.getAttribute("data-title") || "",
+        body: el.querySelector(".inline-event-detail")?.textContent ?? el.getAttribute("data-body") ?? "",
+        extraHtml: extraFromDom,
+      };
+      if (primaryHtml) payload.primaryHtml = primaryHtml;
+      if (techExpanded) payload.techExpanded = true;
+      if (variant) payload.variant = variant;
+      entries.push(payload);
     }
   });
 
@@ -1787,11 +1990,19 @@ window.endocode.onEvent(async (event) => {
     removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
     const label = toolActionLabel(event.tool, event.args);
     const detail = toolActionDetail(event.tool, event.args, event.note || "");
-    const toolEvent = addInlineEvent("tool", label, detail, "", { eventAt: event.at, showDuration: true, duration: "00:00" });
+    const path = toolSegmentPath(event.tool, event.args);
+    const primaryHtml = `<div class="tool-run-placeholder"><span class="tool-run-badge">W toku</span><span class="tool-run-path">${escapeHtml(shortPath(path) || path || "—")}</span></div>`;
+    const toolEvent = addInlineEvent("tool", label, detail, "", {
+      eventAt: event.at,
+      showDuration: true,
+      duration: "00:00",
+      variant: "toolcard",
+      primaryHtml,
+    });
     const durationEl = toolEvent.querySelector(".inline-event-duration");
     const durationKey = `tool-${event.tool || "unknown"}-${event.id || Date.now()}`;
     if (durationEl) startLiveDuration(durationKey, parseEventTimeMs(event), durationEl);
-    activeToolSegments.push({ key: durationKey, tool: event.tool, el: toolEvent });
+    activeToolSegments.push({ key: durationKey, tool: event.tool, el: toolEvent, path });
     showLive(label, detail);
     return;
   }
@@ -1799,26 +2010,37 @@ window.endocode.onEvent(async (event) => {
     const matchingIndex = activeToolSegments.findIndex((segment) => segment.tool === event.tool);
     const segment = matchingIndex >= 0 ? activeToolSegments.splice(matchingIndex, 1)[0] : activeToolSegments.shift();
     if (segment?.key) stopLiveDuration(segment.key, parseEventTimeMs(event));
+    const durationText = segment?.el?.querySelector(".inline-event-duration")?.textContent || "00:00";
     if (!event.ok) {
-      const errorEl = addInlineEvent("error", `Błąd: ${event.tool}`, `${event.error || ""}${event.recoveryHint ? `\nObejście: ${event.recoveryHint}` : ""}`, "", { eventAt: event.at });
-      if (segment?.el?.querySelector(".inline-event-duration")) {
-        setInlineEventDuration(errorEl, segment.el.querySelector(".inline-event-duration").textContent || "00:00");
+      if (!finalizeToolCardError(segment, event)) {
+        const errorEl = addInlineEvent("error", `Błąd: ${event.tool}`, `${event.error || ""}${event.recoveryHint ? `\nObejście: ${event.recoveryHint}` : ""}`, "", { eventAt: event.at });
+        setInlineEventDuration(errorEl, durationText);
+      } else if (segment?.el) {
+        setInlineEventDuration(segment.el, durationText);
       }
-    } else {
+    } else if (!finalizeToolCardSuccess(segment, event)) {
       const okEl = addInlineEvent("activity", `Zakończono: ${event.tool}`, compactJsonPreview(event.result || {}), "", { eventAt: event.at });
-      if (segment?.el?.querySelector(".inline-event-duration")) {
-        setInlineEventDuration(okEl, segment.el.querySelector(".inline-event-duration").textContent || "00:00");
-      }
+      setInlineEventDuration(okEl, durationText);
+    } else if (segment?.el) {
+      setInlineEventDuration(segment.el, durationText);
     }
     return;
   }
   if (event.type === "file-change") {
+    const seg = findSegmentForFileChange(event);
+    if (seg) {
+      mergeFileChangeIntoToolCard(seg, event);
+      showLive(`Zapisano: ${event.path}`);
+      return;
+    }
     const actionLabel =
       event.action === "write_file"
         ? "Zapisano"
         : event.action === "patch_edit"
           ? "Zastosowano patch"
-              : "Edycja";
+          : event.action === "download_file"
+            ? "Pobrano"
+            : "Edycja";
     const body = "";
     addInlineEvent("change", `${actionLabel}: ${event.path}`, body, renderDiff(event.diff));
     showLive(`Zapisano: ${event.path}`);
