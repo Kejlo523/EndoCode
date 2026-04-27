@@ -636,6 +636,55 @@ function addInlineEvent(kind, title, body = "", extraHtml = "", options = {}) {
   return div;
 }
 
+function buildQuickChoicesHtml(payload = {}) {
+  const title = String(payload?.title || "Wybierz opcję");
+  const options = Array.isArray(payload?.options) ? payload.options : [];
+  const buttons = options
+    .slice(0, 4)
+    .map((opt) => {
+      const key = escapeAttr(opt?.key || "");
+      const label = escapeHtml(opt?.label || key || "Opcja");
+      const prompt = escapeAttr(opt?.prompt || "");
+      return `<button class="quick-choice-btn" data-quick-choice="preset" data-choice-key="${key}" data-choice-prompt="${prompt}">${label}</button>`;
+    })
+    .join("");
+  const otherLabel = escapeHtml(payload?.otherLabel || "Other");
+  return `
+    <div class="quick-choices-wrap">
+      <div class="quick-choices-title">${escapeHtml(title)}</div>
+      <div class="quick-choices-grid">${buttons}</div>
+      <button class="quick-choice-btn other" data-quick-choice="other">${otherLabel}</button>
+    </div>
+  `;
+}
+
+async function submitQuickChoicePrompt(text) {
+  const prompt = String(text || "").trim();
+  if (!prompt) return;
+  if (!firstUserMessage) firstUserMessage = prompt;
+  addMessage("user", prompt);
+  chatTitle.textContent = prompt.length > 40 ? `${prompt.slice(0, 40)}...` : prompt;
+  await saveChatSession(firstUserMessage);
+  const submission = { text: prompt, imageBase64: null, attachment: null };
+  const hasQueuedWork = promptQueueItems.some((item) => item.status === "queued" || item.status === "running");
+  if (!appBusy && !hasQueuedWork) {
+    setBusy(true);
+    try {
+      await sendPromptPayload(submission);
+    } catch (e) {
+      addInlineEvent("error", "Błąd", e.message || String(e));
+      setBusy(false);
+      hideLive();
+      promptEl.focus();
+      await saveChatSession(firstUserMessage);
+      await updateContextInfo();
+    }
+    return;
+  }
+  addPromptToQueue(submission);
+  promptEl.focus();
+}
+
 function removeInlineEventByActivityId(activityId) {
   const el = conversation.querySelector(`.inline-event[data-activity-id="${activityId}"]`);
   if (el) el.remove();
@@ -1530,6 +1579,26 @@ if (promptQueueList) {
   });
 }
 
+conversation.addEventListener("click", (event) => {
+  const target = event.target.closest("button[data-quick-choice]");
+  if (!target) return;
+  const mode = target.getAttribute("data-quick-choice");
+  if (mode === "preset") {
+    const prompt = target.getAttribute("data-choice-prompt") || "";
+    target.disabled = true;
+    void submitQuickChoicePrompt(prompt);
+    return;
+  }
+  if (mode === "other") {
+    const custom = window.prompt("Wpisz własny kierunek:", "");
+    if (custom === null) return;
+    const trimmed = String(custom).trim();
+    if (!trimmed) return;
+    target.disabled = true;
+    void submitQuickChoicePrompt(trimmed);
+  }
+});
+
 composer.addEventListener("submit", async (event) => {
   event.preventDefault();
   const text = promptEl.value.trim();
@@ -1872,6 +1941,10 @@ window.endocode.onEvent(async (event) => {
     }
     hideLive();
     saveChatSession(firstUserMessage);
+  }
+  if (event.type === "quick-choices") {
+    addInlineEvent("activity", "Wybór kolejnego kroku", "", buildQuickChoicesHtml(event), { eventAt: event.at });
+    return;
   }
 });
 

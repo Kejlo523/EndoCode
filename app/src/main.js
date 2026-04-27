@@ -415,6 +415,39 @@ function bumpAgentRecoveryMetric(key) {
   agentRecoveryMetrics[key] += 1;
 }
 
+function buildQuickChoicesForFinal(finalText = "", intentClass = "general", metrics = {}) {
+  const text = String(finalText || "").trim();
+  if (!text) return null;
+  const isQuestionLike = /[?？]\s*$/.test(text) || /\b(czy|wybierz|chcesz|which|choose)\b/i.test(text);
+  if (!isQuestionLike) return null;
+
+  if (intentClass === "web") {
+    return {
+      title: "Wybierz dalszy kierunek",
+      options: [
+        { key: "A", label: "A: Szukaj dalej (inne źródła)", prompt: "Szukaj dalej w innych źródłach i porównaj informacje." },
+        { key: "B", label: "B: Podsumowanie krótkie", prompt: "Zrób krótkie podsumowanie na podstawie już zebranych danych." },
+        { key: "C", label: "C: Podsumowanie szczegółowe", prompt: "Zrób szczegółowe podsumowanie z zaznaczeniem niepewności i rozbieżności." },
+        { key: "D", label: "D: Tylko wiarygodne źródła", prompt: "Użyj tylko bardziej wiarygodnych źródeł i odfiltruj serwisy plotkarskie." },
+      ],
+      otherLabel: "Other: własna odpowiedź",
+      reason: metrics?.toolErrors > 0 || metrics?.parseErrors > 0 ? "recovery" : "question",
+    };
+  }
+
+  return {
+    title: "Wybierz dalszy kierunek",
+    options: [
+      { key: "A", label: "A: Kontynuuj automatycznie", prompt: "Kontynuuj zadanie autonomicznie najlepszą strategią." },
+      { key: "B", label: "B: Wersja krótka", prompt: "Daj krótką odpowiedź końcową." },
+      { key: "C", label: "C: Wersja szczegółowa", prompt: "Daj szczegółową odpowiedź końcową." },
+      { key: "D", label: "D: Wyjaśnij plan krok po kroku", prompt: "Wyjaśnij plan krok po kroku i wykonaj go." },
+    ],
+    otherLabel: "Other: własna odpowiedź",
+    reason: "question",
+  };
+}
+
 function appendAgentDebugLog(type, payload = {}) {
   try {
     const interesting = new Set([
@@ -5373,7 +5406,9 @@ async function runAgent(userText) {
       failedModelIds,
     });
     const finalText = String(result?.final || "");
+    const quickChoices = buildQuickChoicesForFinal(finalText, currentAgentIntentClass, agentRecoveryMetrics);
     emit("final", { text: finalText });
+    if (quickChoices) emit("quick-choices", quickChoices);
     messages.push({ role: "assistant", content: JSON.stringify({ final: finalText }) });
     baselineMetrics.recordRun({ mode: "agent", latencyMs: Date.now() - startedAt, ok: true, backend: runtimeBackendStatus.activeBackend });
     return { ok: true, final: finalText };
