@@ -4342,6 +4342,45 @@ const SHELL_SAFE_READONLY_PATTERNS = [
   /(^|[^a-z0-9_])(get-childitem|get-location|get-process|get-date|get-command|get-history|systeminfo)\b/i,
 ];
 
+const SHELL_BACKGROUND_PATTERNS = [
+  /(^|[\s"'])(node|bun|deno)\s+[^;&|]*(server|dev|watch|preview)\.(js|mjs|cjs|ts)\b/i,
+  /(^|[\s"'])(npm|pnpm|yarn|bun)\s+(run\s+)?(dev|start|serve|preview|watch)\b/i,
+  /(^|[\s"'])(vite|next|nuxt|astro|webpack-dev-server|serve)\b/i,
+  /\b(flask|uvicorn|fastapi|streamlit)\b/i,
+];
+
+function shouldRunShellInBackground(command = "") {
+  const cmd = String(command || "").trim();
+  if (!cmd) return false;
+  if (/[;&|]\s*(echo|type|cat|get-content|select-string|findstr)\b/i.test(cmd)) return false;
+  return SHELL_BACKGROUND_PATTERNS.some((re) => re.test(cmd));
+}
+
+function runBackgroundShell(command) {
+  const child = spawn(command, {
+    cwd,
+    shell: true,
+    detached: true,
+    stdio: "ignore",
+    env: {
+      ...process.env,
+      TEMP: path.join(workspaceRoot, ".tmp"),
+      TMP: path.join(workspaceRoot, ".tmp"),
+      AGENT_SANDBOX_ROOT: workspaceRoot,
+    },
+    windowsHide: true,
+  });
+  child.unref();
+  return {
+    cwd: relativeToRoot(cwd),
+    exitCode: null,
+    background: true,
+    pid: child.pid,
+    stdout: "",
+    stderr: "Uruchomiono w tle, bo komenda wygląda jak długotrwały lokalny serwer/dev watcher.",
+  };
+}
+
 function getShellPolicyWarnings(command = "") {
   const cmd = String(command || "");
   const warnings = [];
@@ -4381,6 +4420,12 @@ async function runPowerShell(command, timeoutSeconds) {
     if (!approved) throw new Error("Uzytkownik odrzucil komende.");
   } else {
     emit("status", { status: "shell-auto-approved", detail: `Auto-zgoda shell (${approvalPolicy.reason}).` });
+  }
+
+  if (shouldRunShellInBackground(command)) {
+    const result = runBackgroundShell(command);
+    emit("status", { status: "shell-background-started", detail: `Uruchomiono w tle: ${command}` });
+    return result;
   }
 
   return new Promise((resolve) => {

@@ -1668,9 +1668,24 @@ function openApproval(request, approvalId) {
   approveCommand.focus();
 }
 
-function closeApproval(approved) {
-  if (pendingApprovalId) window.endocode.approve(pendingApprovalId, approved);
+async function closeApproval(approved) {
+  const approvalId = pendingApprovalId;
+  if (!approvalId) return;
   pendingApprovalId = null;
+  approveCommand.disabled = true;
+  rejectCommand.disabled = true;
+  try {
+    await window.endocode.approve(approvalId, approved);
+    showLive(approved ? "Zatwierdzono" : "Odrzucono", approved ? "Uruchamiam komendę..." : "Komenda anulowana.");
+  } catch (e) {
+    pendingApprovalId = approvalId;
+    addInlineEvent("error", "Zatwierdzenie komendy", e.message || String(e));
+    showLive("Błąd zatwierdzenia", e.message || String(e));
+    return;
+  } finally {
+    approveCommand.disabled = false;
+    rejectCommand.disabled = false;
+  }
   approvalModal.classList.add("hidden");
 }
 
