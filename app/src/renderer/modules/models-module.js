@@ -58,6 +58,7 @@
           actions.push(`<button class="model-btn delete" onclick="deleteModel('${escapeAttr(model.id)}')">Usuń</button>`);
         } else if (ui.isDownloading) {
           actions.push(`<button class="model-btn download" disabled>${ui.state === "queued" ? "W kolejce..." : `Pobieranie ${ui.progress}%...`}</button>`);
+          actions.push(`<button class="model-btn delete" onclick="cancelModelDownload('${escapeAttr(model.id)}')">Anuluj</button>`);
         } else {
           const cta = ui.isFailed ? "Ponów pobieranie" : `Pobierz (${ui.sizeGB})`;
           actions.push(`<button class="model-btn primary" onclick="downloadModel('${escapeAttr(model.id)}')">${cta}</button>`);
@@ -168,8 +169,8 @@
       if (modelsInstalledList) modelsInstalledList.innerHTML = `<div class="models-empty">Ładowanie...</div>`;
       try {
         const models = await api.listModels();
-        renderModels(models, modelsList, modelRenderCacheLibrary);
         const installed = models.filter((model) => model.kind === "local-gguf" && model.fileStatus?.available);
+        renderModels(installed, modelsList, modelRenderCacheLibrary);
         renderModels(installed, modelsInstalledList, modelRenderCacheInstalled);
       } catch (e) {
         modelsList.innerHTML = `<div class="models-empty error">${escapeHtml(e.message || String(e))}</div>`;

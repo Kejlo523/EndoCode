@@ -50,6 +50,14 @@ const modelsInstalledList = document.getElementById("modelsInstalledList");
 const modelsStatus = document.getElementById("modelsStatus");
 const hfModelUrl = document.getElementById("hfModelUrl");
 const addHfModel = document.getElementById("addHfModel");
+const modelsLibraryStats = document.getElementById("modelsLibraryStats");
+const modelsApiList = document.getElementById("modelsApiList");
+const downloadCenter = document.getElementById("downloadCenter");
+const downloadCenterList = document.getElementById("downloadCenterList");
+const downloadCenterCount = document.getElementById("downloadCenterCount");
+const downloadCenterToggle = document.getElementById("downloadCenterToggle");
+const downloadCenterRestore = document.getElementById("downloadCenterRestore");
+const downloadCenterRestoreCount = document.getElementById("downloadCenterRestoreCount");
 const runtimeWarning = document.getElementById("runtimeWarning");
 const installRuntimeBtn = document.getElementById("installRuntimeBtn");
 const runtimeInstallProgress = document.getElementById("runtimeInstallProgress");
@@ -108,6 +116,9 @@ let promptQueueItems = [];
 let promptQueueSeq = 0;
 let promptQueueProcessing = false;
 let finalReceivedInRun = false;
+let apiProvidersState = [];
+const modelDownloadState = new Map();
+let downloadCenterCollapsed = false;
 const modelsModule = window.EndoModules?.createModelsModule?.({
   modelsList,
   modelsInstalledList,
@@ -121,6 +132,12 @@ const modelsModule = window.EndoModules?.createModelsModule?.({
     listModels: () => window.endocode.listModels(),
   },
 });
+
+const API_PROVIDER_LABELS = {
+  openai: "OpenAI",
+  claude: "Claude",
+  openrouter: "OpenRouter",
+};
 
 // ── Helpers ──
 function escapeHtml(value) {
@@ -295,25 +312,35 @@ async function sendPromptPayload(item) {
 }
 
 function movePromptInQueue(id, direction) {
-  const currentIdx = promptQueueItems.findIndex((item) => item.id === id && item.status === "queued");
+  const currentIdx = promptQueueItems.findIndex((item) => item.id === id && item.status !== "running" && item.status !== "done");
   if (currentIdx < 0) return;
   const targetIdx = direction === "up" ? currentIdx - 1 : currentIdx + 1;
   if (targetIdx < 0 || targetIdx >= promptQueueItems.length) return;
   const target = promptQueueItems[targetIdx];
-  if (!target || target.status !== "queued") return;
+  if (!target || target.status === "running" || target.status === "done") return;
   const [item] = promptQueueItems.splice(currentIdx, 1);
   promptQueueItems.splice(targetIdx, 0, item);
   renderPromptQueue();
 }
 
-function setPromptPriorityNow(id) {
-  const idx = promptQueueItems.findIndex((item) => item.id === id && item.status === "queued");
+async function setPromptPriorityNow(id) {
+  const idx = promptQueueItems.findIndex((item) => item.id === id && item.status !== "running" && item.status !== "done");
   if (idx < 0) return;
-  const firstQueuedIdx = promptQueueItems.findIndex((item) => item.status === "queued");
+  const firstQueuedIdx = promptQueueItems.findIndex((item) => item.status === "queued" || item.status === "error");
   if (firstQueuedIdx < 0 || idx === firstQueuedIdx) return;
   const [item] = promptQueueItems.splice(idx, 1);
+  item.status = "queued";
   promptQueueItems.splice(firstQueuedIdx, 0, item);
   renderPromptQueue();
+  if (appBusy) {
+    try {
+      await window.endocode.abort();
+    } catch (e) {
+      addInlineEvent("error", "Kolejka", e.message || String(e));
+    }
+  } else {
+    void processPromptQueue();
+  }
 }
 
 function deletePromptFromQueue(id) {
@@ -324,7 +351,7 @@ function deletePromptFromQueue(id) {
 }
 
 function editPromptInQueue(id) {
-  const item = promptQueueItems.find((entry) => entry.id === id && entry.status === "queued");
+  const item = promptQueueItems.find((entry) => entry.id === id && entry.status !== "running" && entry.status !== "done");
   if (!item) return;
   const updated = window.prompt("Edytuj prompt:", item.text || "");
   if (updated === null) return;
@@ -334,6 +361,7 @@ function editPromptInQueue(id) {
     return;
   }
   item.text = trimmed;
+  item.status = "queued";
   renderPromptQueue();
 }
 
@@ -358,10 +386,10 @@ function renderPromptQueue() {
             <div class="prompt-queue-meta">${statusLabel}</div>
           </div>
           <div class="prompt-queue-actions">
-            ${item.status === "queued" ? `<button data-queue-action="now" data-queue-id="${item.id}" title="Uruchom jako następny">Teraz</button>` : ""}
-            ${item.status === "queued" ? `<button data-queue-action="up" data-queue-id="${item.id}" title="Przesuń wyżej">↑</button>` : ""}
-            ${item.status === "queued" ? `<button data-queue-action="down" data-queue-id="${item.id}" title="Przesuń niżej">↓</button>` : ""}
-            ${item.status === "queued" ? `<button data-queue-action="edit" data-queue-id="${item.id}" title="Edytuj">Edytuj</button>` : ""}
+            ${item.status !== "running" ? `<button data-queue-action="now" data-queue-id="${item.id}" title="Uruchom jako następny">Teraz</button>` : ""}
+            ${item.status !== "running" ? `<button data-queue-action="up" data-queue-id="${item.id}" title="Przesuń wyżej">↑</button>` : ""}
+            ${item.status !== "running" ? `<button data-queue-action="down" data-queue-id="${item.id}" title="Przesuń niżej">↓</button>` : ""}
+            ${item.status !== "running" ? `<button data-queue-action="edit" data-queue-id="${item.id}" title="Edytuj">Edytuj</button>` : ""}
             ${item.status !== "running" ? `<button data-queue-action="delete" data-queue-id="${item.id}" title="Usuń">Usuń</button>` : ""}
           </div>
         </div>
@@ -642,8 +670,12 @@ function syncInlineEventPersistAttrs(el) {
 
 function addInlineEvent(kind, title, body = "", extraHtml = "", options = {}) {
   const iconMap = INLINE_EVENT_ICONS;
-  if (kind === "error" && options.defaultExpanded !== false) {
-    options = { ...options, defaultExpanded: true };
+  let normalizedBody = String(body || "");
+  let normalizedExtraHtml = String(extraHtml || "");
+  if (kind === "error" && normalizedBody && !normalizedExtraHtml) {
+    const firstLine = normalizedBody.split("\n").find((line) => String(line || "").trim()) || normalizedBody;
+    normalizedBody = firstLine;
+    normalizedExtraHtml = `<pre class="inline-error-full">${escapeHtml(body)}</pre>`;
   }
 
   const variant = options.variant || "";
@@ -655,8 +687,8 @@ function addInlineEvent(kind, title, body = "", extraHtml = "", options = {}) {
   div.className = `inline-event ${kind}${isToolcard ? " inline-event--toolcard" : ""}`;
   div.setAttribute("data-kind", kind);
   div.setAttribute("data-title", title);
-  div.setAttribute("data-body", body);
-  div.setAttribute("data-extra-html", extraHtml || "");
+  div.setAttribute("data-body", normalizedBody);
+  div.setAttribute("data-extra-html", normalizedExtraHtml || "");
   const techOpen = Boolean(options.defaultExpanded);
   div.setAttribute("data-expanded", techOpen ? "true" : "false");
   if (isToolcard) div.setAttribute("data-variant", "toolcard");
@@ -664,7 +696,7 @@ function addInlineEvent(kind, title, body = "", extraHtml = "", options = {}) {
   const durationHtml = options.showDuration
     ? `<span class="inline-event-duration">${escapeHtml(options.duration || "00:00")}</span>`
     : "";
-  const hasDetail = Boolean(body || extraHtml);
+  const hasDetail = Boolean(normalizedBody || normalizedExtraHtml);
   const detailId = `inline-event-detail-${crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36)}`;
   const expandLabel = isToolcard && hasDetail ? "Szczegóły techniczne" : "szczegóły";
   const expandToggle = hasDetail ? `<span class="inline-event-expand-toggle">${expandLabel}</span>` : "";
@@ -682,8 +714,8 @@ function addInlineEvent(kind, title, body = "", extraHtml = "", options = {}) {
       </button>
       ${primaryBlock}
       <div class="inline-event-detail-wrap${detailHiddenClass}" id="${detailId}">
-        ${body ? `<div class="inline-event-detail">${escapeHtml(body)}</div>` : ""}
-        ${extraHtml ? `<div class="inline-event-expand">${extraHtml}</div>` : ""}
+        ${normalizedBody ? `<div class="inline-event-detail">${escapeHtml(normalizedBody)}</div>` : ""}
+        ${normalizedExtraHtml ? `<div class="inline-event-expand">${normalizedExtraHtml}</div>` : ""}
       </div>
     </div>
     <div class="inline-event-meta">
@@ -782,6 +814,7 @@ const MODEL_WRITING_ACTIVITY_ID = "model-writing";
 const AGENT_PHASE_ACTIVITY_ID = "agent-phase";
 const AGENT_NOTE_ACTIVITY_ID = "agent-note";
 let lastAgentPhaseSignature = "";
+let agentPhaseHistoryLines = [];
 
 function upsertInlineEvent(activityId, kind, title, body = "") {
   const safeBody = String(body ?? "").slice(0, 50000);
@@ -1384,6 +1417,16 @@ async function startNewChat() {
 }
 
 async function saveChatSession(firstMessage = null) {
+  const hasUserMessage = Boolean(
+    conversation.querySelector(".message.user")?.getAttribute("data-raw-text")
+    || conversation.querySelector(".message.user")?.textContent,
+  );
+  const existingSession = activeChatId
+    ? chatSessions.find((session) => session.id === activeChatId)
+    : null;
+  if (!existingSession && !hasUserMessage) {
+    return;
+  }
   if (!activeChatId) activeChatId = generateId();
   let state = null;
   try { state = await window.endocode.getState(); } catch { /* ignore */ }
@@ -1576,6 +1619,16 @@ async function refreshState() {
 function renderModelSelect(state) {
   modelSelect.innerHTML = "";
   const availableModels = (state.models || []).filter((model) => model.available);
+  const truncateModelLabel = (value, max = 42) => {
+    const text = String(value || "");
+    return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+  };
+  const applyModelSelectFontSize = (fullLabel = "") => {
+    const len = String(fullLabel || "").length;
+    modelSelect.classList.remove("model-select-small", "model-select-xsmall");
+    if (len > 46) modelSelect.classList.add("model-select-xsmall");
+    else if (len > 34) modelSelect.classList.add("model-select-small");
+  };
 
   if (availableModels.length === 0) {
     const option = document.createElement("option");
@@ -1585,6 +1638,7 @@ function renderModelSelect(state) {
     option.selected = true;
     modelSelect.appendChild(option);
     modelSelect.disabled = true;
+    applyModelSelectFontSize("");
     return;
   }
 
@@ -1592,10 +1646,12 @@ function renderModelSelect(state) {
   for (const model of availableModels) {
     const option = document.createElement("option");
     option.value = model.id;
-    option.textContent = model.displayName;
+    option.textContent = truncateModelLabel(model.displayName);
+    option.title = model.displayName;
     option.disabled = false;
     option.selected = model.id === state.selectedModelId;
     modelSelect.appendChild(option);
+    if (option.selected) applyModelSelectFontSize(model.displayName);
   }
 }
 
@@ -1621,6 +1677,72 @@ function patchModelDownloadProgress(modelId, progress, downloaded = 0, total = 0
 
 async function loadModels() {
   await modelsModule?.loadModels?.();
+  await refreshModelLibraryStats();
+}
+
+function formatBytesShort(value) {
+  const bytes = Number(value || 0);
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 MB";
+  const gb = bytes / 1024 / 1024 / 1024;
+  if (gb >= 1) return `${gb.toFixed(1)} GB`;
+  return `${(bytes / 1024 / 1024).toFixed(0)} MB`;
+}
+
+async function refreshModelLibraryStats() {
+  if (!modelsLibraryStats) return;
+  try {
+    const stats = await window.endocode.getModelLibraryStats();
+    const count = Number(stats?.installedCount || 0);
+    const sizeText = formatBytesShort(stats?.installedBytes || 0);
+    const freeText = stats?.diskFreeBytes == null ? "—" : formatBytesShort(stats.diskFreeBytes);
+    modelsLibraryStats.textContent = `Modele: ${count} • Rozmiar: ${sizeText} • Wolne: ${freeText}`;
+  } catch {
+    modelsLibraryStats.textContent = "Modele: — • Rozmiar: — • Wolne: —";
+  }
+}
+
+function renderApiProviders() {
+  if (!modelsApiList) return;
+  if (!Array.isArray(apiProvidersState) || !apiProvidersState.length) {
+    modelsApiList.innerHTML = `<div class="models-empty">Brak providerów API.</div>`;
+    return;
+  }
+  modelsApiList.innerHTML = apiProvidersState.map((provider) => {
+    const label = API_PROVIDER_LABELS[provider.id] || provider.id;
+    const enabled = Boolean(provider.enabled);
+    const hasKey = Boolean(provider.hasKey);
+    const modelsCount = Number(provider.modelsCount || 0);
+    const status = enabled
+      ? (hasKey ? `włączone • modeli: ${modelsCount}` : "włączone • brak klucza")
+      : "wyłączone";
+    return `
+      <div class="api-provider-card" data-provider-id="${escapeAttr(provider.id)}">
+        <div class="api-provider-head">
+          <span class="api-provider-name">${escapeHtml(label)}</span>
+          <span class="api-provider-state">${escapeHtml(status)}</span>
+        </div>
+        <div class="api-provider-controls">
+          <label class="api-provider-toggle">
+            <input type="checkbox" data-role="toggle" ${enabled ? "checked" : ""} />
+            Włącz
+          </label>
+          <input type="password" data-role="api-key" placeholder="Wklej klucz API..." ${enabled ? "" : "disabled"} />
+          <button class="modal-btn approve" data-role="refresh" ${enabled ? "" : "disabled"}>Pobierz modele</button>
+        </div>
+        <div class="api-provider-meta">Klucz jest zapisywany lokalnie. Modele pobierają się po kliknięciu „Pobierz modele”.</div>
+        ${provider.lastError ? `<div class="api-provider-error">${escapeHtml(provider.lastError)}</div>` : ""}
+      </div>
+    `;
+  }).join("");
+}
+
+async function loadApiProviders() {
+  try {
+    apiProvidersState = await window.endocode.getApiProviders();
+    renderApiProviders();
+  } catch (error) {
+    modelsApiList.innerHTML = `<div class="models-empty error">${escapeHtml(error.message || String(error))}</div>`;
+  }
 }
 
 window.useModel = async (modelId) => {
@@ -1639,11 +1761,15 @@ window.useModel = async (modelId) => {
 
 window.downloadModel = async (modelId) => {
   try {
-    modelsModule?.setModelsStatus?.("Rozpoczynam pobieranie...");
     await window.endocode.downloadModel(modelId);
     await loadModels();
   } catch (e) {
-    alert(`Błąd pobierania: ${e.message}`);
+    const msg = String(e?.message || "");
+    if (/anulowan|cancel/i.test(msg)) {
+      modelsModule?.setModelsStatus?.(`Anulowano pobieranie ${modelId}.`);
+    } else {
+      alert(`Błąd pobierania: ${e.message}`);
+    }
   }
 };
 
@@ -1656,6 +1782,75 @@ window.deleteModel = async (modelId) => {
     alert(`Błąd usuwania: ${e.message}`);
   }
 };
+
+window.cancelModelDownload = async (modelId) => {
+  try {
+    await window.endocode.cancelModelDownload(modelId);
+    addInlineEvent("note", "Pobieranie", `Anulowano pobieranie modelu ${modelId}.`);
+  } catch (e) {
+    addInlineEvent("error", "Pobieranie", e.message || String(e));
+  }
+};
+
+function formatDownloadSize(bytes = 0) {
+  const value = Number(bytes || 0);
+  if (!Number.isFinite(value) || value <= 0) return "0 MB";
+  return `${(value / 1024 / 1024).toFixed(0)} MB`;
+}
+
+function renderDownloadCenter() {
+  if (!downloadCenter || !downloadCenterList || !downloadCenterCount) return;
+  const items = [...modelDownloadState.values()];
+  downloadCenterCount.textContent = String(items.length);
+  if (downloadCenterRestoreCount) downloadCenterRestoreCount.textContent = String(items.length);
+  if (!items.length) {
+    downloadCenter.classList.add("hidden");
+    if (downloadCenterRestore) downloadCenterRestore.classList.add("hidden");
+    downloadCenterCollapsed = false;
+  } else if (downloadCenterCollapsed) {
+    downloadCenter.classList.add("hidden");
+    if (downloadCenterRestore) downloadCenterRestore.classList.remove("hidden");
+  } else {
+    downloadCenter.classList.remove("hidden");
+    if (downloadCenterRestore) downloadCenterRestore.classList.add("hidden");
+  }
+  if (!items.length) {
+    downloadCenterList.innerHTML = `<div class="models-empty">Brak aktywnych pobrań.</div>`;
+    return;
+  }
+  downloadCenterList.innerHTML = items.map((entry) => {
+    const progress = Number(entry.progress || 0);
+    const downloaded = formatDownloadSize(entry.downloaded);
+    const total = Number(entry.total || 0) > 0 ? formatDownloadSize(entry.total) : "?? MB";
+    return `
+      <div class="download-center-item">
+        <div class="download-center-item-head">
+          <span class="download-center-model">${escapeHtml(entry.modelId)}</span>
+          <span class="download-center-state">${escapeHtml(entry.state)}</span>
+        </div>
+        <div class="download-progress-container">
+          <div class="download-progress-fill" style="width:${Math.max(0, Math.min(100, progress))}%"></div>
+        </div>
+        <div class="download-center-meta">${downloaded} / ${total}</div>
+        <button class="model-btn delete" data-download-cancel="${escapeAttr(entry.modelId)}">Anuluj</button>
+      </div>
+    `;
+  }).join("");
+}
+
+if (downloadCenterToggle) {
+  downloadCenterToggle.addEventListener("click", () => {
+    downloadCenterCollapsed = true;
+    renderDownloadCenter();
+  });
+}
+
+if (downloadCenterRestore) {
+  downloadCenterRestore.addEventListener("click", () => {
+    downloadCenterCollapsed = false;
+    renderDownloadCenter();
+  });
+}
 
 // ══════════════ APPROVAL MODAL ══════════════
 function openApproval(request, approvalId) {
@@ -1716,6 +1911,7 @@ newChatBtn.addEventListener("click", () => startNewChat());
 modelsBtn.addEventListener("click", async () => {
   modelsModal.classList.remove("hidden");
   await loadModels();
+  await loadApiProviders();
 });
 closeModels.addEventListener("click", () => modelsModal.classList.add("hidden"));
 
@@ -1734,6 +1930,63 @@ if (addHfModel) {
     } finally {
       addHfModel.disabled = false;
     }
+  });
+}
+
+if (modelsApiList) {
+  modelsApiList.addEventListener("change", async (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLInputElement) || target.dataset.role !== "toggle") return;
+    const card = target.closest(".api-provider-card");
+    const providerId = card?.dataset?.providerId;
+    if (!providerId) return;
+    try {
+      await window.endocode.updateApiProvider({ providerId, enabled: target.checked });
+      await loadApiProviders();
+      await loadModels();
+    } catch (error) {
+      addInlineEvent("error", "API", error.message || String(error));
+      await loadApiProviders();
+    }
+  });
+
+  modelsApiList.addEventListener("click", async (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) return;
+    const actionBtn = target.closest("button[data-role='refresh']");
+    if (!actionBtn) return;
+    const card = actionBtn.closest(".api-provider-card");
+    const providerId = card?.dataset?.providerId;
+    const keyInput = card?.querySelector("input[data-role='api-key']");
+    const apiKey = keyInput instanceof HTMLInputElement ? keyInput.value.trim() : "";
+    if (!providerId) return;
+    actionBtn.setAttribute("disabled", "disabled");
+    try {
+      if (apiKey) {
+        await window.endocode.updateApiProvider({ providerId, apiKey });
+      }
+      await window.endocode.refreshApiProviderModels(providerId);
+      await loadApiProviders();
+      await loadModels();
+      addInlineEvent("note", "API", `Odświeżono modele: ${API_PROVIDER_LABELS[providerId] || providerId}`);
+    } catch (error) {
+      addInlineEvent("error", "API", error.message || String(error));
+      await loadApiProviders();
+    } finally {
+      actionBtn.removeAttribute("disabled");
+    }
+  });
+}
+
+if (downloadCenterList) {
+  downloadCenterList.addEventListener("click", async (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) return;
+    const cancelBtn = target.closest("button[data-download-cancel]");
+    if (!cancelBtn) return;
+    const modelId = cancelBtn.getAttribute("data-download-cancel");
+    if (!modelId) return;
+    await window.cancelModelDownload(modelId);
   });
 }
 
@@ -1922,7 +2175,7 @@ if (promptQueueList) {
     else if (action === "down") movePromptInQueue(id, "down");
     else if (action === "edit") editPromptInQueue(id);
     else if (action === "delete") deletePromptFromQueue(id);
-    else if (action === "now") setPromptPriorityNow(id);
+    else if (action === "now") void setPromptPriorityNow(id);
   });
 }
 
@@ -1970,16 +2223,34 @@ if (quickChoicesDock) {
 
 composer.addEventListener("submit", async (event) => {
   event.preventDefault();
-  if (appBusy) {
-    try {
-      await window.endocode.abort();
-    } catch (e) {
-      addInlineEvent("error", "Stop", e.message || String(e));
+  const text = promptEl.value.trim();
+  const hasAttachment = Boolean(currentAttachmentFile);
+  if (!text && !hasAttachment) {
+    if (appBusy) {
+      try {
+        await window.endocode.abort();
+      } catch (e) {
+        addInlineEvent("error", "Stop", e.message || String(e));
+      }
     }
     return;
   }
-  const text = promptEl.value.trim();
-  if (!text && !currentAttachmentFile) return;
+  if (appBusy) {
+    // While model is running, Enter should queue next prompt instead of stopping.
+    const attachedFile = currentAttachmentFile ? { ...currentAttachmentFile } : null;
+    clearAttachment();
+    promptEl.value = "";
+    promptEl.style.height = "auto";
+    clearQuickChoicesDock();
+    const messagePreview = text || (attachedFile ? `[Załączono plik: ${attachedFile.name}]` : "Obraz");
+    if (!firstUserMessage) firstUserMessage = messagePreview;
+    addMessage("user", messagePreview, null);
+    chatTitle.textContent = messagePreview.length > 40 ? messagePreview.slice(0, 40) + "..." : messagePreview;
+    await saveChatSession(firstUserMessage);
+    addPromptToQueue({ text, attachment: attachedFile });
+    promptEl.focus();
+    return;
+  }
   promptEl.value = "";
   promptEl.style.height = "auto";
   clearQuickChoicesDock();
@@ -2042,8 +2313,6 @@ window.endocode.onEvent(async (event) => {
     } else if (event.status === "context-compacted") {
       showLive("Kontekst", event.detail || "");
       updateContextInfo();
-    } else if (event.status === "downloading") {
-      showLive("Pobieranie", event.detail || "");
     } else if (event.status === "runtime-install") {
       showLive("Instalacja runtime", event.detail || "");
     } else if (event.status === "runtime-install-complete") {
@@ -2052,7 +2321,11 @@ window.endocode.onEvent(async (event) => {
     else if (event.status === "server-killed") showLive("Kill switch", event.detail || "");
     else if (event.status === "server-starting" || event.status === "server-stopping") showLive("Runtime modelu", event.detail || "");
     else if (event.status === "download-complete") {
-      showLive("Pobieranie", event.detail || "Model pobrany pomyślnie.");
+      if (event.modelId) {
+        modelDownloadState.delete(event.modelId);
+        renderDownloadCenter();
+      }
+      hideLive();
       loadModels();
     }
     return;
@@ -2089,22 +2362,30 @@ window.endocode.onEvent(async (event) => {
     }
   }
   if (event.type === "model-download-progress") {
-    if (modelsModal?.classList?.contains("hidden")) return;
-    if (modelsStatus) {
-      const downloadedMb = (event.downloaded / 1024 / 1024).toFixed(0);
-      const totalMb = event.total > 0 ? ` / ${(event.total / 1024 / 1024).toFixed(0)} MB` : "";
-      const progress = event.total > 0 ? `${event.progress}%` : `${downloadedMb} MB`;
-      modelsStatus.textContent = `Pobieranie ${event.modelId}: ${progress} (${downloadedMb} MB${totalMb})`;
-    }
+    modelDownloadState.set(event.modelId, {
+      modelId: event.modelId,
+      state: "downloading",
+      progress: event.progress,
+      downloaded: event.downloaded,
+      total: event.total,
+    });
+    renderDownloadCenter();
     patchModelDownloadProgress(event.modelId, event.progress, event.downloaded, event.total);
     return;
   }
   if (event.type === "model-download-state") {
-    if (event.state === "failed" && modelsStatus) {
-      modelsStatus.textContent = `Błąd pobierania ${event.modelId}: ${event.error || "nieznany błąd"}`;
-    } else if (event.state === "completed" && modelsStatus) {
-      modelsStatus.textContent = `Pobrano model ${event.modelId}.`;
+    if (event.state === "queued" || event.state === "downloading") {
+      modelDownloadState.set(event.modelId, {
+        modelId: event.modelId,
+        state: event.state,
+        progress: event.progress || 0,
+        downloaded: event.downloaded || 0,
+        total: event.total || 0,
+      });
+    } else {
+      modelDownloadState.delete(event.modelId);
     }
+    renderDownloadCenter();
     await loadModels();
     return;
   }
@@ -2132,12 +2413,14 @@ window.endocode.onEvent(async (event) => {
     currentThinkingSegment = null;
     activeToolSegments.length = 0;
     lastAgentPhaseSignature = "";
+    agentPhaseHistoryLines = [];
     resetTurnActivity();
     removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
     removeInlineEventByActivityId(AGENT_PHASE_ACTIVITY_ID);
     removeInlineEventByActivityId(AGENT_NOTE_ACTIVITY_ID);
     const rawInput = String(event.text || "").trim();
     const shortInput = rawInput.length > 240 ? `${rawInput.slice(0, 240)}...` : rawInput;
+    upsertInlineEvent(AGENT_PHASE_ACTIVITY_ID, "activity", "Planowanie akcji", "Start planowania...");
     showLive("Planowanie...", shortInput || "Przygotowanie kontekstu i kolejnych kroków.");
     return;
   }
@@ -2146,7 +2429,6 @@ window.endocode.onEvent(async (event) => {
     activeToolSegments.length = 0;
     currentThinkingSegment = null;
     lastAgentPhaseSignature = "";
-    removeInlineEventByActivityId(AGENT_PHASE_ACTIVITY_ID);
     removeInlineEventByActivityId(AGENT_NOTE_ACTIVITY_ID);
     if (!finalReceivedInRun && hasStreamingAssistantContent()) {
       finalizeStreamingAssistantMessage("", { overwriteText: false });
@@ -2182,6 +2464,10 @@ window.endocode.onEvent(async (event) => {
     const signature = `${phase}|${detail}`;
     if (signature !== lastAgentPhaseSignature) {
       lastAgentPhaseSignature = signature;
+      const line = `${event.step ? `krok ${event.step}` : "krok"}: ${phaseLabel}${detail ? ` (${detail})` : ""}`;
+      agentPhaseHistoryLines.push(line);
+      if (agentPhaseHistoryLines.length > 40) agentPhaseHistoryLines = agentPhaseHistoryLines.slice(-40);
+      upsertInlineEvent(AGENT_PHASE_ACTIVITY_ID, "activity", "Planowanie akcji", agentPhaseHistoryLines.join("\n"));
       showLive(event.step ? `Krok ${event.step}: ${phaseLabel}` : phaseLabel, detail || "Przetwarzanie");
     }
     return;
@@ -2324,7 +2610,6 @@ async function init() {
   await loadChatHistory();
   await updateSystemMonitor();
   await updateContextInfo();
-  activeChatId = generateId();
 }
 
 init();
@@ -2576,45 +2861,48 @@ resetSettings.addEventListener("click", async () => {
 });
 // ── Tabs Switching ──
 const tabLibrary = document.getElementById("tabLibrary");
-const tabInstalled = document.getElementById("tabInstalled");
 const tabDiscover = document.getElementById("tabDiscover");
 const tabManual = document.getElementById("tabManual");
+const tabApi = document.getElementById("tabApi");
 const modelsLibraryView = document.getElementById("modelsLibraryView");
-const modelsInstalledView = document.getElementById("modelsInstalledView");
 const modelsDiscoverView = document.getElementById("modelsDiscoverView");
 const modelsManualView = document.getElementById("modelsManualView");
+const modelsApiView = document.getElementById("modelsApiView");
 const pickManualModelBtn = document.getElementById("pickManualModelBtn");
 const manualModelName = document.getElementById("manualModelName");
 const manualModelDescription = document.getElementById("manualModelDescription");
 const manualImportStatus = document.getElementById("manualImportStatus");
 
-if (tabLibrary && tabDiscover && tabInstalled && tabManual) {
+if (tabLibrary && tabDiscover && tabManual && tabApi) {
   const activateTab = (tabName) => {
     tabLibrary.classList.toggle("active", tabName === "library");
-    tabInstalled.classList.toggle("active", tabName === "installed");
     tabDiscover.classList.toggle("active", tabName === "discover");
     tabManual.classList.toggle("active", tabName === "manual");
+    tabApi.classList.toggle("active", tabName === "api");
     modelsLibraryView.classList.toggle("hidden", tabName !== "library");
-    modelsInstalledView.classList.toggle("hidden", tabName !== "installed");
     modelsDiscoverView.classList.toggle("hidden", tabName !== "discover");
     modelsManualView.classList.toggle("hidden", tabName !== "manual");
+    modelsApiView.classList.toggle("hidden", tabName !== "api");
     if (tabName === "discover") {
       ensureDiscoveryObserver();
       if (!discoveryAllResults.length && !discoveryLoading) void runDiscoverySearch({ resetResults: true });
     }
+    if (tabName === "api") {
+      void loadApiProviders();
+    }
   };
 
   tabLibrary.addEventListener("click", () => activateTab("library"));
-  tabInstalled.addEventListener("click", () => activateTab("installed"));
   tabDiscover.addEventListener("click", () => activateTab("discover"));
   tabManual.addEventListener("click", () => activateTab("manual"));
+  tabApi.addEventListener("click", () => activateTab("api"));
 }
 
 // ── Discovery Logic ──
 const discoveryList = document.getElementById("discoveryList");
 const hfSearchInput = document.getElementById("hfSearchInput");
 const hfSearchBtn = document.getElementById("hfSearchBtn");
-const modelSourceSelect = document.getElementById("modelSourceSelect");
+const hfSearchSuggestions = document.getElementById("hfSearchSuggestions");
 const discoveryStatus = document.getElementById("discoveryStatus");
 const discoverySentinel = document.getElementById("discoverySentinel");
 let currentFilter = "all";
@@ -2657,7 +2945,6 @@ function scheduleDiscoverySearch(delayMs = 220) {
 async function runDiscoverySearch(options = {}) {
   const resetResults = options.resetResults !== false;
   const query = hfSearchInput?.value?.trim() || "";
-  const source = modelSourceSelect?.value || "all";
   const requestId = ++discoveryRequestSeq;
   discoveryLoading = true;
   if (resetResults) {
@@ -2669,9 +2956,13 @@ async function runDiscoverySearch(options = {}) {
   if (hfSearchBtn) hfSearchBtn.disabled = true;
   try {
     const searchFn = window.endocode.searchModels || window.endocode.searchHfModels;
-    const results = await searchFn({ query, filter: currentFilter, source });
+    const results = await searchFn({ query, filter: currentFilter, source: "huggingface" });
     if (requestId !== discoveryRequestSeq) return;
     discoveryAllResults = Array.isArray(results) ? results : [];
+    if (hfSearchSuggestions) {
+      const suggestions = discoveryAllResults.map((item) => item.repoId || item.name || item.id).filter(Boolean).slice(0, 20);
+      hfSearchSuggestions.innerHTML = suggestions.map((value) => `<option value="${escapeAttr(value)}"></option>`).join("");
+    }
     discoveryRenderCount = 0;
     renderDiscoveryPage(true);
     setDiscoveryStatus(`Wyniki: ${discoveryAllResults.length}`);
@@ -2694,6 +2985,9 @@ function buildDiscoveryCard(model) {
   const fileLine = m.fileName
     ? `<span class="model-meta-item">Plik: <strong>${escapeHtml(m.fileName)}</strong>${m.expectedBytes ? ` (${escapeHtml((m.expectedBytes / 1024 / 1024 / 1024).toFixed(1))} GB)` : ""}</span>`
     : "";
+  const filesBlock = Array.isArray(m.files) && m.files.length
+    ? `<div class="discovery-files-list">${m.files.map((file) => `<div class="discovery-file-row"><span class="discovery-file-name" title="${escapeAttr(file.name)}">${escapeHtml(file.name)}</span><button class="model-btn use js-add-discovery-file" data-model-id="${escapeAttr(m.id)}" data-file-name="${escapeAttr(file.name)}">Pobierz</button></div>`).join("")}</div>`
+    : "";
   const actions = m.externalOnly
     ? `<button class="model-btn use js-open-model-source" data-url="${escapeAttr(m.openUrl)}">Otwórz stronę</button>`
     : `<button class="model-btn primary js-add-discovery" data-model-id="${escapeAttr(m.id)}" ${m.canDownload ? "" : "disabled"}>Dodaj i pobierz</button>
@@ -2713,6 +3007,7 @@ function buildDiscoveryCard(model) {
         <span class="model-meta-item">Autor: ${escapeHtml(m.author || "unknown")}</span>
         ${fileLine}
       </div>
+      ${filesBlock}
       <div class="model-actions">${actions}</div>
     </div>
   `;
@@ -2731,6 +3026,12 @@ function attachDiscoveryCardHandlers() {
         alert(e.message || String(e));
       }
     });
+  });
+  discoveryList.querySelectorAll(".js-add-discovery-file").forEach((btn) => {
+    btn.addEventListener("click", () => addAndDownloadFromFile(
+      btn.getAttribute("data-model-id"),
+      btn.getAttribute("data-file-name"),
+    ));
   });
 }
 
@@ -2780,12 +3081,6 @@ document.querySelectorAll(".filter-btn").forEach(btn => {
   });
 });
 
-if (modelSourceSelect) {
-  modelSourceSelect.addEventListener("change", () => {
-    void runDiscoverySearch({ resetResults: true });
-  });
-}
-
 if (pickManualModelBtn) {
   pickManualModelBtn.addEventListener("click", async () => {
     pickManualModelBtn.disabled = true;
@@ -2832,6 +3127,31 @@ window.addAndDownload = async (modelKey) => {
     if (added?.model?.id) window.endocode.downloadModel(added.model.id);
   } catch (e) {
     alert(e.message);
+    await runDiscoverySearch({ resetResults: true });
+  }
+};
+
+window.addAndDownloadFromFile = async (modelKey, fileName) => {
+  setDiscoveryLoading("Przygotowuję wybrany plik do pobrania...");
+  setDiscoveryStatus("Dodawanie modelu do biblioteki...");
+  try {
+    const model = lastDiscoveryResults.get(modelKey);
+    const files = Array.isArray(model?.files) ? model.files : [];
+    const selected = files.find((file) => file.name === fileName);
+    if (!model || !selected) throw new Error("Nie znaleziono wybranego pliku GGUF.");
+    const encodedFile = selected.name.split("/").map(encodeURIComponent).join("/");
+    const downloadUrl = `https://huggingface.co/${model.repoId}/resolve/main/${encodedFile}`;
+    const added = await window.endocode.addCustomModel({
+      url: downloadUrl,
+      displayName: `${model.name} (${selected.name.split("/").pop()})`,
+      description: model.description,
+      expectedBytes: selected.sizeBytes || 0,
+    });
+    if (tabLibrary) tabLibrary.click();
+    await loadModels();
+    if (added?.model?.id) window.endocode.downloadModel(added.model.id);
+  } catch (e) {
+    alert(e.message || String(e));
     await runDiscoverySearch({ resetResults: true });
   }
 };

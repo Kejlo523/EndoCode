@@ -261,12 +261,9 @@
         <aside class="models-sidebar">
           <div class="models-tabs models-tabs-vertical">
             <button class="model-tab-btn active" id="tabLibrary">Moja Biblioteka</button>
-            <button class="model-tab-btn" id="tabInstalled">Zainstalowane</button>
             <button class="model-tab-btn" id="tabDiscover">Odkrywaj</button>
             <button class="model-tab-btn" id="tabManual">Dodaj ręcznie</button>
-          </div>
-          <div class="models-status models-sidebar-hint">
-            W kartach modeli patrz na: <strong>Typ</strong>, <strong>Rozmiar</strong> i <strong>Kontekst</strong>.
+            <button class="model-tab-btn" id="tabApi">API</button>
           </div>
         </aside>
         <section class="models-main">
@@ -276,7 +273,7 @@
             <input type="text" id="hfModelUrl" placeholder="Wklej link .gguf z HF, ModelScope, GitHub lub direct..." />
             <button class="modal-btn approve" id="addHfModel">Dodaj</button>
           </div>
-          <span class="models-status" id="modelsStatus">Status: gotowe</span>
+          <span class="models-status" id="modelsLibraryStats">Modele: 0 • Rozmiar: 0 MB • Wolne: —</span>
         </div>
         <div class="models-list" id="modelsList">
           <div class="models-empty">Ładowanie katalogu...</div>
@@ -286,13 +283,8 @@
       <div id="modelsDiscoverView" class="hidden">
         <div class="models-toolbar">
           <div class="models-import-group">
-            <select id="modelSourceSelect" class="models-source-select">
-              <option value="all">Wszystkie źródła</option>
-              <option value="huggingface">Hugging Face</option>
-              <option value="modelscope">ModelScope</option>
-              <option value="github">GitHub / direct</option>
-            </select>
-            <input type="text" id="hfSearchInput" placeholder="Szukaj modeli albo wklej link/repo .gguf..." />
+            <input type="text" id="hfSearchInput" list="hfSearchSuggestions" placeholder="Szukaj modeli GGUF na Hugging Face lub wpisz repo owner/model..." />
+            <datalist id="hfSearchSuggestions"></datalist>
             <button class="modal-btn" id="hfSearchBtn">Odśwież</button>
           </div>
           <div class="models-filters">
@@ -308,14 +300,6 @@
         <div class="discovery-footer" id="discoveryFooter">
           <span class="models-status" id="discoveryStatus">Gotowe</span>
           <div id="discoverySentinel" class="discovery-sentinel" aria-hidden="true"></div>
-        </div>
-      </div>
-      <div id="modelsInstalledView" class="hidden">
-        <div class="models-toolbar">
-          <span class="models-status">Tylko modele lokalne z istniejącym plikiem GGUF.</span>
-        </div>
-        <div class="models-list" id="modelsInstalledList">
-          <div class="models-empty">Ładowanie zainstalowanych modeli...</div>
         </div>
       </div>
       <div id="modelsManualView" class="hidden">
@@ -340,10 +324,37 @@
           </div>
         </div>
       </div>
+      <div id="modelsApiView" class="hidden">
+        <div class="models-api-panel">
+          <div class="models-manual-head">
+            <strong>Dostawcy API modeli</strong>
+            <span>Domyślnie wszyscy są wyłączeni. Włącz provider, podaj klucz API i pobierz listę modeli.</span>
+          </div>
+          <div class="models-api-list" id="modelsApiList">
+            <div class="models-empty">Ładowanie ustawień API...</div>
+          </div>
+        </div>
+      </div>
       </section>
       </div>
     </div>
   </div>
+
+  <aside class="download-center hidden" id="downloadCenter">
+    <div class="download-center-head">
+      <strong>Pobieranie modeli</strong>
+      <div class="download-center-head-actions">
+        <span id="downloadCenterCount">0</span>
+        <button type="button" class="download-center-toggle" id="downloadCenterToggle" title="Zwiń pobieranie">−</button>
+      </div>
+    </div>
+    <div class="download-center-list" id="downloadCenterList">
+      <div class="models-empty">Brak aktywnych pobrań.</div>
+    </div>
+  </aside>
+  <button type="button" class="download-center-restore hidden" id="downloadCenterRestore" title="Pokaż pobieranie modeli">
+    Pobieranie modeli (<span id="downloadCenterRestoreCount">0</span>)
+  </button>
 
 
   <!-- ── SETTINGS MODAL ── -->

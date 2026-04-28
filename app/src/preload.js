@@ -27,12 +27,17 @@ contextBridge.exposeInMainWorld("endocode", {
   getModelRawConfig: (modelId) => ipcRenderer.invoke("app:get-model-raw-config", modelId),
   setModelRawConfig: (payload) => ipcRenderer.invoke("app:set-model-raw-config", payload),
   listModels: () => ipcRenderer.invoke("app:list-models"),
+  getModelLibraryStats: () => ipcRenderer.invoke("app:model-library-stats"),
   downloadModel: (modelId) => ipcRenderer.invoke("app:download-model", modelId),
+  cancelModelDownload: (modelId) => ipcRenderer.invoke("app:cancel-model-download", modelId),
   deleteModel: (modelId) => ipcRenderer.invoke("app:delete-model", modelId),
   addCustomModel: (urlOrPath) => ipcRenderer.invoke("app:add-custom-model", urlOrPath),
   importLocalModel: (payload) => ipcRenderer.invoke("app:import-local-model", payload),
   searchModels: (options) => ipcRenderer.invoke("app:search-models", options),
   searchHfModels: (options) => ipcRenderer.invoke("app:search-hf-models", options),
+  getApiProviders: () => ipcRenderer.invoke("app:get-api-providers"),
+  updateApiProvider: (payload) => ipcRenderer.invoke("app:update-api-provider", payload),
+  refreshApiProviderModels: (providerId) => ipcRenderer.invoke("app:refresh-api-provider-models", providerId),
   openExternal: (url) => ipcRenderer.invoke("app:open-external", url),
   onEvent: (callback) => {
     const listener = (_event, payload) => callback(payload);

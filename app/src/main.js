@@ -219,7 +219,7 @@ DOSTEPNE NARZEDZIA:
 ${TOOLS_PROMPT_BLOCK}
 
 PODSTAWOWY LOOP:
-1. Zrozum zadanie i sprawdz obecny folder.
+1. Zrozum zadanie i sprawdz obecny folder. Jesli wejdziesz do podfolderu (cd), pracuj dalej w nim dopoki zadanie nie wymaga innego miejsca.
 2. Przed edycja istniejacego pliku przeczytaj istotny fragment.
 3. Zmieniaj najmniejszy sensowny fragment. Nie przepisuj calego pliku dla drobnej poprawki.
 4. Po bledzie przeczytaj dokladna tresc bledu, popraw przyczyne i sprobuj ponownie.
@@ -235,7 +235,7 @@ ZASADY EDYCJI:
 - Append stosuj do celowych dopisek albo dzielenia duzego pliku na fragmenty.
 - Pelny overwrite istniejacego pliku tylko gdy plik jest generowany, bardzo maly, albo uzytkownik wyraznie chce przepisania.
 - SyntaxError/build error: nie panikuj. Odczytaj plik i linie z bledu, popraw minimalny region, rerun tego samego checka.
-- Jesli zapis sie nie uda, wyjasnij sobie powod z bledu: brak folderu -> mkdir; za dlugi content -> mniejsze chunki; odmowa -> alternatywa w workspace.
+- Jesli zapis sie nie uda, wyjasnij sobie powod z bledu: brak folderu -> mkdir (tylko gdy realnie brakuje), za dlugi content -> mniejsze chunki; odmowa -> alternatywa w workspace.
 
 ZASADY NARZEDZI I SIECI:
 - Nie zgaduj URL-i. Przy 404/403 wroc do strony glownej, dokumentacji, API albo uzyj extract_media.
@@ -328,6 +328,16 @@ const DEFAULT_MODEL_SETTINGS = {
   extraServerArgs: null,
 };
 let customModelSettingsByModelId = {};
+const API_PROVIDER_DEFAULTS = {
+  openai: { id: "openai", label: "OpenAI", baseUrl: "https://api.openai.com/v1" },
+  claude: { id: "claude", label: "Claude", baseUrl: "https://api.anthropic.com/v1" },
+  openrouter: { id: "openrouter", label: "OpenRouter", baseUrl: "https://openrouter.ai/api/v1" },
+};
+let apiProviders = {
+  openai: { enabled: false, apiKey: "", models: [], lastError: "", updatedAt: "" },
+  claude: { enabled: false, apiKey: "", models: [], lastError: "", updatedAt: "" },
+  openrouter: { enabled: false, apiKey: "", models: [], lastError: "", updatedAt: "" },
+};
 const chatWebLookupCache = new Map();
 const runtimeRecoveryStateByModelId = new Map();
 const debugLogState = {
@@ -827,11 +837,6 @@ function loadModelCatalog() {
   };
   const catalog = readJsonFile(path.join(ENDOCODE_HOME, "config", "models.json"), fallback);
   if (!Array.isArray(catalog.models)) catalog.models = [];
-  for (const preset of loadModelPresets()) {
-    if (!catalog.models.some((model) => model.id === preset.id)) {
-      catalog.models.push(createPresetModelConfig(preset));
-    }
-  }
   // Filter out Claude Opus (API only) as requested
   catalog.models = catalog.models.filter(m => m.id !== "claude-opus-4-5-api");
   modelCatalogCache = catalog;
@@ -963,7 +968,7 @@ function createPresetModelConfig(preset) {
 function saveModelCatalog(catalog) {
   writeJsonFile(path.join(ENDOCODE_HOME, "config", "models.json"), {
     ...catalog,
-    models: (catalog.models || []).filter((model) => !model.preset),
+    models: catalog.models || [],
   });
   modelCatalogCache = null;
   modelCatalogCacheAt = 0;
@@ -1036,8 +1041,78 @@ function saveAppSettings() {
     agentRuntime,
     accessLevel,
     customModelSettingsByModelId,
+    apiProviders,
     workspaceRoot,
   });
+}
+
+function normalizeApiProviders(raw = {}) {
+  const next = {};
+  for (const providerId of Object.keys(API_PROVIDER_DEFAULTS)) {
+    const current = raw?.[providerId] || {};
+    const models = Array.isArray(current.models)
+      ? current.models.filter((entry) => entry && typeof entry === "object" && entry.id)
+      : [];
+    next[providerId] = {
+      enabled: Boolean(current.enabled),
+      apiKey: String(current.apiKey || ""),
+      models,
+      lastError: String(current.lastError || ""),
+      updatedAt: String(current.updatedAt || ""),
+    };
+  }
+  return next;
+}
+
+function getApiProvidersForUi() {
+  return Object.entries(API_PROVIDER_DEFAULTS).map(([providerId, meta]) => {
+    const state = apiProviders[providerId] || {};
+    return {
+      id: providerId,
+      label: meta.label,
+      enabled: Boolean(state.enabled),
+      hasKey: Boolean(String(state.apiKey || "").trim()),
+      modelsCount: Array.isArray(state.models) ? state.models.length : 0,
+      lastError: String(state.lastError || ""),
+      updatedAt: String(state.updatedAt || ""),
+    };
+  });
+}
+
+function buildApiModelsForUi() {
+  const result = [];
+  for (const [providerId, meta] of Object.entries(API_PROVIDER_DEFAULTS)) {
+    const state = apiProviders[providerId];
+    if (!state?.enabled || !String(state.apiKey || "").trim()) continue;
+    for (const model of Array.isArray(state.models) ? state.models : []) {
+      if (!model?.id) continue;
+      const modelId = `api:${providerId}:${model.id}`;
+      result.push({
+        id: modelId,
+        providerId,
+        displayName: model.name || model.id,
+        kind: "cloud-api",
+        serverModel: model.id,
+        source: meta.label,
+        sourceType: providerId,
+        contextTokens: Number(model.contextTokens || 0) || null,
+        description: model.description || `${meta.label} API`,
+        enabled: true,
+      });
+    }
+  }
+  return result;
+}
+
+function findModelById(modelId) {
+  const localModel = loadModelCatalog().models.find((entry) => entry.id === modelId);
+  if (localModel) return localModel;
+  return buildApiModelsForUi().find((entry) => entry.id === modelId) || null;
+}
+
+function isCloudModelSelected() {
+  const model = getModelConfig();
+  return model?.kind === "cloud-api";
 }
 
 function getChatHistoryPath() {
@@ -2411,7 +2486,7 @@ let selectedReasoning = REASONING_LEVELS[initialSettings.reasoningLevel] ? initi
 
 function getModelConfig() {
   const catalog = loadModelCatalog();
-  return catalog.models.find((model) => model.id === selectedModelId) ||
+  return findModelById(selectedModelId) ||
     catalog.models.find((model) => model.id === catalog.defaultModelId) ||
     catalog.models[0];
 }
@@ -2446,10 +2521,12 @@ function getRecommendedSettingsForModelId(modelId = selectedModelId) {
   const runtime = createRuntimeModelConfig(model);
   const tokenLimits = getTokenRuntimeLimits();
   const recommended = {
-    contextTokens: clampContextTokens(runtime.contextTokens ?? model?.contextTokens ?? 8192, tokenLimits),
+    temperature: 1.0,
+    maxSteps: 0,
+    contextTokens: clampContextTokens(8196, tokenLimits),
     gpuLayers: clampRuntimeNumber(runtime.gpuLayers ?? model?.gpuLayers ?? 99, 0, 99),
-    maxTokens: clampResponseTokens(model?.maxTokens ?? 1300, tokenLimits),
-    maxMessages: clampMaxMessages(model?.maxMessages ?? 32, tokenLimits),
+    maxTokens: clampResponseTokens(4096, tokenLimits),
+    maxMessages: clampMaxMessages(100, tokenLimits),
     threads: clampRuntimeNumber(runtime.threads, SAFE_RUNTIME_LIMITS.threadsMin, SAFE_RUNTIME_LIMITS.threadsMax),
     threadsBatch: clampRuntimeNumber(runtime.threadsBatch, SAFE_RUNTIME_LIMITS.threadsBatchMin, SAFE_RUNTIME_LIMITS.threadsBatchMax),
     batchSize: clampRuntimeNumber(runtime.batchSize, SAFE_RUNTIME_LIMITS.batchMin, SAFE_RUNTIME_LIMITS.batchMax),
@@ -2547,7 +2624,7 @@ function createInitialMessages() {
 
 function getModelsForUi() {
   const catalog = loadModelCatalog();
-  return catalog.models.map((model) => {
+  const localModels = catalog.models.map((model) => {
     const modelPath = model.file ? path.resolve(ENDOCODE_HOME, model.file) : null;
     const fileStatus = getModelFileStatus(model);
     const available = model.kind === "local-gguf" ? fileStatus.available : Boolean(model.enabled);
@@ -2559,6 +2636,39 @@ function getModelsForUi() {
       selected: model.id === selectedModelId,
     };
   });
+  const apiModels = buildApiModelsForUi().map((model) => ({
+    ...model,
+    fileStatus: { available: true, size: 0, expectedBytes: 0, progress: 1, state: "completed", downloaded: 0, total: 0 },
+    available: true,
+    selected: model.id === selectedModelId,
+  }));
+  return [...localModels, ...apiModels];
+}
+
+function getModelLibraryStats() {
+  const models = getModelsForUi().filter((model) => model.kind === "local-gguf" && model.fileStatus?.available);
+  const installedCount = models.length;
+  const installedBytes = models.reduce((sum, model) => sum + Number(model.fileStatus?.size || 0), 0);
+  let diskFreeBytes = null;
+  let diskTotalBytes = null;
+  try {
+    const stat = fs.statfsSync(ENDOCODE_HOME);
+    const bsize = Number(stat.bsize || 0);
+    const bavail = Number(stat.bavail || 0);
+    const blocks = Number(stat.blocks || 0);
+    if (bsize > 0) {
+      diskFreeBytes = Math.max(0, Math.round(bavail * bsize));
+      diskTotalBytes = Math.max(0, Math.round(blocks * bsize));
+    }
+  } catch {
+    // Optional metric on platforms without statfs support.
+  }
+  return {
+    installedCount,
+    installedBytes,
+    diskFreeBytes,
+    diskTotalBytes,
+  };
 }
 
 function getModelFileStatus(model) {
@@ -3180,6 +3290,95 @@ async function killModelServerResources() {
   return { aborted: hadRun, ownedPid, killedPids, port: DEFAULT_PORT, alive };
 }
 
+function splitSystemAndMessages(messages = []) {
+  const systemChunks = [];
+  const rest = [];
+  for (const message of messages) {
+    if (message?.role === "system") systemChunks.push(String(message.content || ""));
+    else rest.push(message);
+  }
+  return {
+    system: systemChunks.join("\n\n").trim(),
+    messages: rest,
+  };
+}
+
+async function callCloudModel(model, messages, abortGuard, modelSettings, step, plainChat, silent) {
+  const provider = model.providerId;
+  const providerState = apiProviders[provider];
+  const apiKey = String(providerState?.apiKey || "").trim();
+  if (!apiKey) throw new Error(`Brak klucza API dla ${API_PROVIDER_DEFAULTS[provider]?.label || provider}.`);
+  const temp = modelSettings.temperature ?? getReasoningProfile().temperature;
+  const maxTok = modelSettings.maxTokens ?? getReasoningProfile().maxTokens;
+  const converted = buildModelMessages(messages);
+  let content = "";
+
+  if (provider === "claude") {
+    const normalized = splitSystemAndMessages(converted);
+    const response = await fetch(`${API_PROVIDER_DEFAULTS.claude.baseUrl}/messages`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: model.serverModel,
+        system: normalized.system || undefined,
+        messages: normalized.messages.map((entry) => ({
+          role: entry.role === "assistant" ? "assistant" : "user",
+          content: [{ type: "text", text: String(entry.content || "") }],
+        })),
+        max_tokens: maxTok,
+        temperature: temp,
+      }),
+      signal: abortGuard.signal,
+    });
+    abortGuard.reset();
+    if (!response.ok) {
+      const details = await response.text();
+      throw new Error(`Claude API ${response.status}: ${details}`);
+    }
+    const json = await response.json();
+    content = (json.content || [])
+      .filter((part) => part?.type === "text")
+      .map((part) => part.text)
+      .join("");
+  } else {
+    const baseUrl = API_PROVIDER_DEFAULTS[provider]?.baseUrl;
+    const headers = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    };
+    if (provider === "openrouter") {
+      headers["HTTP-Referer"] = "https://endocode.local";
+      headers["X-Title"] = "EndoCode";
+    }
+    const response = await fetch(`${baseUrl}/chat/completions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: model.serverModel,
+        messages: converted,
+        max_tokens: maxTok,
+        temperature: temp,
+        stream: false,
+      }),
+      signal: abortGuard.signal,
+    });
+    abortGuard.reset();
+    if (!response.ok) {
+      const details = await response.text();
+      throw new Error(`${API_PROVIDER_DEFAULTS[provider]?.label || "API"} ${response.status}: ${details}`);
+    }
+    const json = await response.json();
+    content = String(json.choices?.[0]?.message?.content || "");
+  }
+
+  if (!silent && content) emit("content-delta", { text: content, full: content, plainChat, step });
+  return { content, reasoning: "" };
+}
+
 async function callModel(messages, abortSignal, options = {}, step = null) {
   const plainChat = options.plainChat === true;
   const silent = options.silent === true;
@@ -3201,6 +3400,10 @@ async function callModel(messages, abortSignal, options = {}, step = null) {
   if (modelSettings.topK != null) body.top_k = modelSettings.topK;
   if (modelSettings.repeatPenalty != null) body.repeat_penalty = modelSettings.repeatPenalty;
 
+  if (model?.kind === "cloud-api") {
+    return callCloudModel(model, messages, abortGuard, modelSettings, step, plainChat, silent);
+  }
+
   try {
     const res = await fetch(`http://127.0.0.1:${DEFAULT_PORT}/v1/chat/completions`, {
       method: "POST",
@@ -3215,7 +3418,7 @@ async function callModel(messages, abortSignal, options = {}, step = null) {
         const available = text.match(/available context size \((\d+)\s*tokens\)/i);
         if (available?.[1]) runtimeAvailableContextTokens = Number(available[1]);
       }
-      throw new Error(`Model API ${res.status}: ${text.slice(0, 600)}`);
+      throw new Error(`Model API ${res.status}: ${text}`);
     }
 
     let fullContent = "";
@@ -3487,6 +3690,37 @@ function parsePartialActionFromRaw(raw) {
       if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
     } catch {
       // best-effort parser
+    }
+  }
+  return null;
+}
+
+function attemptJsonHotfix(raw) {
+  const text = sanitizeJsonCandidateText(raw);
+  if (!text) return null;
+  const firstBrace = text.indexOf("{");
+  if (firstBrace < 0) return null;
+  const tail = text.slice(firstBrace).trim();
+  const smartQuoteFixed = tail
+    .replace(/[“”]/g, "\"")
+    .replace(/[‘’]/g, "'");
+  const trimmedToLastBrace = smartQuoteFixed.includes("}")
+    ? smartQuoteFixed.slice(0, smartQuoteFixed.lastIndexOf("}") + 1)
+    : smartQuoteFixed;
+  const trailingCommaFixed = trimmedToLastBrace.replace(/,\s*([}\]])/g, "$1");
+  const candidates = [
+    trailingCommaFixed,
+    autoCloseJsonObject(trailingCommaFixed),
+    autoCloseJsonObject(smartQuoteFixed.replace(/,\s*([}\]])/g, "$1")),
+  ];
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed;
+      }
+    } catch {
+      // deterministic hotfix pass failed
     }
   }
   return null;
@@ -4069,6 +4303,21 @@ async function getNextActionWithRepair(abortSignal, failedModelIds, step = null)
           return { action: partialValidation.action, reasoning: actionRawReasoning };
         }
       }
+      const hotfix = attemptJsonHotfix(raw);
+      if (hotfix) {
+        const hotfixValidation = validateAction(hotfix, {
+          intentClass: currentAgentIntentClass,
+        });
+        if (hotfixValidation.ok) {
+          bumpAgentRecoveryMetric("partialJsonRecoveries");
+          emit("status", {
+            status: "action-json-hotfix-recover",
+            detail: "Naprawiono składnię JSON deterministycznym hotfixem.",
+            step,
+          });
+          return { action: hotfixValidation.action, reasoning: actionRawReasoning };
+        }
+      }
       if (attempt >= retryLimit) break;
       const guidance = makeJsonRepairPrompt(error, raw, { step, attempt, retryLimit });
       if (agentCore?.memory) {
@@ -4115,7 +4364,20 @@ async function getNextActionWithRepair(abortSignal, failedModelIds, step = null)
     }
     return { action: validated.action, reasoning: actionRawReasoning };
   }
-  throw new Error(`Model zwrocil niepoprawny format akcji po ${retryLimit + 1} probach: ${lastError?.message || String(lastRaw || "nieznany blad")}`);
+  const rawPreview = textPreview(lastRaw || "", 500);
+  const reason = lastError?.message || "nieznany blad";
+  emit("status", {
+    status: "action-guardrail-fallback",
+    detail: `Aktywuje guardrail po ${retryLimit + 1} probach (bez petli). Koncze odpowiedzia final.`,
+    step,
+  });
+  return {
+    action: {
+      note: "Guardrail: fallback po nieudanych probach naprawy formatu akcji.",
+      final: `Nie udalo sie bezpiecznie wygenerowac poprawnej akcji JSON po ${retryLimit + 1} probach.\nPowod: ${reason}\n\nPodglad ostatniej odpowiedzi modelu:\n${rawPreview || "(pusto)"}\n\nSprobuj uproscic polecenie albo uruchomic jeszcze raz.`,
+    },
+    reasoning: actionRawReasoning,
+  };
 }
 
 
@@ -4403,7 +4665,7 @@ function classifyShellApproval(command = "", policyWarnings = []) {
   return { requiresApproval: true, reason: "uncertain-command" };
 }
 
-async function runPowerShell(command, timeoutSeconds) {
+async function runPowerShell(command, timeoutSeconds, commandCwd = cwd) {
   const policyWarnings = getShellPolicyWarnings(command);
   const approvalPolicy = classifyShellApproval(command, policyWarnings);
   if (approvalPolicy.requiresApproval) {
@@ -4414,7 +4676,7 @@ async function runPowerShell(command, timeoutSeconds) {
       title: policyWarnings.length
         ? "Model prosi o uruchomienie komendy (ostrzezenia sandbox)"
         : "Model prosi o uruchomienie komendy",
-      cwd: relativeToRoot(cwd),
+      cwd: relativeToRoot(commandCwd),
       command: commandForApproval,
     });
     if (!approved) throw new Error("Uzytkownik odrzucil komende.");
@@ -4423,7 +4685,10 @@ async function runPowerShell(command, timeoutSeconds) {
   }
 
   if (shouldRunShellInBackground(command)) {
+    const prevCwd = cwd;
+    cwd = commandCwd;
     const result = runBackgroundShell(command);
+    cwd = prevCwd;
     emit("status", { status: "shell-background-started", detail: `Uruchomiono w tle: ${command}` });
     return result;
   }
@@ -4431,7 +4696,7 @@ async function runPowerShell(command, timeoutSeconds) {
   return new Promise((resolve) => {
     const timeout = Math.max(1, Math.min(Number(timeoutSeconds) || 60, 300)) * 1000;
     const child = spawn(command, {
-      cwd,
+      cwd: commandCwd,
       shell: true,
       env: {
         ...process.env,
@@ -4459,7 +4724,7 @@ async function runPowerShell(command, timeoutSeconds) {
     child.on("error", (err) => {
       stderr += `\n[spawn-error] ${err?.message || String(err)}`;
       finalize({
-        cwd: relativeToRoot(cwd),
+        cwd: relativeToRoot(commandCwd),
         exitCode: 1,
         stdout: textPreview(stdout),
         stderr: textPreview(stderr),
@@ -4467,7 +4732,7 @@ async function runPowerShell(command, timeoutSeconds) {
     });
     child.on("close", (code) => {
       finalize({
-        cwd: relativeToRoot(cwd),
+        cwd: relativeToRoot(commandCwd),
         exitCode: code,
         stdout: textPreview(stdout),
         stderr: textPreview(stderr),
@@ -4914,7 +5179,8 @@ async function executeTool(action) {
     }
     result = { appliedCount: applied.length, applied };
   } else if (tool === "run_powershell") {
-    result = await runPowerShell(String(args.command ?? ""), args.timeout);
+    const shellCwd = args?.cwd ? normalizeInsideRoot(String(args.cwd)) : cwd;
+    result = await runPowerShell(String(args.command ?? ""), args.timeout, shellCwd);
     const blob = `${result.stderr || ""}\n${result.stdout || ""}`;
     if (
       result.exitCode !== 0 &&
@@ -5229,7 +5495,7 @@ function formatChatFacingError(error, options = {}) {
   const mode = options.mode === "agent" ? "agent" : "chat";
   const modelName = options.modelName || getModelConfig()?.displayName || "model";
   const raw = String(error?.message || error || "").trim();
-  const detail = textPreview(raw, 180);
+  const detail = raw;
   if (!raw) {
     return mode === "agent"
       ? "Zadanie zatrzymane: wystapil nieznany blad runtime."
@@ -5331,7 +5597,7 @@ async function runAgent(userText) {
   try {
     resetAgentRecoveryMetrics();
     await validateCurrentWorkspaceRoot();
-    await ensureServer(DEFAULT_PORT);
+    if (!isCloudModelSelected()) await ensureServer(DEFAULT_PORT);
     const core = getAgentCore();
 
     let content;
@@ -5449,7 +5715,7 @@ async function runSimpleChat(userText) {
   const signal = runAbortController.signal;
   try {
     await validateCurrentWorkspaceRoot();
-    await ensureServer(DEFAULT_PORT);
+    if (!isCloudModelSelected()) await ensureServer(DEFAULT_PORT);
     const chatPayload = typeof userText === "object" && userText !== null
       ? userText
       : { text: userText };
@@ -5694,6 +5960,9 @@ app.whenReady().then(async () => {
   if (settings.customModelSettingsByModelId && typeof settings.customModelSettingsByModelId === "object") {
     customModelSettingsByModelId = { ...settings.customModelSettingsByModelId };
   }
+  if (settings.apiProviders && typeof settings.apiProviders === "object") {
+    apiProviders = normalizeApiProviders(settings.apiProviders);
+  }
   // Legacy migration: global customModelSettings + maxMessages -> selectedModelId entry.
   if (settings.customModelSettings && typeof settings.customModelSettings === "object") {
     const targetModelId = selectedModelId || loadModelCatalog().defaultModelId;
@@ -5719,19 +5988,7 @@ app.whenReady().then(async () => {
     if (model.kind !== "local-gguf") continue;
     if (!getModelFileStatus(model).available) continue;
     if (customModelSettingsByModelId[model.id]) continue;
-    setModelSettingsForId(model.id, {
-      maxMessages: clampMaxMessages(model.maxMessages ?? 32),
-      contextTokens: clampContextTokens(model.contextTokens ?? 8192),
-      gpuLayers: Number.isFinite(Number(model.gpuLayers)) ? Number(model.gpuLayers) : null,
-      threads: Number.isFinite(Number(model.threads)) ? Number(model.threads) : null,
-      threadsBatch: Number.isFinite(Number(model.threadsBatch)) ? Number(model.threadsBatch) : null,
-      batchSize: Number.isFinite(Number(model.batchSize)) ? Number(model.batchSize) : null,
-      ubatchSize: Number.isFinite(Number(model.ubatchSize)) ? Number(model.ubatchSize) : null,
-      parallel: Number.isFinite(Number(model.parallel)) ? Number(model.parallel) : null,
-      flashAttention: model.flashAttention ?? "on",
-      cacheTypeK: model.cacheTypeK ?? "q8_0",
-      cacheTypeV: model.cacheTypeV ?? "q8_0",
-    });
+    setModelSettingsForId(model.id, getRecommendedSettingsForModelId(model.id));
   }
   if (workspaceResult.workspaceFallback?.used) saveAppSettings();
   createWindow();
@@ -5769,25 +6026,13 @@ ipcMain.handle("app:reset-chat", () => {
   emit("status", { status: "chat-reset", detail: "Wyczyszczono kontekst rozmowy." });
 });
 ipcMain.handle("app:set-model", async (_event, modelId) => {
-  const model = loadModelCatalog().models.find((candidate) => candidate.id === modelId);
+  const model = findModelById(modelId);
   if (!model) throw new Error(`Nieznany model: ${modelId}`);
-  if (model.kind !== "local-gguf") throw new Error(`${model.displayName} nie jest lokalnym modelem GGUF.`);
+  if (model.kind === "cloud-api" && !model.enabled) throw new Error(`${model.displayName} jest wyłączony.`);
   selectedModelId = modelId;
   resetRuntimeRecoveryState(modelId);
   if (!customModelSettingsByModelId[modelId]) {
-    setModelSettingsForId(modelId, {
-      maxMessages: clampMaxMessages(model.maxMessages ?? 32),
-      contextTokens: clampContextTokens(model.contextTokens ?? 8192),
-      gpuLayers: Number.isFinite(Number(model.gpuLayers)) ? Number(model.gpuLayers) : null,
-      threads: Number.isFinite(Number(model.threads)) ? Number(model.threads) : null,
-      threadsBatch: Number.isFinite(Number(model.threadsBatch)) ? Number(model.threadsBatch) : null,
-      batchSize: Number.isFinite(Number(model.batchSize)) ? Number(model.batchSize) : null,
-      ubatchSize: Number.isFinite(Number(model.ubatchSize)) ? Number(model.ubatchSize) : null,
-      parallel: Number.isFinite(Number(model.parallel)) ? Number(model.parallel) : null,
-      flashAttention: model.flashAttention ?? "on",
-      cacheTypeK: model.cacheTypeK ?? "q8_0",
-      cacheTypeV: model.cacheTypeV ?? "q8_0",
-    });
+    setModelSettingsForId(modelId, getRecommendedSettingsForModelId(modelId));
   }
   saveAppSettings();
   if (serverOwned) await stopOwnedServer();
@@ -5874,6 +6119,95 @@ ipcMain.handle("app:delete-chat", (_event, chatId) => {
   saveChatHistory();
   return chatHistory;
 });
+
+async function fetchProviderModels(providerId) {
+  const provider = API_PROVIDER_DEFAULTS[providerId];
+  if (!provider) throw new Error(`Nieznany provider: ${providerId}`);
+  const state = apiProviders[providerId];
+  const apiKey = String(state?.apiKey || "").trim();
+  if (!apiKey) throw new Error(`Brak klucza API dla ${provider.label}.`);
+
+  if (providerId === "claude") {
+    const response = await fetch(`${provider.baseUrl}/models`, {
+      headers: {
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+    });
+    if (!response.ok) {
+      const details = await response.text();
+      throw new Error(`Claude API ${response.status}: ${details}`);
+    }
+    const json = await response.json();
+    return (json.data || []).map((item) => ({
+      id: item.id,
+      name: item.display_name || item.id,
+      description: "Model Anthropic Claude",
+      contextTokens: Number(item.context_window || 0) || null,
+    }));
+  }
+
+  const headers = { Authorization: `Bearer ${apiKey}` };
+  if (providerId === "openrouter") {
+    headers["HTTP-Referer"] = "https://endocode.local";
+    headers["X-Title"] = "EndoCode";
+  }
+  const response = await fetch(`${provider.baseUrl}/models`, { headers });
+  if (!response.ok) {
+    const details = await response.text();
+    throw new Error(`${provider.label} API ${response.status}: ${details}`);
+  }
+  const json = await response.json();
+  return (json.data || []).map((item) => ({
+    id: item.id,
+    name: item.name || item.id,
+    description: item.description || `${provider.label} API`,
+    contextTokens: Number(item.context_length || item.context_window || item.max_context_length || 0) || null,
+  }));
+}
+
+ipcMain.handle("app:get-api-providers", () => getApiProvidersForUi());
+ipcMain.handle("app:update-api-provider", async (_event, payload) => {
+  const providerId = String(payload?.providerId || "");
+  if (!API_PROVIDER_DEFAULTS[providerId]) throw new Error("Nieznany provider API.");
+  const current = apiProviders[providerId] || {};
+  apiProviders[providerId] = {
+    ...current,
+    enabled: payload?.enabled == null ? Boolean(current.enabled) : Boolean(payload.enabled),
+    apiKey: payload?.apiKey == null ? String(current.apiKey || "") : String(payload.apiKey || "").trim(),
+    lastError: "",
+    updatedAt: new Date().toISOString(),
+  };
+  saveAppSettings();
+  return getApiProvidersForUi();
+});
+ipcMain.handle("app:refresh-api-provider-models", async (_event, providerIdRaw) => {
+  const providerId = String(providerIdRaw || "");
+  if (!API_PROVIDER_DEFAULTS[providerId]) throw new Error("Nieznany provider API.");
+  const state = apiProviders[providerId];
+  if (!state?.enabled) throw new Error("Provider jest wyłączony.");
+  try {
+    const models = await fetchProviderModels(providerId);
+    apiProviders[providerId] = {
+      ...state,
+      models,
+      lastError: "",
+      updatedAt: new Date().toISOString(),
+    };
+  } catch (error) {
+    apiProviders[providerId] = {
+      ...state,
+      models: [],
+      lastError: error.message || String(error),
+      updatedAt: new Date().toISOString(),
+    };
+    saveAppSettings();
+    throw error;
+  }
+  saveAppSettings();
+  return { ok: true, count: apiProviders[providerId].models.length };
+});
+
 ipcMain.handle("app:list-models", async () => {
   const startedAt = Date.now();
   const catalog = loadModelCatalog();
@@ -5884,7 +6218,7 @@ ipcMain.handle("app:list-models", async () => {
       detail: `Usunieto z katalogu ${removedModelIds.length} wpisow bez plikow modelu.`,
     });
   }
-  const items = catalog.models.map((model) => {
+  const localItems = catalog.models.map((model) => {
     const status = getModelFileStatus(model);
     const downloadInfo = activeDownloads.get(model.id);
     return {
@@ -5902,9 +6236,26 @@ ipcMain.handle("app:list-models", async () => {
       selected: model.id === selectedModelId,
     };
   });
+  const apiItems = buildApiModelsForUi().map((model) => ({
+    ...model,
+    available: true,
+    fileStatus: {
+      available: true,
+      size: 0,
+      expectedBytes: 0,
+      downloading: false,
+      progress: 1,
+      state: "completed",
+      error: null,
+      downloaded: 0,
+      total: 0,
+    },
+    selected: model.id === selectedModelId,
+  }));
   logPerf("app:list-models", startedAt);
-  return items;
+  return [...localItems, ...apiItems];
 });
+ipcMain.handle("app:model-library-stats", () => getModelLibraryStats());
 
 ipcMain.handle("app:download-model", async (_event, modelId) => {
   const catalog = loadModelCatalog();
@@ -5927,24 +6278,46 @@ ipcMain.handle("app:download-model", async (_event, modelId) => {
 
   try {
     await performDownload(url, dest, modelId);
-    emit("status", { status: "download-complete", detail: `Pobrano model: ${model.displayName}` });
+    emit("status", { status: "download-complete", modelId, detail: `Pobrano model: ${model.displayName}` });
     return { ok: true };
   } catch (error) {
+    const message = String(error?.message || error || "");
+    if (/anulowan|cancel/i.test(message)) {
+      return { ok: false, cancelled: true };
+    }
     throw new Error(`Blad pobierania: ${error.message}`);
   }
 });
 
-ipcMain.handle("app:delete-model", async (_event, modelId) => {
-  const catalog = loadModelCatalog();
-  const model = catalog.models.find(m => m.id === modelId);
-  if (!model) throw new Error("Model nie znaleziony.");
-  
-  const filePath = path.resolve(ENDOCODE_HOME, model.file);
-  if (fs.existsSync(filePath)) {
-    fs.unlinkSync(filePath);
+ipcMain.handle("app:cancel-model-download", async (_event, modelId) => {
+  const active = activeDownloads.get(modelId);
+  if (!active) return { ok: false, reason: "not-found" };
+  if (typeof active.cancel === "function") {
+    active.cancel("cancelled-by-user");
     return { ok: true };
   }
-  return { ok: false, error: "Plik nie istnieje." };
+  return { ok: false, reason: "cannot-cancel" };
+});
+
+ipcMain.handle("app:delete-model", async (_event, modelId) => {
+  const catalog = loadModelCatalog();
+  const model = catalog.models.find((m) => m.id === modelId);
+  if (!model) throw new Error("Model nie znaleziony.");
+
+  if (model.file) {
+    const filePath = path.resolve(ENDOCODE_HOME, model.file);
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+  }
+
+  catalog.models = catalog.models.filter((m) => m.id !== modelId);
+  if (selectedModelId === modelId) {
+    const installedFallback = catalog.models.find((entry) => entry.kind === "local-gguf" && getModelFileStatus(entry).available);
+    selectedModelId = installedFallback?.id || catalog.defaultModelId || catalog.models[0]?.id || selectedModelId;
+  }
+  delete customModelSettingsByModelId[modelId];
+  saveModelCatalog(catalog);
+  saveAppSettings();
+  return { ok: true };
 });
 
 function parseModelDownloadInput(input) {
@@ -6133,37 +6506,59 @@ function createDirectUrlResult(rawUrl, profile) {
 
 async function searchHuggingFaceModels(options, profile) {
   const baseQuery = String(options.query || "").trim();
+  const repoQuery = parseHfRepoQuery(baseQuery);
+  if (repoQuery) {
+    const detail = await fetchJson(`https://huggingface.co/api/models/${encodeRepoPath(repoQuery)}?full=true`);
+    const single = buildHuggingFaceResult(detail, profile, { includeAllFiles: true });
+    return single ? [single] : [];
+  }
   const hfQuery = `${baseQuery} gguf ${filterQuerySuffix(options.filter)}`.trim() || "gguf";
   const url = `https://huggingface.co/api/models?search=${encodeURIComponent(hfQuery)}&filter=gguf&sort=downloads&direction=-1&limit=20&full=true`;
   const data = await fetchJson(url);
-  return data.map((model) => {
-    const siblings = Array.isArray(model.siblings) ? model.siblings : [];
-    const files = siblings
-      .filter((file) => String(file.rfilename || "").toLowerCase().endsWith(".gguf"))
-      .map((file) => normalizeGgufFile(file, profile, { name: model.id, description: model.description }));
-    const best = chooseBestGgufFile(files, profile, { name: model.id, description: model.description });
-    if (!best) return null;
-    const downloads = Number(model.downloads || 0);
-    const likes = Number(model.likes || 0);
-    return {
-      id: `huggingface:${model.id}`,
-      repoId: model.id,
-      source: "huggingface",
-      sourceLabel: "Hugging Face",
-      author: model.author || model.id.split("/")[0],
-      name: model.id.split("/").slice(1).join("/") || model.id,
-      description: `HF: ${downloads.toLocaleString("pl-PL")} pobrań, ${likes.toLocaleString("pl-PL")} polubień. ${best.fit.fitLabel}.`,
-      tags: model.tags || [],
-      recommended: best.fit.recommended,
-      recommendation: best.fit,
-      files,
-      fileName: best.name,
-      expectedBytes: best.sizeBytes,
-      downloadUrl: `https://huggingface.co/${model.id}/resolve/main/${best.name.split("/").map(encodeURIComponent).join("/")}`,
-      openUrl: `https://huggingface.co/${model.id}`,
-      canDownload: true,
-    };
-  }).filter(Boolean);
+  return data.map((model) => buildHuggingFaceResult(model, profile, { includeAllFiles: Boolean(baseQuery) })).filter(Boolean);
+}
+
+function parseHfRepoQuery(query) {
+  const value = String(query || "").trim();
+  if (!value) return "";
+  try {
+    const u = new URL(value);
+    if (u.hostname === "huggingface.co" || u.hostname.endsWith(".huggingface.co")) {
+      const parts = u.pathname.split("/").filter(Boolean).map(decodeURIComponent);
+      if (parts.length >= 2) return `${parts[0]}/${parts[1]}`;
+    }
+  } catch { /* not an url */ }
+  return /^[\w.-]+\/[\w.-]+$/.test(value) ? value : "";
+}
+
+function buildHuggingFaceResult(model, profile, options = {}) {
+  const siblings = Array.isArray(model?.siblings) ? model.siblings : [];
+  const files = siblings
+    .filter((file) => String(file.rfilename || "").toLowerCase().endsWith(".gguf"))
+    .map((file) => normalizeGgufFile(file, profile, { name: model.id, description: model.description }));
+  const best = chooseBestGgufFile(files, profile, { name: model.id, description: model.description });
+  if (!best) return null;
+  const listedFiles = options.includeAllFiles ? files : [best];
+  const downloads = Number(model.downloads || 0);
+  const likes = Number(model.likes || 0);
+  return {
+    id: `huggingface:${model.id}`,
+    repoId: model.id,
+    source: "huggingface",
+    sourceLabel: "Hugging Face",
+    author: model.author || String(model.id || "").split("/")[0],
+    name: String(model.id || "").split("/").slice(1).join("/") || model.id,
+    description: `HF: ${downloads.toLocaleString("pl-PL")} pobrań, ${likes.toLocaleString("pl-PL")} polubień. ${best.fit.fitLabel}.`,
+    tags: model.tags || [],
+    recommended: best.fit.recommended,
+    recommendation: best.fit,
+    files: listedFiles,
+    fileName: best.name,
+    expectedBytes: best.sizeBytes,
+    downloadUrl: `https://huggingface.co/${model.id}/resolve/main/${best.name.split("/").map(encodeURIComponent).join("/")}`,
+    openUrl: `https://huggingface.co/${model.id}`,
+    canDownload: true,
+  };
 }
 
 async function searchModelScopeModels(options, profile) {
@@ -6235,93 +6630,19 @@ async function getModelScopeRepoResult(repoId, profile) {
 
 async function searchModelSources(options = {}) {
   const source = options.source || "all";
-  const query = String(options.query || "").trim().toLowerCase();
-  const filter = options.filter || "all";
   const profile = getHardwareModelProfile();
   const results = [];
 
-  // 1. Search Presets (the "gotowe linki")
-  if (source === "all" || source === "presets" || source === "huggingface") {
-    const presets = loadModelPresets();
-    const filteredPresets = presets.filter(p => {
-      const text = `${p.displayName} ${p.id} ${p.description} ${p.category} ${p.source}`.toLowerCase();
-      const matchesQuery = !query || text.includes(query);
-      const matchesFilter = filter === "all" || p.category === filter;
-      return matchesQuery && matchesFilter;
-    });
-
-    results.push(...filteredPresets.map(p => {
-      const fit = scoreModelFit({
-        name: p.displayName,
-        fileName: p.file || p.fileName,
-        sizeBytes: p.expectedBytes
-      }, profile);
-      return {
-        id: `preset:${p.id}`,
-        repoId: p.source,
-        source: "presets",
-        sourceLabel: "Polecane",
-        author: p.author || "EndoCode",
-        name: p.displayName,
-        description: p.description || `Model z Twojej listy polecanych. ${fit.fitLabel}`,
-        tags: [p.category, ...(p.tags || [])],
-        recommended: fit.recommended,
-        recommendation: fit,
-        files: [],
-        fileName: p.file || p.fileName,
-        expectedBytes: p.expectedBytes,
-        downloadUrl: p.downloadUrl || (p.source ? `https://huggingface.co/${p.source}/resolve/main/${p.file || p.fileName}` : ""),
-        openUrl: p.source ? `https://huggingface.co/${p.source}` : "",
-        canDownload: true,
-        hardwareProfile: profile.target
-      };
-    }));
-  }
-
-  // 2. Search External
   if (source === "all" || source === "huggingface") {
     try {
       const hfResults = await searchHuggingFaceModels(options, profile);
-      // Avoid duplicates with presets
-      const presetRepos = new Set(results.map(r => r.repoId));
-      results.push(...hfResults.filter(r => !presetRepos.has(r.repoId)));
+      results.push(...hfResults);
     } catch (e) {
       console.error("HF Search error:", e);
     }
   }
-
-  if (query && (source === "all" || source === "modelscope")) {
-    const repoId = parseModelScopeRepoQuery(query);
-    if (repoId) {
-      try {
-        results.push(await getModelScopeRepoResult(repoId, profile));
-      } catch (error) {
-        results.push({ ...buildExternalSourceCard("modelscope", query), description: `Błąd ModelScope: ${error.message}` });
-      }
-    } else {
-      try {
-        const msResults = await searchModelScopeModels(options, profile);
-        if (msResults.length) results.push(...msResults);
-      } catch {
-        // fallback card below
-      }
-      if (source === "modelscope" && !results.some((item) => item.source === "modelscope")) {
-        results.push(buildExternalSourceCard("modelscope", query));
-      }
-    }
-  }
-
-  if (query && (source === "all" || source === "github")) {
-    results.push(buildExternalSourceCard("github", query));
-  }
-
-  // Prefer live provider results first; presets are fallback.
   return results
-    .sort((a, b) => {
-      if (a.source === "presets" && b.source !== "presets") return 1;
-      if (a.source !== "presets" && b.source === "presets") return -1;
-      return (Number(b.recommended) - Number(a.recommended)) || ((b.recommendation?.score || 0) - (a.recommendation?.score || 0));
-    })
+    .sort((a, b) => (Number(b.recommended) - Number(a.recommended)) || ((b.recommendation?.score || 0) - (a.recommendation?.score || 0)))
     .slice(0, 60);
 }
 
@@ -6342,17 +6663,44 @@ async function performDownload(url, dest, modelId) {
 
   const tempDest = dest + ".downloading";
   const file = fs.createWriteStream(tempDest);
+  let cancelled = false;
+  let requestRef = null;
+  let finished = false;
+  let settled = false;
+
+  const cancelDownload = (reason = "cancelled") => {
+    if (finished || cancelled) return;
+    cancelled = true;
+    try { requestRef?.destroy(); } catch { /* ignore */ }
+    try { file.destroy(); } catch { /* ignore */ }
+    try { if (fs.existsSync(tempDest)) fs.unlinkSync(tempDest); } catch { /* ignore */ }
+    activeDownloads.delete(modelId);
+    emit("agent:event", { type: "model-download-state", modelId, state: "cancelled", progress: 0, downloaded: 0, total: 0, error: "Anulowano przez użytkownika." });
+  };
   
-  activeDownloads.set(modelId, { state: "queued", progress: 0, downloaded: 0, total: 0, error: null });
+  activeDownloads.set(modelId, { state: "queued", progress: 0, downloaded: 0, total: 0, error: null, cancel: cancelDownload });
   emit("agent:event", { type: "model-download-state", modelId, state: "queued", progress: 0, downloaded: 0, total: 0 });
 
   return new Promise((resolve, reject) => {
+    const safeResolve = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    const safeReject = (error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
+
     function startRequest(requestUrl) {
       const request = https.get(requestUrl, { headers: { "User-Agent": "EndoCode-Desktop-App" } }, (response) => {
+        requestRef = request;
+        if (cancelled) return;
         if ([301, 302, 303, 307, 308].includes(response.statusCode)) {
           const location = response.headers.location;
           if (!location) {
-            reject(new Error("Przekierowanie bez nagłówka Location."));
+            safeReject(new Error("Przekierowanie bez nagłówka Location."));
             return;
           }
           startRequest(new URL(location, requestUrl).toString());
@@ -6362,22 +6710,23 @@ async function performDownload(url, dest, modelId) {
         if (response.statusCode !== 200) {
           fs.unlink(tempDest, () => {});
           activeDownloads.delete(modelId);
-          reject(new Error(`Serwer zwrocil blad ${response.statusCode}`));
+          safeReject(new Error(`Serwer zwrocil blad ${response.statusCode}`));
           return;
         }
 
         const total = parseInt(response.headers["content-length"], 10) || 0;
         let downloaded = 0;
         let lastPercent = -1;
-        activeDownloads.set(modelId, { state: "downloading", progress: 0, downloaded: 0, total, error: null });
+        activeDownloads.set(modelId, { state: "downloading", progress: 0, downloaded: 0, total, error: null, cancel: cancelDownload });
         emit("agent:event", { type: "model-download-state", modelId, state: "downloading", progress: 0, downloaded: 0, total });
 
         response.on("data", (chunk) => {
+          if (cancelled) return;
           downloaded += chunk.length;
           const progress = total > 0 ? Math.round((downloaded / total) * 100) : 0;
           if (progress !== lastPercent) {
             lastPercent = progress;
-            activeDownloads.set(modelId, { state: "downloading", progress, downloaded, total, error: null });
+            activeDownloads.set(modelId, { state: "downloading", progress, downloaded, total, error: null, cancel: cancelDownload });
             emit("agent:event", { type: "model-download-progress", modelId, progress, downloaded, total });
           }
         });
@@ -6385,26 +6734,34 @@ async function performDownload(url, dest, modelId) {
         response.pipe(file);
 
         file.on("finish", () => {
+          if (cancelled) return;
+          finished = true;
           file.close();
           try {
              if (fs.existsSync(dest)) fs.unlinkSync(dest);
              fs.renameSync(tempDest, dest);
              activeDownloads.delete(modelId);
              emit("agent:event", { type: "model-download-state", modelId, state: "completed", progress: 100, downloaded, total });
-              resolve();
+              safeResolve();
            } catch (e) {
               activeDownloads.set(modelId, { state: "failed", progress: 0, downloaded: 0, total: 0, error: String(e?.message || e) });
               emit("agent:event", { type: "model-download-state", modelId, state: "failed", progress: 0, downloaded: 0, total: 0, error: String(e?.message || e) });
-              reject(e);
+              safeReject(e);
            }
         });
       });
 
+      file.on("error", (err) => {
+        if (cancelled) return safeReject(new Error("Pobieranie anulowane."));
+        safeReject(err);
+      });
+
       request.on("error", (err) => {
+        if (cancelled || String(err?.message || "").includes("cancelled-by-user")) return safeReject(new Error("Pobieranie anulowane."));
         fs.unlink(tempDest, () => {});
-        activeDownloads.set(modelId, { state: "failed", progress: 0, downloaded: 0, total: 0, error: String(err?.message || err) });
+        activeDownloads.set(modelId, { state: "failed", progress: 0, downloaded: 0, total: 0, error: String(err?.message || err), cancel: null });
         emit("agent:event", { type: "model-download-state", modelId, state: "failed", progress: 0, downloaded: 0, total: 0, error: String(err?.message || err) });
-        reject(err);
+        safeReject(err);
       });
     }
     
@@ -6420,7 +6777,7 @@ const MODEL_RUNTIME_WHITELIST = new Set([
 ]);
 
 function getEffectiveSettingsForModel(modelId) {
-  const model = loadModelCatalog().models.find((entry) => entry.id === modelId) || getModelConfig();
+  const model = findModelById(modelId) || getModelConfig();
   const selected = getModelSettingsForId(model?.id || modelId);
   const tokenLimits = getTokenRuntimeLimits();
   const rawContextTokens = clampContextTokens(selected.contextTokens ?? model?.contextTokens ?? 8192, tokenLimits);
@@ -6483,7 +6840,7 @@ function sanitizeSettingsPatch(rawSettings = {}) {
 
 ipcMain.handle("app:get-model-settings", (_event, modelId) => {
   const targetModelId = String(modelId || selectedModelId);
-  const model = loadModelCatalog().models.find((entry) => entry.id === targetModelId);
+  const model = findModelById(targetModelId);
   if (!model) throw new Error(`Nieznany model: ${targetModelId}`);
   const tokenLimits = getTokenRuntimeLimits();
   return {
@@ -6497,7 +6854,7 @@ ipcMain.handle("app:get-model-settings", (_event, modelId) => {
 
 ipcMain.handle("app:get-model-recommended-settings", (_event, modelId) => {
   const targetModelId = String(modelId || selectedModelId);
-  const model = loadModelCatalog().models.find((entry) => entry.id === targetModelId);
+  const model = findModelById(targetModelId);
   if (!model) throw new Error(`Nieznany model: ${targetModelId}`);
   return {
     modelId: targetModelId,
@@ -6508,7 +6865,7 @@ ipcMain.handle("app:get-model-recommended-settings", (_event, modelId) => {
 
 ipcMain.handle("app:set-model-settings", async (_event, payload) => {
   const targetModelId = String(payload?.modelId || selectedModelId);
-  const model = loadModelCatalog().models.find((entry) => entry.id === targetModelId);
+  const model = findModelById(targetModelId);
   if (!model) throw new Error(`Nieznany model: ${targetModelId}`);
   const settings = sanitizeSettingsPatch(payload?.settings || payload || {});
   setModelSettingsForId(targetModelId, settings);

@@ -3,7 +3,6 @@
 const {
   ALLOWED_TOOLS,
   REQUIRED_ARGS_BY_TOOL,
-  TOOL_INTENT_CLASS,
   allowedToolNamesList,
 } = require("./command-contract");
 
@@ -68,18 +67,6 @@ function validateRequiredArgs(tool, args) {
   return { ok: true };
 }
 
-function validateIntentGuard(tool, intentClass) {
-  if (!intentClass || intentClass === "general") return { ok: true };
-  const toolClass = TOOL_INTENT_CLASS[tool] || "general";
-  if (intentClass === toolClass) return { ok: true };
-  if (intentClass === "filesystem" && toolClass === "document") return { ok: true };
-  return {
-    ok: false,
-    errorCode: "intent_mismatch",
-    error: `Tool '${tool}' is incompatible with current intent '${intentClass}'.`,
-  };
-}
-
 function validateAction(rawAction, options = {}) {
   const normalized = normalizeAction(rawAction);
   if (!normalized.ok) return normalized;
@@ -99,9 +86,6 @@ function validateAction(rawAction, options = {}) {
   }
   const req = validateRequiredArgs(tool, action.args || {});
   if (!req.ok) return req;
-  const intent = options.intentClass || "general";
-  const intentCheck = validateIntentGuard(tool, intent);
-  if (!intentCheck.ok) return intentCheck;
   return { ok: true, action: { ...action, args: action.args || {} } };
 }
 
