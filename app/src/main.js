@@ -5496,7 +5496,7 @@ function createWindow() {
     height: 860,
     minWidth: 960,
     minHeight: 640,
-    backgroundColor: "#1a1a2e",
+    backgroundColor: "#1c1c1c",
     title: "EndoCode",
     icon: path.join(__dirname, "assets", "icon.ico"),
     webPreferences: {

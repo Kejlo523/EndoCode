@@ -26,6 +26,7 @@ const composerAccess = document.getElementById("composerAccess");
 const liveActivity = document.getElementById("liveActivity");
 const liveLabel = document.getElementById("liveLabel");
 const liveDetail = document.getElementById("liveDetail");
+const quickChoicesDock = document.getElementById("quickChoicesDock");
 
 const attachBtn = document.getElementById("attachBtn");
 const fileInput = document.getElementById("fileInput");
@@ -98,6 +99,10 @@ let liveDurationTicker = null;
 let activeRunStartedAtMs = null;
 let currentThinkingSegment = null;
 const activeToolSegments = [];
+let autoScrollPinned = true;
+let currentFileChangeEvent = null;
+let currentFileChanges = [];
+let currentWebLookupEvent = null;
 let promptQueueItems = [];
 let promptQueueSeq = 0;
 let promptQueueProcessing = false;
@@ -389,29 +394,74 @@ async function processPromptQueue() {
 
 // ── Live Activity ──
 function showLive(label, detail = "") {
-  liveLabel.textContent = label;
-  liveDetail.textContent = detail;
+  const cleanLabel = String(label || "Pracuję...").trim();
+  const cleanDetail = String(detail || "").replace(/\s+/g, " ").trim();
+  liveLabel.textContent = cleanLabel;
+  liveDetail.textContent = cleanDetail.length > 220 ? `${cleanDetail.slice(0, 220)}...` : cleanDetail;
+  liveActivity.title = cleanDetail || cleanLabel;
   liveActivity.classList.remove("hidden");
 }
 
 function hideLive() {
   liveActivity.classList.add("hidden");
   liveDetail.textContent = "";
+  liveActivity.title = "";
 }
 
 // ── Welcome Screen ──
 function updateWelcome() {
+  const welcome = document.getElementById("welcomeScreen");
   const hasMessages = conversation.querySelectorAll(".message, .inline-event, .thinking-bubble").length > 0;
-  if (welcomeScreen) {
-    welcomeScreen.style.display = hasMessages ? "none" : "";
+  if (welcome) {
+    welcome.style.display = hasMessages ? "none" : "";
   }
 }
 
-function smartScroll() {
+function isConversationNearBottom(threshold = 140) {
   const distanceToBottom = conversation.scrollHeight - conversation.scrollTop - conversation.clientHeight;
-  if (distanceToBottom < 150) {
-    conversation.scrollTop = conversation.scrollHeight;
+  return distanceToBottom <= threshold;
+}
+
+conversation.addEventListener("scroll", () => {
+  autoScrollPinned = isConversationNearBottom(96);
+}, { passive: true });
+
+function smartScroll(options = {}) {
+  const force = options.force === true;
+  if (!force && !autoScrollPinned) return;
+  requestAnimationFrame(() => {
+    conversation.scrollTo({ top: conversation.scrollHeight, behavior: options.smooth ? "smooth" : "auto" });
+  });
+}
+
+function clearQuickChoicesDock() {
+  if (!quickChoicesDock) return;
+  quickChoicesDock.classList.add("hidden");
+  quickChoicesDock.innerHTML = "";
+}
+
+function resetTurnActivity() {
+  currentFileChangeEvent = null;
+  currentFileChanges = [];
+  currentWebLookupEvent = null;
+  clearQuickChoicesDock();
+}
+
+function setLiveIdle() {
+  hideLive();
+}
+
+function compactToolResultSummary(tool, result = {}) {
+  if (tool === "read_file") return result?.path ? `Odczytano ${result.path}` : "Odczytano plik";
+  if (tool === "ls") return result?.path ? `Lista ${result.path}` : "Lista katalogu";
+  if (tool === "pwd") return "Sprawdzono ścieżkę";
+  if (tool === "cd") return result?.cwd ? `Katalog: ${result.cwd}` : "Zmieniono katalog";
+  if (tool === "run_powershell") {
+    const code = Number(result?.exitCode);
+    return Number.isFinite(code) ? `Kod wyjścia ${code}` : "Komenda zakończona";
   }
+  if (result?.path) return String(result.path);
+  return "Gotowe";
 }
 
 // ── Messages ──
@@ -513,12 +563,29 @@ function extractLiveAnswerFromDelta(fullText = "") {
   if (!text.trim()) return "";
   const finalMatch = text.match(/\bFINAL\s*:\s*([\s\S]*)$/i);
   if (finalMatch?.[1]) return finalMatch[1].trimStart();
-  const jsonFinalMatch = text.match(/"final"\s*:\s*"([\s\S]*?)"/i);
-  if (jsonFinalMatch?.[1]) {
-    return jsonFinalMatch[1]
-      .replace(/\\"/g, "\"")
-      .replace(/\\n/g, "\n")
-      .replace(/\\t/g, "\t");
+  const jsonFinalStart = text.match(/"final"\s*:\s*"/i);
+  if (jsonFinalStart) {
+    const startIndex = (jsonFinalStart.index || 0) + jsonFinalStart[0].length;
+    const raw = text.slice(startIndex);
+    let out = "";
+    let escaping = false;
+    for (const ch of raw) {
+      if (escaping) {
+        if (ch === "n") out += "\n";
+        else if (ch === "t") out += "\t";
+        else if (ch === "r") out += "\r";
+        else out += ch;
+        escaping = false;
+        continue;
+      }
+      if (ch === "\\") {
+        escaping = true;
+        continue;
+      }
+      if (ch === "\"") break;
+      out += ch;
+    }
+    return out.trimStart();
   }
   return "";
 }
@@ -626,7 +693,7 @@ function addInlineEvent(kind, title, body = "", extraHtml = "", options = {}) {
       if (!expanded) {
         requestAnimationFrame(() => {
           detailWrap.scrollTop = 0;
-          div.scrollIntoView({ block: "end", behavior: "smooth" });
+          smartScroll({ smooth: true });
         });
       } else {
         smartScroll();
@@ -662,9 +729,16 @@ function buildQuickChoicesHtml(payload = {}) {
   `;
 }
 
+function renderQuickChoicesDock(payload = {}) {
+  if (!quickChoicesDock) return;
+  quickChoicesDock.innerHTML = buildQuickChoicesHtml(payload);
+  quickChoicesDock.classList.remove("hidden");
+}
+
 async function submitQuickChoicePrompt(text) {
   const prompt = String(text || "").trim();
   if (!prompt) return;
+  clearQuickChoicesDock();
   if (!firstUserMessage) firstUserMessage = prompt;
   addMessage("user", prompt);
   chatTitle.textContent = prompt.length > 40 ? `${prompt.slice(0, 40)}...` : prompt;
@@ -832,11 +906,11 @@ function collectDiffHunks(diff) {
   return { hunks, added, removed };
 }
 
-/** DOM diff block: stats in summary, hunks scrollable (native details, open by default). */
-function buildDiffDetailsElement(diff) {
+/** DOM diff block: stats in summary, hunks scrollable, collapsed by default. */
+function buildDiffDetailsElement(diff, options = {}) {
   const details = document.createElement("details");
   details.className = "diff-details";
-  details.open = true;
+  details.open = options.open === true;
   const summary = document.createElement("summary");
   summary.className = "diff-summary";
   const { hunks, added, removed } = collectDiffHunks(diff);
@@ -876,6 +950,127 @@ function buildDiffDetailsElement(diff) {
 function renderDiff(diff) {
   const el = buildDiffDetailsElement(diff);
   return el.outerHTML;
+}
+
+function fileChangeActionLabel(action) {
+  if (action === "write_file") return "Zapisano";
+  if (action === "patch_edit") return "Patch";
+  if (action === "download_file") return "Pobrano";
+  return "Edycja";
+}
+
+function buildFileChangesHtml(changes = []) {
+  if (!changes.length) return "";
+  return `
+    <div class="file-change-list">
+      ${changes.map((change) => {
+        const { added, removed } = collectDiffHunks(change.diff);
+        const diffEl = buildDiffDetailsElement(Array.isArray(change.diff) ? change.diff : [], { open: false });
+        return `
+          <div class="file-change-item">
+            <div class="file-change-head">
+              <span class="file-change-action">${escapeHtml(fileChangeActionLabel(change.action))}</span>
+              <span class="file-change-path">${escapeHtml(change.path || "")}</span>
+              <span class="file-change-stats">
+                <span class="diff-stat-plus">+${added}</span>
+                <span class="diff-stat-minus">-${removed}</span>
+              </span>
+            </div>
+            ${diffEl.outerHTML}
+          </div>
+        `;
+      }).join("")}
+    </div>
+  `;
+}
+
+function upsertFileChangeEvent(event) {
+  currentFileChanges.push({
+    path: String(event.path || ""),
+    action: event.action || "change",
+    diff: Array.isArray(event.diff) ? event.diff : [],
+    at: event.at || new Date().toISOString(),
+  });
+  const count = currentFileChanges.length;
+  const title = count === 1
+    ? `Zmieniony plik: ${currentFileChanges[0].path}`
+    : `Zmienione pliki · ${count}`;
+  const extraHtml = buildFileChangesHtml(currentFileChanges);
+
+  if (!currentFileChangeEvent || !currentFileChangeEvent.isConnected) {
+    currentFileChangeEvent = addInlineEvent("change", title, "", extraHtml, {
+      eventAt: event.at,
+      defaultExpanded: false,
+    });
+    currentFileChangeEvent.setAttribute("data-activity-id", `file-changes-${event.id || Date.now()}`);
+    return;
+  }
+
+  const titleEl = currentFileChangeEvent.querySelector(".inline-event-title");
+  if (titleEl) titleEl.textContent = title;
+  currentFileChangeEvent.setAttribute("data-title", title);
+  currentFileChangeEvent.setAttribute("data-extra-html", extraHtml);
+  const expandEl = currentFileChangeEvent.querySelector(".inline-event-expand");
+  if (expandEl) expandEl.innerHTML = extraHtml;
+  syncInlineEventPersistAttrs(currentFileChangeEvent);
+  smartScroll();
+}
+
+function buildWebLookupHtml(event = {}) {
+  const sources = Array.isArray(event.sources) ? event.sources : [];
+  const visited = Array.isArray(event.visitedUrls) ? event.visitedUrls : [];
+  const query = event.lookupQuery || event.query || "";
+  const sourceRows = sources
+    .filter((source) => source?.url)
+    .map((source) => {
+      const url = String(source.url || "");
+      const label = String(source.title || source.url || "Źródło");
+      return `<li><a href="${escapeAttr(url)}" target="_blank" rel="noreferrer">${escapeHtml(label)}</a></li>`;
+    })
+    .join("");
+  const visitedRows = visited
+    .filter(Boolean)
+    .slice(0, 8)
+    .map((url) => `<li><a href="${escapeAttr(url)}" target="_blank" rel="noreferrer">${escapeHtml(url)}</a></li>`)
+    .join("");
+  return `
+    <div class="web-lookup-compact">
+      ${query ? `<div class="web-lookup-query">Zapytanie: <span>${escapeHtml(query)}</span></div>` : ""}
+      ${event.detail ? `<div class="web-lookup-detail">${escapeHtml(event.detail)}</div>` : ""}
+      ${sourceRows ? `<div class="web-lookup-section"><strong>Źródła</strong><ul>${sourceRows}</ul></div>` : ""}
+      ${visitedRows ? `<div class="web-lookup-section"><strong>Odwiedzone</strong><ul>${visitedRows}</ul></div>` : ""}
+      ${event.lookupUrl ? `<div class="web-lookup-url">API: ${escapeHtml(event.lookupUrl)}</div>` : ""}
+    </div>
+  `;
+}
+
+function upsertWebLookupEvent(event = {}) {
+  const sources = Array.isArray(event.sources) ? event.sources.filter((source) => source?.url) : [];
+  const visited = Array.isArray(event.visitedUrls) ? event.visitedUrls.filter(Boolean) : [];
+  const hasUsefulDetail = event.used || sources.length || visited.length || event.lookupQuery || event.lookupUrl;
+  if (!hasUsefulDetail) return;
+
+  const title = event.used
+    ? `Web lookup · ${sources.length || visited.length || 1} źródł${(sources.length || visited.length || 1) === 1 ? "o" : "a"}`
+    : "Web lookup · bez mocnego wyniku";
+  const extraHtml = buildWebLookupHtml(event);
+  if (!currentWebLookupEvent || !currentWebLookupEvent.isConnected) {
+    currentWebLookupEvent = addInlineEvent("activity", title, "", extraHtml, {
+      eventAt: event.at,
+      defaultExpanded: false,
+    });
+    currentWebLookupEvent.setAttribute("data-activity-id", `web-lookup-${event.id || Date.now()}`);
+    return;
+  }
+
+  const titleEl = currentWebLookupEvent.querySelector(".inline-event-title");
+  if (titleEl) titleEl.textContent = title;
+  currentWebLookupEvent.setAttribute("data-title", title);
+  currentWebLookupEvent.setAttribute("data-extra-html", extraHtml);
+  const expandEl = currentWebLookupEvent.querySelector(".inline-event-expand");
+  if (expandEl) expandEl.innerHTML = extraHtml;
+  syncInlineEventPersistAttrs(currentWebLookupEvent);
+  smartScroll();
 }
 
 function findSegmentForFileChange(event) {
@@ -1102,6 +1297,8 @@ function renderChatHistory() {
 async function switchToChat(chatId) {
   activeChatId = chatId;
   conversation.innerHTML = "";
+  resetTurnActivity();
+  setLiveIdle();
   const session = chatSessions.find((s) => s.id === chatId);
   if (session) {
     let workspaceWarning = "";
@@ -1156,6 +1353,8 @@ async function startNewChat() {
   promptQueueItems = [];
   promptQueueProcessing = false;
   renderPromptQueue();
+  resetTurnActivity();
+  setLiveIdle();
   chatTitle.textContent = "Nowy czat";
   conversation.innerHTML = "";
   // Re-add welcome screen
@@ -1282,9 +1481,9 @@ async function updateContextInfo() {
     if (circle) {
       circle.style.strokeDashoffset = offset.toFixed(1);
       if (percent > 0.85) {
-        circle.style.stroke = "#ef4444";
+        circle.style.stroke = "var(--danger)";
       } else if (percent > 0.6) {
-        circle.style.stroke = "#f59e0b";
+        circle.style.stroke = "var(--amber)";
       } else {
         circle.style.stroke = "currentColor";
       }
@@ -1701,12 +1900,35 @@ conversation.addEventListener("click", (event) => {
   }
 });
 
+if (quickChoicesDock) {
+  quickChoicesDock.addEventListener("click", (event) => {
+    const target = event.target.closest("button[data-quick-choice]");
+    if (!target) return;
+    const mode = target.getAttribute("data-quick-choice");
+    if (mode === "preset") {
+      const prompt = target.getAttribute("data-choice-prompt") || "";
+      target.disabled = true;
+      void submitQuickChoicePrompt(prompt);
+      return;
+    }
+    if (mode === "other") {
+      const custom = window.prompt("Wpisz własny kierunek:", "");
+      if (custom === null) return;
+      const trimmed = String(custom).trim();
+      if (!trimmed) return;
+      target.disabled = true;
+      void submitQuickChoicePrompt(trimmed);
+    }
+  });
+}
+
 composer.addEventListener("submit", async (event) => {
   event.preventDefault();
   const text = promptEl.value.trim();
   if (!text && !currentAttachmentFile) return;
   promptEl.value = "";
   promptEl.style.height = "auto";
+  clearQuickChoicesDock();
 
   const attachedFile = currentAttachmentFile ? { ...currentAttachmentFile } : null;
   clearAttachment();
@@ -1755,18 +1977,15 @@ window.endocode.onEvent(async (event) => {
     if (event.status === "model-thinking") showLive("Myśli...", event.detail || "");
     else if (event.status === "model-json-retry") showLive("Naprawiam JSON...", event.detail || "");
     else if (event.status === "model-call-retry") {
-      addInlineEvent("note", "Runtime modelu", event.detail || "Ponawiam po błędzie modelu.");
       showLive("Restart modelu...", event.detail || "");
     } else if (event.status === "model-action-ready") {
       showLive("Akcja gotowa", event.detail || "");
     } else if (event.status === "model-fallback") {
-      addInlineEvent("note", "Fallback modelu", event.detail || "Przełączam model.");
       showLive("Fallback modelu...", event.detail || "");
       refreshState();
     } else if (event.status === "model-fallback-failed") {
       addInlineEvent("error", "Fallback modelu", event.detail || "Model zapasowy nie wystartował.");
     } else if (event.status === "context-compacted") {
-      addInlineEvent("note", "Kontekst", event.detail || "Skompaktowano kontekst rozmowy.");
       showLive("Kontekst", event.detail || "");
       updateContextInfo();
     } else if (event.status === "downloading") {
@@ -1774,13 +1993,12 @@ window.endocode.onEvent(async (event) => {
     } else if (event.status === "runtime-install") {
       showLive("Instalacja runtime", event.detail || "");
     } else if (event.status === "runtime-install-complete") {
-      addInlineEvent("note", "Runtime", event.detail || "Runtime llama.cpp zainstalowany.");
       showLive("Instalacja runtime", event.detail || "");
     } else if (event.status === "server-killing") showLive("Kill switch...", event.detail || "");
     else if (event.status === "server-killed") showLive("Kill switch", event.detail || "");
     else if (event.status === "server-starting" || event.status === "server-stopping") showLive("Runtime modelu", event.detail || "");
     else if (event.status === "download-complete") {
-      addInlineEvent("note", "Pobieranie", event.detail || "Model pobrany pomyślnie.");
+      showLive("Pobieranie", event.detail || "Model pobrany pomyślnie.");
       loadModels();
     }
     return;
@@ -1788,14 +2006,15 @@ window.endocode.onEvent(async (event) => {
   if (event.type === "chat-web-lookup") {
     const phase = String(event.phase || "");
     if (phase === "start") {
-      showLive("Web lookup", "Wyszukiwanie i lekka ekstrakcja danych...");
-      const startDetail = `${event.detail || "Rozpoczynam wyszukiwanie."}${event.lookupQuery ? `\nZapytanie modelu: ${event.lookupQuery}` : ""}`;
-      addInlineEvent("activity", "Web lookup", startDetail);
+      showLive("Web lookup", event.lookupQuery || "Wyszukiwanie i lekka ekstrakcja danych...");
       return;
     }
     if (phase === "error") {
       showLive("Web lookup: błąd", event.detail || "Błąd pobierania kontekstu internetowego.");
-      addInlineEvent("error", "Web lookup", event.detail || "Błąd pobierania kontekstu internetowego.");
+      addInlineEvent("error", "Web lookup", event.detail || "Błąd pobierania kontekstu internetowego.", "", {
+        eventAt: event.at,
+        defaultExpanded: false,
+      });
       return;
     }
     if (phase === "result") {
@@ -1811,7 +2030,7 @@ window.endocode.onEvent(async (event) => {
         event.used ? `Web lookup: użyto${event.fromCache ? " (cache)" : ""}` : "Web lookup: brak trafnych danych",
         (visited[0] || sources[0]?.url || event.lookupQuery || event.lookupUrl || event.detail || "").slice(0, 220),
       );
-      addInlineEvent("activity", "Web lookup", detail || "Brak wyników web lookup.");
+      upsertWebLookupEvent({ ...event, detail });
       return;
     }
   }
@@ -1858,15 +2077,12 @@ window.endocode.onEvent(async (event) => {
     currentThinkingSegment = null;
     activeToolSegments.length = 0;
     lastAgentPhaseSignature = "";
+    resetTurnActivity();
     removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
     removeInlineEventByActivityId(AGENT_PHASE_ACTIVITY_ID);
     removeInlineEventByActivityId(AGENT_NOTE_ACTIVITY_ID);
     const rawInput = String(event.text || "").trim();
     const shortInput = rawInput.length > 240 ? `${rawInput.slice(0, 240)}...` : rawInput;
-    const planningDetail = shortInput
-      ? `Start tury. Wejście użytkownika: ${shortInput}`
-      : "Start tury. Brak tekstu wejściowego (np. załącznik lub akcja systemowa).";
-    addInlineEvent("activity", "Model planuje", planningDetail);
     showLive("Planowanie...", shortInput || "Przygotowanie kontekstu i kolejnych kroków.");
     return;
   }
@@ -1888,8 +2104,7 @@ window.endocode.onEvent(async (event) => {
   }
   if (event.type === "note") {
     removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
-    upsertInlineEvent(AGENT_NOTE_ACTIVITY_ID, "activity", "Model planuje", event.note);
-    showLive("Notatka", event.note);
+    showLive("Plan", event.note);
     return;
   }
   if (event.type === "agent-phase") {
@@ -1912,8 +2127,7 @@ window.endocode.onEvent(async (event) => {
     const signature = `${phase}|${detail}`;
     if (signature !== lastAgentPhaseSignature) {
       lastAgentPhaseSignature = signature;
-      upsertInlineEvent(AGENT_PHASE_ACTIVITY_ID, "activity", `Model planuje: ${phaseLabel}`, detail || "Przetwarzanie etapu.");
-      showLive(`Etap: ${phaseLabel}`, detail || "Przetwarzanie");
+      showLive(event.step ? `Krok ${event.step}: ${phaseLabel}` : phaseLabel, detail || "Przetwarzanie");
     }
     return;
   }
@@ -1968,21 +2182,25 @@ window.endocode.onEvent(async (event) => {
     const full = event.full || "";
     const preview = full.trim().slice(0, 50000);
     
-    const writingLabel = event.plainChat ? "Odpowiedź" : "Model wybiera akcję";
     const livePhrase = event.plainChat ? "Pisze…" : "Planuje akcję...";
 
     if (event.plainChat) {
       removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
       updateStreamingAssistantMessage(event.text || "", full);
-    } else if (preview) {
-      upsertInlineEvent(MODEL_WRITING_ACTIVITY_ID, "activity", writingLabel, preview);
+      showLive(livePhrase, preview.slice(-500));
+      return;
+    }
+
+    if (preview) {
       const liveFinal = extractLiveAnswerFromDelta(full);
       if (liveFinal) {
         removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
         updateStreamingAssistantMessage("", liveFinal);
+        showLive("Pisze…", liveFinal.slice(-500));
+        return;
       }
     }
-    showLive(livePhrase, preview.slice(-500));
+    showLive(livePhrase, event.step ? `Krok ${event.step}` : "");
     return;
   }
 
@@ -1991,70 +2209,37 @@ window.endocode.onEvent(async (event) => {
     const label = toolActionLabel(event.tool, event.args);
     const detail = toolActionDetail(event.tool, event.args, event.note || "");
     const path = toolSegmentPath(event.tool, event.args);
-    const primaryHtml = `<div class="tool-run-placeholder"><span class="tool-run-badge">W toku</span><span class="tool-run-path">${escapeHtml(shortPath(path) || path || "—")}</span></div>`;
-    const toolEvent = addInlineEvent("tool", label, detail, "", {
-      eventAt: event.at,
-      showDuration: true,
-      duration: "00:00",
-      variant: "toolcard",
-      primaryHtml,
-    });
-    const durationEl = toolEvent.querySelector(".inline-event-duration");
     const durationKey = `tool-${event.tool || "unknown"}-${event.id || Date.now()}`;
-    if (durationEl) startLiveDuration(durationKey, parseEventTimeMs(event), durationEl);
-    activeToolSegments.push({ key: durationKey, tool: event.tool, el: toolEvent, path });
-    showLive(label, detail);
+    activeToolSegments.push({ key: durationKey, tool: event.tool, path, startedAtMs: parseEventTimeMs(event) });
+    showLive(label, detail || shortPath(path) || path || "");
     return;
   }
   if (event.type === "tool-result") {
     const matchingIndex = activeToolSegments.findIndex((segment) => segment.tool === event.tool);
     const segment = matchingIndex >= 0 ? activeToolSegments.splice(matchingIndex, 1)[0] : activeToolSegments.shift();
-    if (segment?.key) stopLiveDuration(segment.key, parseEventTimeMs(event));
-    const durationText = segment?.el?.querySelector(".inline-event-duration")?.textContent || "00:00";
     if (!event.ok) {
-      if (!finalizeToolCardError(segment, event)) {
-        const errorEl = addInlineEvent("error", `Błąd: ${event.tool}`, `${event.error || ""}${event.recoveryHint ? `\nObejście: ${event.recoveryHint}` : ""}`, "", { eventAt: event.at });
-        setInlineEventDuration(errorEl, durationText);
-      } else if (segment?.el) {
-        setInlineEventDuration(segment.el, durationText);
-      }
-    } else if (!finalizeToolCardSuccess(segment, event)) {
-      const okEl = addInlineEvent("activity", `Zakończono: ${event.tool}`, compactJsonPreview(event.result || {}), "", { eventAt: event.at });
-      setInlineEventDuration(okEl, durationText);
-    } else if (segment?.el) {
-      setInlineEventDuration(segment.el, durationText);
+      addInlineEvent("error", `Błąd: ${event.tool}`, `${event.error || ""}${event.recoveryHint ? `\nObejście: ${event.recoveryHint}` : ""}`, "", {
+        eventAt: event.at,
+        defaultExpanded: true,
+      });
+      showLive(`Błąd: ${event.tool}`, event.error || "");
+    } else {
+      showLive(`Gotowe: ${event.tool}`, compactToolResultSummary(event.tool, event.result || {}));
     }
     return;
   }
   if (event.type === "file-change") {
-    const seg = findSegmentForFileChange(event);
-    if (seg) {
-      mergeFileChangeIntoToolCard(seg, event);
-      showLive(`Zapisano: ${event.path}`);
-      return;
-    }
-    const actionLabel =
-      event.action === "write_file"
-        ? "Zapisano"
-        : event.action === "patch_edit"
-          ? "Zastosowano patch"
-          : event.action === "download_file"
-            ? "Pobrano"
-            : "Edycja";
-    const body = "";
-    addInlineEvent("change", `${actionLabel}: ${event.path}`, body, renderDiff(event.diff));
+    upsertFileChangeEvent(event);
     showLive(`Zapisano: ${event.path}`);
     return;
   }
   if (event.type === "approval-request") {
-    addInlineEvent("tool", "Prośba o komendę", `${event.request.cwd}: ${event.request.command}`);
     openApproval(event.request, event.approvalId);
-    showLive("Czeka na zatwierdzenie...");
+    showLive("Czeka na zatwierdzenie", event.request?.command || "");
     return;
   }
   if (event.type === "final") {
     removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
-    if (event.note) addInlineEvent("note", "Podsumowanie", event.note);
     if (hasStreamingAssistantContent()) {
       finalizeStreamingAssistantMessage(event.text || "");
     } else if (String(event.text || "").trim()) {
@@ -2062,17 +2247,17 @@ window.endocode.onEvent(async (event) => {
     }
     const sources = extractSourcesFromAnswer(event.text || "");
     if (sources.length) {
-      addInlineEvent("activity", "Źródła", sources.map((url) => `- ${url}`).join("\n"));
+      addInlineEvent("activity", "Źródła", sources.map((url) => `- ${url}`).join("\n"), "", {
+        eventAt: event.at,
+        defaultExpanded: false,
+      });
     }
-    if (Number.isFinite(activeRunStartedAtMs)) {
-      addTotalDurationDivider(parseEventTimeMs(event) - activeRunStartedAtMs);
-      activeRunStartedAtMs = null;
-    }
+    activeRunStartedAtMs = null;
     hideLive();
     saveChatSession(firstUserMessage);
   }
   if (event.type === "quick-choices") {
-    addInlineEvent("activity", "Wybór kolejnego kroku", "", buildQuickChoicesHtml(event), { eventAt: event.at });
+    renderQuickChoicesDock(event);
     return;
   }
 });
