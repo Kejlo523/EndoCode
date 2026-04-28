@@ -69,6 +69,8 @@
       const contextLabel = model.contextTokens ? `${(model.contextTokens / 1024).toFixed(0)}k` : "—";
       const memoryLabel = ui.sizeGB || "—";
       const roleLabel = model.kind === "local-gguf" ? "Lokalny GGUF" : "API";
+      const sourceLabel = model.sourceType || model.source || "unknown";
+      const authorLabel = model.author || (typeof model.source === "string" ? model.source.split("/")[0] : "unknown");
 
       return `
     <article class="model-item ${model.selected ? "selected" : ""}" data-model-id="${escapeAttr(model.id)}" data-model-state="${escapeAttr(ui.state)}">
@@ -84,10 +86,11 @@
         <div class="model-quick-stat"><span>Rozmiar pliku</span><strong>${escapeHtml(memoryLabel)}</strong></div>
         <div class="model-quick-stat"><span>Kontekst</span><strong>${escapeHtml(contextLabel)}</strong></div>
       </div>
-      <p class="model-desc">${escapeHtml(model.description)}</p>
+      <p class="model-desc">${escapeHtml(model.description || "Brak opisu modelu.")}</p>
       <div class="model-meta">
+        <div class="model-meta-item"><span>Autor:</span> <strong>${escapeHtml(authorLabel)}</strong></div>
+        <div class="model-meta-item"><span>Źródło:</span> <strong>${escapeHtml(String(sourceLabel))}</strong></div>
         ${ui.categoryLabel ? `<div class="model-meta-item"><span>Klasa:</span> <strong>${ui.categoryLabel}</strong></div>` : ""}
-        ${model.sourceType ? `<div class="model-meta-item"><span>Źródło:</span> <strong>${escapeHtml(String(model.sourceType))}</strong></div>` : ""}
       </div>
       ${ui.isDownloading ? `<div class="download-progress-container"><div class="download-progress-fill" style="width:${ui.progress}%"></div></div>` : ""}
       ${ui.isFailed && ui.error ? `<div class="model-error">${escapeHtml(ui.error)}</div>` : ""}

@@ -9,7 +9,8 @@ const contextIndicator = document.getElementById("contextIndicator");
 const composer = document.getElementById("composer");
 const promptEl = document.getElementById("prompt");
 const sendBtn = document.getElementById("send");
-const stopBtn = document.getElementById("stopBtn");
+const sendLabel = document.getElementById("sendLabel");
+const sendIcon = document.getElementById("sendIcon");
 const promptQueueBox = document.getElementById("promptQueue");
 const promptQueueList = document.getElementById("promptQueueList");
 const promptQueueCount = document.getElementById("promptQueueCount");
@@ -93,7 +94,7 @@ let streamingAssistantMessage = null;
 const modelRenderCacheLibrary = new Map();
 const modelRenderCacheInstalled = new Map();
 const STREAM_RENDER_THROTTLE_MS = 50;
-const SHOW_MODEL_THINKING_TRACE = false;
+const SHOW_MODEL_THINKING_TRACE = true;
 const liveDurationTrackers = new Map();
 let liveDurationTicker = null;
 let activeRunStartedAtMs = null;
@@ -106,6 +107,7 @@ let currentWebLookupEvent = null;
 let promptQueueItems = [];
 let promptQueueSeq = 0;
 let promptQueueProcessing = false;
+let finalReceivedInRun = false;
 const modelsModule = window.EndoModules?.createModelsModule?.({
   modelsList,
   modelsInstalledList,
@@ -254,13 +256,18 @@ function setBusy(nextBusy) {
   sendBtn.disabled = false;
   modelSelect.disabled = nextBusy;
   reasoningSelect.disabled = nextBusy;
-  if (nextBusy) {
-    stopBtn.classList.remove("hidden");
-  } else {
-    stopBtn.classList.add("hidden");
-    if (promptQueueItems.some((item) => item.status === "queued")) {
-      void processPromptQueue();
-    }
+  if (sendBtn) {
+    sendBtn.classList.toggle("run-stop", nextBusy);
+    sendBtn.title = nextBusy ? "Zatrzymaj (Enter)" : "Wyślij (Enter)";
+  }
+  if (sendLabel) sendLabel.textContent = nextBusy ? "Stop" : "Start";
+  if (sendIcon) {
+    sendIcon.innerHTML = nextBusy
+      ? `<rect x="3" y="3" width="10" height="10" rx="2" fill="currentColor"></rect>`
+      : `<path d="M3 13V3l11 5-11 5z" fill="currentColor"></path>`;
+  }
+  if (!nextBusy && promptQueueItems.some((item) => item.status === "queued")) {
+    void processPromptQueue();
   }
 }
 
@@ -469,6 +476,9 @@ function addMessage(role, text, imageBase64 = null) {
   const div = document.createElement("div");
   div.className = `message ${role}`;
   div.setAttribute("data-raw-text", String(text ?? ""));
+  if (role === "assistant" && /^(Zadanie zatrzymane|Nie udalo sie wygenerowac odpowiedzi)/i.test(String(text || "").trim())) {
+    div.classList.add("message-error");
+  }
   
   if (imageBase64) {
     const img = document.createElement("img");
@@ -1489,7 +1499,12 @@ async function updateContextInfo() {
       }
     }
 
-    if (info.isNearCompaction) {
+    if (info.needsRuntimeRestart) {
+      const runtimeLabel = formatTokenLabel(info.runtimeMaxTokens);
+      const configuredLabel = formatTokenLabel(info.configuredMaxTokens);
+      contextIndicator.classList.add("warning");
+      contextIndicator.title = `Runtime działa na ${runtimeLabel} tok., a ustawienia mają ${configuredLabel} tok. (wymagany restart runtime).`;
+    } else if (info.isNearCompaction) {
       contextIndicator.classList.add("warning");
       contextIndicator.title = "Blisko kompaktowania! (Agresywne skracanie)";
     } else {
@@ -1648,6 +1663,9 @@ function openApproval(request, approvalId) {
   approvalCwd.textContent = `cwd: ${request.cwd}`;
   approvalCommand.textContent = request.command;
   approvalModal.classList.remove("hidden");
+  approvalModal.setAttribute("tabindex", "-1");
+  approvalModal.focus();
+  approveCommand.focus();
 }
 
 function closeApproval(approved) {
@@ -1659,6 +1677,18 @@ function closeApproval(approved) {
 // ══════════════ EVENT LISTENERS ══════════════
 approveCommand.addEventListener("click", () => closeApproval(true));
 rejectCommand.addEventListener("click", () => closeApproval(false));
+approvalModal.addEventListener("keydown", (event) => {
+  if (approvalModal.classList.contains("hidden")) return;
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeApproval(false);
+    return;
+  }
+  if (event.key === "Enter") {
+    event.preventDefault();
+    closeApproval(true);
+  }
+});
 
 chooseWorkspaceBtn.addEventListener("click", async () => {
   const state = await window.endocode.selectWorkspace();
@@ -1708,7 +1738,6 @@ modelSelect.addEventListener("change", async () => {
     const state = await window.endocode.setModel(modelSelect.value);
     renderModelSelect(state);
     renderReasoningSelect(state);
-    await startNewChat();
     addInlineEvent("note", "Model", `Wybrano ${state.modelConfig.displayName}`);
   } catch (e) {
     addInlineEvent("error", "Model", e.message || String(e));
@@ -1729,7 +1758,9 @@ reasoningSelect.addEventListener("change", async () => {
   }
 });
 
-stopBtn.addEventListener("click", async () => {
+sendBtn.addEventListener("click", async (event) => {
+  if (!appBusy) return;
+  event.preventDefault();
   try {
     await window.endocode.abort();
     if (hasStreamingAssistantContent()) {
@@ -1924,6 +1955,14 @@ if (quickChoicesDock) {
 
 composer.addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (appBusy) {
+    try {
+      await window.endocode.abort();
+    } catch (e) {
+      addInlineEvent("error", "Stop", e.message || String(e));
+    }
+    return;
+  }
   const text = promptEl.value.trim();
   if (!text && !currentAttachmentFile) return;
   promptEl.value = "";
@@ -2072,6 +2111,7 @@ window.endocode.onEvent(async (event) => {
     return;
   }
   if (event.type === "run-start") {
+    finalReceivedInRun = false;
     activeRunStartedAtMs = parseEventTimeMs(event);
     stopAllLiveDurations();
     currentThinkingSegment = null;
@@ -2093,7 +2133,7 @@ window.endocode.onEvent(async (event) => {
     lastAgentPhaseSignature = "";
     removeInlineEventByActivityId(AGENT_PHASE_ACTIVITY_ID);
     removeInlineEventByActivityId(AGENT_NOTE_ACTIVITY_ID);
-    if (hasStreamingAssistantContent()) {
+    if (!finalReceivedInRun && hasStreamingAssistantContent()) {
       finalizeStreamingAssistantMessage("", { overwriteText: false });
     }
     setBusy(false);
@@ -2239,6 +2279,7 @@ window.endocode.onEvent(async (event) => {
     return;
   }
   if (event.type === "final") {
+    finalReceivedInRun = true;
     removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
     if (hasStreamingAssistantContent()) {
       finalizeStreamingAssistantMessage(event.text || "");
@@ -2293,6 +2334,13 @@ const SETTINGS_FIELDS = [
     decimals: 0,
     formatFn: (v) => Number(v).toLocaleString("pl-PL"),
   },
+  {
+    id: "runtimeContextCap",
+    slider: "set_runtimeContextCap",
+    display: "val_runtimeContextCap",
+    decimals: 0,
+    formatFn: (v) => Number(v) <= 0 ? "auto" : Number(v).toLocaleString("pl-PL"),
+  },
   { id: "gpuLayers", slider: "set_gpuLayers", display: "val_gpuLayers", decimals: 0 },
   { id: "maxMessages", slider: "set_maxMessages", display: "val_maxMessages", decimals: 0 },
   { id: "threads", slider: "set_threads", display: "val_threads", decimals: 0 },
@@ -2300,9 +2348,10 @@ const SETTINGS_FIELDS = [
   { id: "batchSize", slider: "set_batchSize", display: "val_batchSize", decimals: 0 },
   { id: "ubatchSize", slider: "set_ubatchSize", display: "val_ubatchSize", decimals: 0 },
   { id: "parallel", slider: "set_parallel", display: "val_parallel", decimals: 0 },
+  { id: "fastStartup", slider: "set_fastStartup", display: "val_fastStartup", decimals: 0, formatFn: (v) => Number(v) === 1 ? "on" : "off" },
   { id: "flashAttention", slider: "set_flashAttention", display: "val_flashAttention", decimals: 0, formatFn: (v) => Number(v) === 1 ? "on" : "off" },
 ];
-const BASIC_SETTINGS = new Set(["contextTokens", "gpuLayers", "maxTokens", "maxMessages"]);
+const BASIC_SETTINGS = new Set(["contextTokens", "runtimeContextCap", "gpuLayers", "maxTokens", "maxMessages", "fastStartup"]);
 let settingsAdvancedVisible = false;
 let cachedRecommendedSettings = null;
 
@@ -2363,6 +2412,7 @@ function applySliderRange(sliderId, range = {}) {
 
 function applyDynamicTokenLimits(limits = {}) {
   applySliderRange("set_contextTokens", limits.contextTokens);
+  applySliderRange("set_runtimeContextCap", { min: 0, max: limits.contextTokens?.max ?? 262144, step: limits.contextTokens?.step ?? 2048 });
   applySliderRange("set_maxTokens", limits.maxTokens);
   applySliderRange("set_maxMessages", limits.maxMessages);
 }
@@ -2393,6 +2443,13 @@ function applySettingsToSliders(settings = {}, eff = {}) {
     0,
     (v) => Number(v).toLocaleString("pl-PL"),
   );
+  setSlider(
+    "set_runtimeContextCap",
+    "val_runtimeContextCap",
+    settings.runtimeContextCap ?? eff.runtimeContextCap ?? 0,
+    0,
+    (v) => Number(v) <= 0 ? "auto" : Number(v).toLocaleString("pl-PL"),
+  );
   setSlider("set_gpuLayers", "val_gpuLayers", settings.gpuLayers ?? eff.gpuLayers, 0);
   setSlider("set_maxMessages", "val_maxMessages", settings.maxMessages ?? eff.maxMessages ?? 32, 0);
   setSlider("set_threads", "val_threads", settings.threads ?? eff.threads ?? 8, 0);
@@ -2400,6 +2457,7 @@ function applySettingsToSliders(settings = {}, eff = {}) {
   setSlider("set_batchSize", "val_batchSize", settings.batchSize ?? eff.batchSize ?? 1024, 0);
   setSlider("set_ubatchSize", "val_ubatchSize", settings.ubatchSize ?? eff.ubatchSize ?? 512, 0);
   setSlider("set_parallel", "val_parallel", settings.parallel ?? eff.parallel ?? 1, 0);
+  setSlider("set_fastStartup", "val_fastStartup", (settings.fastStartup ?? eff.fastStartup ?? "on") === "on" ? 1 : 0, 0, (v) => Number(v) === 1 ? "on" : "off");
   setSlider("set_flashAttention", "val_flashAttention", (settings.flashAttention ?? eff.flashAttention ?? "on") === "on" ? 1 : 0, 0, (v) => Number(v) === 1 ? "on" : "off");
 }
 
@@ -2449,6 +2507,7 @@ function collectSettingsFromUI() {
     topK: parseInt(document.getElementById("set_topK").value, 10),
     repeatPenalty: parseFloat(document.getElementById("set_repeatPenalty").value),
     contextTokens: parseInt(document.getElementById("set_contextTokens").value, 10),
+    runtimeContextCap: parseInt(document.getElementById("set_runtimeContextCap").value, 10),
     gpuLayers: parseInt(document.getElementById("set_gpuLayers").value, 10),
     maxMessages: parseInt(document.getElementById("set_maxMessages").value, 10),
     threads: parseInt(document.getElementById("set_threads").value, 10),
@@ -2456,12 +2515,25 @@ function collectSettingsFromUI() {
     batchSize: parseInt(document.getElementById("set_batchSize").value, 10),
     ubatchSize: parseInt(document.getElementById("set_ubatchSize").value, 10),
     parallel: parseInt(document.getElementById("set_parallel").value, 10),
+    fastStartup: Number(document.getElementById("set_fastStartup").value) === 1 ? "on" : "off",
     flashAttention: Number(document.getElementById("set_flashAttention").value) === 1 ? "on" : "off",
   };
 }
 
 settingsBtn.addEventListener("click", () => openSettingsModal());
-closeSettings.addEventListener("click", () => settingsModal.classList.add("hidden"));
+
+function closeSettingsModalAndRestoreComposerFocus() {
+  settingsModal.classList.add("hidden");
+  // Defensive reset: settings apply should never leave composer locked.
+  setBusy(false);
+  if (promptEl) {
+    promptEl.removeAttribute("disabled");
+    promptEl.removeAttribute("readonly");
+    requestAnimationFrame(() => promptEl.focus());
+  }
+}
+
+closeSettings.addEventListener("click", () => closeSettingsModalAndRestoreComposerFocus());
 
 applySettings.addEventListener("click", async () => {
   const values = collectSettingsFromUI();
@@ -2471,7 +2543,7 @@ applySettings.addEventListener("click", async () => {
     }
     await window.endocode.setModelSettings({ modelId: currentSettingsModelId, settings: values });
     addInlineEvent("note", "Ustawienia", "Zastosowano nowe ustawienia modelu.");
-    settingsModal.classList.add("hidden");
+    closeSettingsModalAndRestoreComposerFocus();
     await updateContextInfo(); // refresh indicator with new maxMessages
   } catch (e) {
     addInlineEvent("error", "Ustawienia", e.message || String(e));
@@ -2702,17 +2774,17 @@ if (modelSourceSelect) {
 if (pickManualModelBtn) {
   pickManualModelBtn.addEventListener("click", async () => {
     pickManualModelBtn.disabled = true;
-    if (manualImportStatus) manualImportStatus.textContent = "Status: wybieranie pliku...";
+    if (manualImportStatus) manualImportStatus.textContent = "Status: wybierz plik GGUF...";
     try {
       const result = await window.endocode.importLocalModel({
         displayName: manualModelName?.value?.trim() || "",
         description: manualModelDescription?.value?.trim() || "",
       });
       if (result?.canceled) {
-        if (manualImportStatus) manualImportStatus.textContent = "Status: anulowano";
+        if (manualImportStatus) manualImportStatus.textContent = "Status: anulowano import";
         return;
       }
-      if (manualImportStatus) manualImportStatus.textContent = "Status: zaimportowano model";
+      if (manualImportStatus) manualImportStatus.textContent = `Status: zaimportowano ${result?.model?.displayName || "model"}`;
       if (manualModelName) manualModelName.value = "";
       if (manualModelDescription) manualModelDescription.value = "";
       await loadModels();
@@ -2729,6 +2801,7 @@ if (pickManualModelBtn) {
 
 window.addAndDownload = async (modelKey) => {
   setDiscoveryLoading("Przygotowuję model do pobrania...");
+  setDiscoveryStatus("Dodawanie modelu do biblioteki...");
   try {
     const model = lastDiscoveryResults.get(modelKey);
     if (!model || !model.downloadUrl) throw new Error("Ten wynik nie ma bezpośredniego linku do pliku .gguf.");
@@ -2740,6 +2813,7 @@ window.addAndDownload = async (modelKey) => {
     });
     if (tabLibrary) tabLibrary.click();
     await loadModels();
+    setDiscoveryStatus("Uruchamiam pobieranie...");
     if (added?.model?.id) window.endocode.downloadModel(added.model.id);
   } catch (e) {
     alert(e.message);

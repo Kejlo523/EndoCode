@@ -102,13 +102,6 @@
       <header class="topbar">
         <div class="topbar-left">
           <h1 class="chat-title" id="chatTitle">Nowy czat</h1>
-          <div class="context-indicator" id="contextIndicator" title="Kontekst rozmowy">
-            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" style="transform: rotate(-90deg);">
-              <circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.5" stroke-opacity="0.2" />
-              <circle id="contextCircle" cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.5" stroke-dasharray="37.7" stroke-dashoffset="37.7" stroke-linecap="round" style="transition: stroke-dashoffset 0.3s ease, stroke 0.3s ease;" />
-            </svg>
-            <span id="contextText">0 / 32 wiadomości</span>
-          </div>
         </div>
         <div class="topbar-controls">
           <div class="control-pill">
@@ -206,6 +199,13 @@
                 </svg>
                 Sandbox
               </span>
+              <span class="context-indicator context-indicator-composer" id="contextIndicator" title="Kontekst rozmowy">
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none" style="transform: rotate(-90deg);">
+                  <circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.5" stroke-opacity="0.2" />
+                  <circle id="contextCircle" cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.5" stroke-dasharray="37.7" stroke-dashoffset="37.7" stroke-linecap="round" style="transition: stroke-dashoffset 0.3s ease, stroke 0.3s ease;" />
+                </svg>
+                <span id="contextText">0 / 32 wiadomości</span>
+              </span>
             </div>
             <div class="composer-buttons">
               <input type="file" id="fileInput" class="hidden" style="display:none;">
@@ -214,16 +214,11 @@
                   <path d="M14.5 8.5v3a2.5 2.5 0 01-5 0v-6a1.5 1.5 0 013 0v5a.5.5 0 01-1 0v-5a.5.5 0 00-1 0v6a1.5 1.5 0 003 0v-3h1.5z" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
                 </svg>
               </button>
-              <button id="stopBtn" type="button" class="stop-btn hidden" title="Zatrzymaj">
-                <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
-                  <rect x="3" y="3" width="10" height="10" rx="2" fill="currentColor" />
-                </svg>
-                Stop
-              </button>
-              <button id="send" type="submit" title="Wyślij (Ctrl+Enter)">
-                <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+              <button id="send" type="submit" title="Wyślij (Enter)">
+                <svg id="sendIcon" width="16" height="16" viewBox="0 0 16 16" fill="none">
                   <path d="M3 13V3l11 5-11 5z" fill="currentColor" />
                 </svg>
+                <span id="sendLabel">Start</span>
               </button>
             </div>
           </div>
@@ -243,11 +238,11 @@
         <span class="modal-title">Zatwierdź komendę</span>
       </div>
       <div class="modal-cwd" id="approvalCwd"></div>
-      <pre class="modal-command" id="approvalCommand"></pre>
-      <div class="modal-actions">
-        <button class="modal-btn reject" id="rejectCommand">Odrzuć</button>
-        <button class="modal-btn approve" id="approveCommand">Uruchom</button>
+      <div class="modal-actions modal-actions-inline">
+        <button class="modal-btn reject subtle" id="rejectCommand">Anuluj</button>
+        <button class="modal-btn approve subtle" id="approveCommand">Zatwierdź (Enter)</button>
       </div>
+      <pre class="modal-command" id="approvalCommand"></pre>
     </div>
   </div>
 
@@ -262,16 +257,19 @@
         <span class="modal-title">Biblioteka Modeli</span>
         <button class="modal-close" id="closeModels">&times;</button>
       </div>
-      <div class="models-tabs">
-        <button class="model-tab-btn active" id="tabLibrary">Moja Biblioteka</button>
-        <button class="model-tab-btn" id="tabInstalled">Zainstalowane</button>
-        <button class="model-tab-btn" id="tabDiscover">Odkrywaj</button>
-        <button class="model-tab-btn" id="tabManual">Dodaj ręcznie</button>
-      </div>
-      <div class="models-status" style="margin-bottom:10px;">
-        W kartach modeli najpierw patrz na: <strong>Typ</strong>, <strong>Rozmiar pliku</strong> i <strong>Kontekst</strong> — to najszybciej pokazuje, czy model pasuje do Twojego sprzętu.
-      </div>
-
+      <div class="models-layout">
+        <aside class="models-sidebar">
+          <div class="models-tabs models-tabs-vertical">
+            <button class="model-tab-btn active" id="tabLibrary">Moja Biblioteka</button>
+            <button class="model-tab-btn" id="tabInstalled">Zainstalowane</button>
+            <button class="model-tab-btn" id="tabDiscover">Odkrywaj</button>
+            <button class="model-tab-btn" id="tabManual">Dodaj ręcznie</button>
+          </div>
+          <div class="models-status models-sidebar-hint">
+            W kartach modeli patrz na: <strong>Typ</strong>, <strong>Rozmiar</strong> i <strong>Kontekst</strong>.
+          </div>
+        </aside>
+        <section class="models-main">
       <div id="modelsLibraryView">
         <div class="models-toolbar">
           <div class="models-import-group">
@@ -341,6 +339,8 @@
             <span class="models-status" id="manualImportStatus">Status: oczekiwanie</span>
           </div>
         </div>
+      </div>
+      </section>
       </div>
     </div>
   </div>
@@ -441,6 +441,16 @@
             <span class="setting-value" id="val_contextTokens">8192</span>
           </div>
         </div>
+        <div class="setting-row">
+          <div class="setting-info">
+            <label class="setting-name">Runtime Hard Cap (tokeny)</label>
+            <div class="setting-desc">Dodatkowy twardy limit runtime. 0 = auto (bez dodatkowego capu), wyższa wartość wymusza niższy limit.</div>
+          </div>
+          <div class="setting-control">
+            <input type="range" id="set_runtimeContextCap" min="0" max="262144" step="2048" value="0">
+            <span class="setting-value" id="val_runtimeContextCap">auto</span>
+          </div>
+        </div>
         <!-- GPU Layers -->
         <div class="setting-row">
           <div class="setting-info">
@@ -512,6 +522,16 @@
           <div class="setting-control">
             <input type="range" id="set_parallel" min="1" max="8" step="1" value="1">
             <span class="setting-value" id="val_parallel">1</span>
+          </div>
+        </div>
+        <div class="setting-row">
+          <div class="setting-info">
+            <label class="setting-name">Runtime Fast Startup</label>
+            <div class="setting-desc">0 = stabilny start (pełne sprawdzenie), 1 = szybszy start runtime.</div>
+          </div>
+          <div class="setting-control">
+            <input type="range" id="set_fastStartup" min="0" max="1" step="1" value="1">
+            <span class="setting-value" id="val_fastStartup">on</span>
           </div>
         </div>
         <div class="setting-row">

@@ -266,6 +266,9 @@ let mainWindow;
 let serverProcess = null;
 let serverOwned = false;
 let runningModelId = null;
+let runningContextTokens = null;
+let runningGpuLayers = null;
+let runtimeAvailableContextTokens = null;
 let runInProgress = false;
 let runAbortController = null;
 const runQueue = [];
@@ -309,6 +312,7 @@ const DEFAULT_MODEL_SETTINGS = {
   topK: null,
   repeatPenalty: null,
   contextTokens: null,   // override for model context window
+  runtimeContextCap: 0,  // 0 = auto, >0 hard runtime cap
   gpuLayers: null,       // override for GPU offload layers
   maxMessages: null,     // override for compaction threshold
   threads: null,
@@ -441,9 +445,13 @@ async function deriveQuickChoicesWithModel(finalText, intentClass, history, abor
 }
 
 async function buildQuickChoicesForFinal(finalText = "", intentClass = "general", metrics = {}, abortSignal = null) {
-  const fallback = buildFallbackQuickChoicesForFinal(finalText, intentClass, metrics);
-  const isQuestionLike = /[?？]\s*$/.test(String(finalText || "").trim()) || /\b(czy|wybierz|chcesz|which|choose)\b/i.test(String(finalText || ""));
-  if (!isQuestionLike) return null;
+  const text = String(finalText || "").trim();
+  if (!text) return null;
+  const fallback = buildFallbackQuickChoicesForFinal(text, intentClass, metrics);
+  const isQuestionLike = /[?？]\s*$/.test(text) || /\b(czy|wybierz|chcesz|which|choose)\b/i.test(text);
+  const hasUncertainty = /\b(nie wiem|nie jestem pewien|potrzebuje doprecyzowania|doprecyzuj|wybierz opcje|which option)\b/i.test(text);
+  const hasRecoverySignals = Number(metrics?.toolErrors || 0) > 0 || Number(metrics?.parseErrors || 0) > 0;
+  if (!isQuestionLike && !hasUncertainty && !hasRecoverySignals) return null;
   const modelChoices = await deriveQuickChoicesWithModel(finalText, intentClass, messages, abortSignal);
   return normalizeModelQuickChoices(modelChoices, fallback);
 }
@@ -2288,12 +2296,16 @@ async function fetchJsonViaHttpsWithRetry(url, attempts = 3) {
 
 function estimateTokens(msgs) {
   let chars = 0;
+  let words = 0;
   for (const m of msgs) {
-    chars += String(m.role || "").length;
-    if (typeof m.content === "string") chars += m.content.length;
-    else chars += JSON.stringify(m.content || "").length;
+    const role = String(m.role || "");
+    const body = typeof m.content === "string" ? m.content : JSON.stringify(m.content || "");
+    chars += role.length + body.length;
+    words += body.trim() ? body.trim().split(/\s+/).length : 0;
   }
-  return Math.ceil(chars / 3.5) + msgs.length * 4;
+  const byChars = chars / 3.8;
+  const byWords = words * 1.25;
+  return Math.ceil(Math.max(byChars, byWords) + msgs.length * 3);
 }
 
 function contentToText(content) {
@@ -2362,8 +2374,22 @@ function buildModelMessages(rawMessages) {
 function getContextInfo() {
   const tokens = estimateTokens(messages);
   const model = getModelConfig();
-  const modelSettings = getModelSettingsForId(model?.id || selectedModelId);
-  const contextTokensLimit = clampContextTokens(modelSettings.contextTokens ?? model?.contextTokens ?? 8192);
+  const selectedId = model?.id || selectedModelId;
+  const configuredContextLimit = getEffectiveContextTokensForModel(selectedId);
+  const runtimeContextLimit = (
+    serverOwned &&
+    runningModelId === selectedId &&
+    Number.isFinite(Number(runningContextTokens)) &&
+    Number(runningContextTokens) > 0
+  ) ? Number(runningContextTokens) : null;
+  const runtimeSlotLimit = Number.isFinite(Number(runtimeAvailableContextTokens)) && Number(runtimeAvailableContextTokens) > 0
+    ? Number(runtimeAvailableContextTokens)
+    : null;
+  const contextTokensLimit = runtimeSlotLimit != null
+    ? Math.min(configuredContextLimit, runtimeSlotLimit)
+    : runtimeContextLimit != null
+      ? Math.min(configuredContextLimit, runtimeContextLimit)
+    : configuredContextLimit;
   const maxMessages = getActiveMaxMessages();
   const isNearCompaction = messages.length > maxMessages - 4 || tokens > contextTokensLimit * 0.8;
   return {
@@ -2371,6 +2397,9 @@ function getContextInfo() {
     maxMessages,
     estimatedTokens: tokens,
     maxTokens: contextTokensLimit,
+    configuredMaxTokens: configuredContextLimit,
+    runtimeMaxTokens: runtimeSlotLimit ?? runtimeContextLimit,
+    needsRuntimeRestart: runtimeContextLimit != null && runtimeContextLimit !== configuredContextLimit,
     willCompactAt: maxMessages,
     isNearCompaction,
   };
@@ -2390,6 +2419,20 @@ function getModelConfig() {
 function getModelSettingsForId(modelId = selectedModelId) {
   const raw = customModelSettingsByModelId?.[modelId] || {};
   return { ...DEFAULT_MODEL_SETTINGS, ...raw };
+}
+
+function getEffectiveContextTokensForModel(modelId = selectedModelId) {
+  const catalog = loadModelCatalog();
+  const model = catalog.models.find((entry) => entry.id === modelId) || getModelConfig();
+  if (!model) return MIN_CONTEXT_TOKENS;
+  const tokenLimits = getTokenRuntimeLimits();
+  const settings = getModelSettingsForId(model.id);
+  let effective = clampContextTokens(settings.contextTokens ?? model.contextTokens ?? 8192, tokenLimits);
+  const hardCap = Number(settings.runtimeContextCap || 0);
+  if (Number.isFinite(hardCap) && hardCap > 0) {
+    effective = Math.min(effective, clampContextTokens(hardCap, tokenLimits));
+  }
+  return effective;
 }
 
 function setModelSettingsForId(modelId, patch = {}) {
@@ -2976,6 +3019,9 @@ async function launchServerProcess(config, modelPath, port, contextTokens, gpuLa
   serverProcess = child;
   serverOwned = true;
   runningModelId = selectedModelId;
+  runningContextTokens = Number(contextTokens) || null;
+  runningGpuLayers = Number(gpuLayers) || 0;
+  runtimeAvailableContextTokens = null;
 
   child.once("exit", (code) => {
     emit("status", { status: "server-stopped", detail: `llama-server zakonczyl prace: ${code}` });
@@ -2983,6 +3029,9 @@ async function launchServerProcess(config, modelPath, port, contextTokens, gpuLa
       serverProcess = null;
       serverOwned = false;
       runningModelId = null;
+      runningContextTokens = null;
+      runningGpuLayers = null;
+      runtimeAvailableContextTokens = null;
     }
   });
 
@@ -3044,8 +3093,15 @@ function getRuntimeEngine() {
       baselineMetrics,
       emit,
       getSelectedModelId: () => selectedModelId,
+      isServerOwned: () => serverOwned,
       getRunningModelId: () => runningModelId,
+      getRunningContextTokens: () => runningContextTokens,
+      getRunningGpuLayers: () => runningGpuLayers,
       setRunningModelId: (value) => { runningModelId = value; },
+      setRunningRuntimeConfig: (payload = {}) => {
+        runningContextTokens = Number(payload.contextTokens || 0) || null;
+        runningGpuLayers = Number(payload.gpuLayers || 0) || 0;
+      },
     });
   }
   return runtimeEngine;
@@ -3071,6 +3127,9 @@ async function stopOwnedServer(options = {}) {
     serverProcess = null;
     serverOwned = false;
     runningModelId = null;
+    runningContextTokens = null;
+    runningGpuLayers = null;
+    runtimeAvailableContextTokens = null;
     for (let i = 0; i < 30; i += 1) {
       if (child.exitCode !== null) break;
       await sleep(100);
@@ -3110,6 +3169,9 @@ async function killModelServerResources() {
   serverProcess = null;
   serverOwned = false;
   runningModelId = null;
+  runningContextTokens = null;
+  runningGpuLayers = null;
+  runtimeAvailableContextTokens = null;
   const stillAlive = [alive ? DEFAULT_PORT : null].filter(Boolean);
   const detail = stillAlive.length
     ? `Kill switch wykonany, ale nadal odpowiadaja porty: ${stillAlive.join(", ")}.`
@@ -3149,6 +3211,10 @@ async function callModel(messages, abortSignal, options = {}, step = null) {
     abortGuard.reset();
     if (!res.ok) {
       const text = await res.text();
+      if (/exceed_context_size_error|exceeds the available context size/i.test(text)) {
+        const available = text.match(/available context size \((\d+)\s*tokens\)/i);
+        if (available?.[1]) runtimeAvailableContextTokens = Number(available[1]);
+      }
       throw new Error(`Model API ${res.status}: ${text.slice(0, 600)}`);
     }
 
@@ -3928,7 +3994,7 @@ async function getNextActionWithRepair(abortSignal, failedModelIds, step = null)
     const model = getModelConfig();
     const modelSettings = getModelSettingsForId(model?.id || selectedModelId);
     const preferredEditFormat = getPreferredEditFormat(model?.id || selectedModelId, currentAgentIntentClass);
-    const contextTokensLimit = clampContextTokens(modelSettings.contextTokens ?? model?.contextTokens ?? 8192);
+    const contextTokensLimit = getEffectiveContextTokensForModel(model?.id || selectedModelId);
     const plannerPromptLimit = Math.max(MIN_CONTEXT_TOKENS, Math.floor(contextTokensLimit * 0.78));
     if (estimateTokens(promptMessages) > plannerPromptLimit && promptMessages.length > 3) {
       const head = promptMessages[0];
@@ -4264,6 +4330,18 @@ const blockedShellPatterns = [
   { re: /(^|[\s"'])\.\.([\\/]|[\s"']|$)/, reason: "wyjscie przez .. jest zablokowane" },
 ];
 
+const SHELL_MUTATING_PATTERNS = [
+  /(^|[^a-z0-9_])(rm|rmdir|del|erase|move|mv|copy|cp|ren|rename-item|set-content|add-content|out-file|new-item|remove-item|set-itemproperty)\b/i,
+  /(^|[^a-z0-9_])(git\s+(add|commit|push|reset|checkout|switch|restore|merge|rebase|cherry-pick))\b/i,
+  />{1,2}\s*[^|]/,
+  /\btee\b/i,
+];
+
+const SHELL_SAFE_READONLY_PATTERNS = [
+  /(^|[^a-z0-9_])(pwd|cd|ls|dir|echo|whoami|date|time|hostname|ver|where|which)\b/i,
+  /(^|[^a-z0-9_])(get-childitem|get-location|get-process|get-date|get-command|get-history|systeminfo)\b/i,
+];
+
 function getShellPolicyWarnings(command = "") {
   const cmd = String(command || "");
   const warnings = [];
@@ -4273,19 +4351,37 @@ function getShellPolicyWarnings(command = "") {
   return [...new Set(warnings)];
 }
 
+function classifyShellApproval(command = "", policyWarnings = []) {
+  const cmd = String(command || "").trim();
+  if (!cmd) return { requiresApproval: true, reason: "empty" };
+  if (policyWarnings.length > 0) return { requiresApproval: true, reason: "policy-warning" };
+  if (SHELL_MUTATING_PATTERNS.some((re) => re.test(cmd))) {
+    return { requiresApproval: true, reason: "mutating-command" };
+  }
+  if (SHELL_SAFE_READONLY_PATTERNS.some((re) => re.test(cmd))) {
+    return { requiresApproval: false, reason: "readonly-command" };
+  }
+  return { requiresApproval: true, reason: "uncertain-command" };
+}
+
 async function runPowerShell(command, timeoutSeconds) {
   const policyWarnings = getShellPolicyWarnings(command);
-  const commandForApproval = policyWarnings.length
-    ? `${command}\n\n[Ostrzezenia sandbox]\n- ${policyWarnings.join("\n- ")}\nUruchomic mimo ostrzezen?`
-    : command;
-  const approved = await askApproval({
-    title: policyWarnings.length
-      ? "Model prosi o uruchomienie komendy (ostrzezenia sandbox)"
-      : "Model prosi o uruchomienie komendy",
-    cwd: relativeToRoot(cwd),
-    command: commandForApproval,
-  });
-  if (!approved) throw new Error("Uzytkownik odrzucil komende.");
+  const approvalPolicy = classifyShellApproval(command, policyWarnings);
+  if (approvalPolicy.requiresApproval) {
+    const commandForApproval = policyWarnings.length
+      ? `${command}\n\n[Ostrzezenia sandbox]\n- ${policyWarnings.join("\n- ")}\nUruchomic mimo ostrzezen?`
+      : command;
+    const approved = await askApproval({
+      title: policyWarnings.length
+        ? "Model prosi o uruchomienie komendy (ostrzezenia sandbox)"
+        : "Model prosi o uruchomienie komendy",
+      cwd: relativeToRoot(cwd),
+      command: commandForApproval,
+    });
+    if (!approved) throw new Error("Uzytkownik odrzucil komende.");
+  } else {
+    emit("status", { status: "shell-auto-approved", detail: `Auto-zgoda shell (${approvalPolicy.reason}).` });
+  }
 
   return new Promise((resolve) => {
     const timeout = Math.max(1, Math.min(Number(timeoutSeconds) || 60, 300)) * 1000;
@@ -5016,8 +5112,7 @@ function shrinkRetainedMessageForCompaction(msg, maxChars) {
 function compactMessages() {
   const tokens = estimateTokens(messages);
   const model = getModelConfig();
-  const modelSettings = getModelSettingsForId(model?.id || selectedModelId);
-  const contextTokensLimit = clampContextTokens(modelSettings.contextTokens ?? model?.contextTokens ?? 8192);
+  const contextTokensLimit = getEffectiveContextTokensForModel(model?.id || selectedModelId);
   const maxMessages = getActiveMaxMessages();
   const overTokens = tokens > contextTokensLimit * 0.85;
   if (messages.length <= maxMessages && !overTokens) return;
@@ -5103,6 +5198,19 @@ function formatChatFacingError(error, options = {}) {
   }
   if (/Model API 5\d\d/i.test(raw)) {
     return `Runtime modelu ${modelName} zwrocil blad API (${detail}). Sprobuj ponownie lub przelacz na lzejszy model.`;
+  }
+  if (/Model API 400/i.test(raw) && /exceed_context_size_error|exceeds the available context size/i.test(raw)) {
+    const req = raw.match(/request \((\d+)\s*tokens\)/i);
+    const avail = raw.match(/available context size \((\d+)\s*tokens\)/i);
+    const requested = req?.[1] ? Number(req[1]) : null;
+    const available = avail?.[1] ? Number(avail[1]) : getEffectiveContextTokensForModel();
+    const reqText = Number.isFinite(requested) ? requested.toLocaleString("pl-PL") : "za duzo";
+    const availText = Number.isFinite(available) ? available.toLocaleString("pl-PL") : "nieznany";
+    const configured = getEffectiveContextTokensForModel();
+    if (Number.isFinite(available) && available < configured) {
+      return `Zadanie zatrzymane: model przyjal maksymalnie ${availText} tokenow (zadanie mialo ${reqText}). Ten model ma wewnetrzny limit kontekstu i runtime ucial slot do ${availText}, nawet przy wyzszym suwaku. Zmniejsz Max Tokens / skroc rozmowe albo wybierz model z wiekszym natywnym kontekstem.`;
+    }
+    return `Zadanie zatrzymane: kontekst zapytania jest za duzy (${reqText} tokenow), a runtime ma limit ${availText}. Zwieksz Context Window i zrestartuj runtime (lub uzyj kill switcha), ewentualnie zmniejsz Max Tokens / wyczysc czat.`;
   }
   if (/timeout|nie wyslal danych/i.test(raw)) {
     return `Model ${modelName} nie odpowiedzial na czas. Sprobuj ponownie albo zmniejsz ustawienia runtime.`;
@@ -5213,9 +5321,16 @@ async function runAgent(userText) {
       failedModelIds,
     });
     const finalText = String(result?.final || "");
-    const quickChoices = await buildQuickChoicesForFinal(finalText, currentAgentIntentClass, agentRecoveryMetrics, signal);
     emit("final", { text: finalText });
-    if (quickChoices) emit("quick-choices", quickChoices);
+    try {
+      const quickChoices = await Promise.race([
+        buildQuickChoicesForFinal(finalText, currentAgentIntentClass, agentRecoveryMetrics, signal),
+        new Promise((resolve) => setTimeout(() => resolve(null), 1800)),
+      ]);
+      if (quickChoices) emit("quick-choices", quickChoices);
+    } catch {
+      // quick choices are optional and should never block final output
+    }
     messages.push({ role: "assistant", content: JSON.stringify({ final: finalText }) });
     baselineMetrics.recordRun({ mode: "agent", latencyMs: Date.now() - startedAt, ok: true, backend: runtimeBackendStatus.activeBackend });
     return { ok: true, final: finalText };
@@ -5546,6 +5661,12 @@ app.whenReady().then(async () => {
   for (const [modelId, rawSettings] of Object.entries(customModelSettingsByModelId)) {
     const normalized = { ...DEFAULT_MODEL_SETTINGS, ...(rawSettings || {}) };
     if (normalized.contextTokens != null) normalized.contextTokens = clampContextTokens(normalized.contextTokens);
+    if (normalized.runtimeContextCap != null) {
+      const cap = Number(normalized.runtimeContextCap);
+      normalized.runtimeContextCap = Number.isFinite(cap) && cap > 0 ? clampContextTokens(cap) : 0;
+    } else {
+      normalized.runtimeContextCap = 0;
+    }
     if (normalized.maxMessages != null) normalized.maxMessages = clampMaxMessages(normalized.maxMessages);
     customModelSettingsByModelId[modelId] = normalized;
   }
@@ -5624,8 +5745,6 @@ ipcMain.handle("app:set-model", async (_event, modelId) => {
     });
   }
   saveAppSettings();
-  messages = createInitialMessages();
-  if (agentCore?.memory) agentCore.memory.hardReset("");
   if (serverOwned) await stopOwnedServer();
   emit("status", { status: "model-selected", detail: `Wybrano model: ${model.displayName}` });
   return getState();
@@ -6002,6 +6121,26 @@ async function searchHuggingFaceModels(options, profile) {
   }).filter(Boolean);
 }
 
+async function searchModelScopeModels(options, profile) {
+  const baseQuery = String(options.query || "").trim();
+  if (!baseQuery) return [];
+  const nameQuery = `${baseQuery} gguf ${filterQuerySuffix(options.filter)}`.trim();
+  const url = `https://www.modelscope.cn/api/v1/models?PageNumber=1&PageSize=20&Name=${encodeURIComponent(nameQuery)}`;
+  const data = await fetchJson(url);
+  const rows = Array.isArray(data?.Data?.Models) ? data.Data.Models : [];
+  const out = [];
+  for (const row of rows) {
+    const repoId = String(row?.Path || row?.Name || "").trim();
+    if (!repoId || !repoId.includes("/")) continue;
+    try {
+      out.push(await getModelScopeRepoResult(repoId, profile));
+    } catch {
+      // ignore rows without gguf files
+    }
+  }
+  return out;
+}
+
 function parseModelScopeRepoQuery(query) {
   const value = String(query || "").trim();
   if (!value) return "";
@@ -6114,8 +6253,16 @@ async function searchModelSources(options = {}) {
       } catch (error) {
         results.push({ ...buildExternalSourceCard("modelscope", query), description: `Błąd ModelScope: ${error.message}` });
       }
-    } else if (source === "modelscope") {
-      results.push(buildExternalSourceCard("modelscope", query));
+    } else {
+      try {
+        const msResults = await searchModelScopeModels(options, profile);
+        if (msResults.length) results.push(...msResults);
+      } catch {
+        // fallback card below
+      }
+      if (source === "modelscope" && !results.some((item) => item.source === "modelscope")) {
+        results.push(buildExternalSourceCard("modelscope", query));
+      }
     }
   }
 
@@ -6123,14 +6270,14 @@ async function searchModelSources(options = {}) {
     results.push(buildExternalSourceCard("github", query));
   }
 
-  // Sort: Presets first, then by recommendation score
+  // Prefer live provider results first; presets are fallback.
   return results
     .sort((a, b) => {
-      if (a.source === "presets" && b.source !== "presets") return -1;
-      if (a.source !== "presets" && b.source === "presets") return 1;
+      if (a.source === "presets" && b.source !== "presets") return 1;
+      if (a.source !== "presets" && b.source === "presets") return -1;
       return (Number(b.recommended) - Number(a.recommended)) || ((b.recommendation?.score || 0) - (a.recommendation?.score || 0));
     })
-    .slice(0, 30);
+    .slice(0, 60);
 }
 
 ipcMain.handle("app:search-models", async (_event, options) => searchModelSources(options));
@@ -6222,8 +6369,8 @@ async function performDownload(url, dest, modelId) {
 
 const MODEL_RUNTIME_WHITELIST = new Set([
   "temperature", "maxTokens", "maxSteps", "topP", "topK", "repeatPenalty",
-  "contextTokens", "gpuLayers", "maxMessages", "threads", "threadsBatch",
-  "batchSize", "ubatchSize", "parallel", "flashAttention", "cacheTypeK",
+  "contextTokens", "runtimeContextCap", "gpuLayers", "maxMessages", "threads", "threadsBatch",
+  "batchSize", "ubatchSize", "parallel", "fastStartup", "flashAttention", "cacheTypeK",
   "cacheTypeV", "reasoning", "reasoningBudget", "extraServerArgs",
 ]);
 
@@ -6231,7 +6378,11 @@ function getEffectiveSettingsForModel(modelId) {
   const model = loadModelCatalog().models.find((entry) => entry.id === modelId) || getModelConfig();
   const selected = getModelSettingsForId(model?.id || modelId);
   const tokenLimits = getTokenRuntimeLimits();
-  const contextTokens = clampContextTokens(selected.contextTokens ?? model?.contextTokens ?? 8192, tokenLimits);
+  const rawContextTokens = clampContextTokens(selected.contextTokens ?? model?.contextTokens ?? 8192, tokenLimits);
+  const hardCap = Number(selected.runtimeContextCap || 0);
+  const contextTokens = Number.isFinite(hardCap) && hardCap > 0
+    ? Math.min(rawContextTokens, clampContextTokens(hardCap, tokenLimits))
+    : rawContextTokens;
   return {
     temperature: selected.temperature ?? getReasoningProfile().temperature,
     maxTokens: clampResponseTokens(selected.maxTokens ?? getReasoningProfile().maxTokens, tokenLimits),
@@ -6240,6 +6391,9 @@ function getEffectiveSettingsForModel(modelId) {
     topK: selected.topK ?? null,
     repeatPenalty: selected.repeatPenalty ?? null,
     contextTokens,
+    runtimeContextCap: Number(selected.runtimeContextCap || 0) > 0
+      ? clampContextTokens(selected.runtimeContextCap, tokenLimits)
+      : 0,
     gpuLayers: selected.gpuLayers ?? model?.gpuLayers ?? 99,
     maxMessages: clampMaxMessages(selected.maxMessages ?? model?.maxMessages ?? 32, tokenLimits),
     threads: selected.threads ?? model?.threads ?? null,
@@ -6247,6 +6401,7 @@ function getEffectiveSettingsForModel(modelId) {
     batchSize: selected.batchSize ?? model?.batchSize ?? null,
     ubatchSize: selected.ubatchSize ?? model?.ubatchSize ?? null,
     parallel: selected.parallel ?? model?.parallel ?? null,
+    fastStartup: selected.fastStartup ?? model?.fastStartup ?? "on",
     flashAttention: selected.flashAttention ?? model?.flashAttention ?? null,
     cacheTypeK: selected.cacheTypeK ?? model?.cacheTypeK ?? null,
     cacheTypeV: selected.cacheTypeV ?? model?.cacheTypeV ?? null,
@@ -6264,6 +6419,10 @@ function sanitizeSettingsPatch(rawSettings = {}) {
   }
   const tokenLimits = getTokenRuntimeLimits();
   if (patch.contextTokens != null) patch.contextTokens = clampContextTokens(patch.contextTokens, tokenLimits);
+  if (patch.runtimeContextCap != null) {
+    const cap = Number(patch.runtimeContextCap);
+    patch.runtimeContextCap = !Number.isFinite(cap) || cap <= 0 ? 0 : clampContextTokens(cap, tokenLimits);
+  }
   if (patch.maxTokens != null) patch.maxTokens = clampResponseTokens(patch.maxTokens, tokenLimits);
   if (patch.maxMessages != null) patch.maxMessages = clampMaxMessages(patch.maxMessages, tokenLimits);
   if (patch.reasoningBudget != null) patch.reasoningBudget = clampReasoningBudget(patch.reasoningBudget, tokenLimits);
@@ -6273,6 +6432,7 @@ function sanitizeSettingsPatch(rawSettings = {}) {
   if (patch.batchSize != null) patch.batchSize = clampRuntimeNumber(patch.batchSize, SAFE_RUNTIME_LIMITS.batchMin, SAFE_RUNTIME_LIMITS.batchMax);
   if (patch.ubatchSize != null) patch.ubatchSize = clampRuntimeNumber(patch.ubatchSize, SAFE_RUNTIME_LIMITS.ubatchMin, SAFE_RUNTIME_LIMITS.ubatchMax);
   if (patch.parallel != null) patch.parallel = clampRuntimeNumber(patch.parallel, SAFE_RUNTIME_LIMITS.parallelMin, SAFE_RUNTIME_LIMITS.parallelMax);
+  if (patch.fastStartup != null) patch.fastStartup = String(patch.fastStartup) === "off" || Number(patch.fastStartup) === 0 ? "off" : "on";
   return patch;
 }
 
@@ -6309,7 +6469,7 @@ ipcMain.handle("app:set-model-settings", async (_event, payload) => {
   setModelSettingsForId(targetModelId, settings);
   resetRuntimeRecoveryState(targetModelId);
   saveAppSettings();
-  const requiresRestart = ["contextTokens", "gpuLayers", "threads", "threadsBatch", "batchSize", "ubatchSize", "parallel", "flashAttention", "cacheTypeK", "cacheTypeV", "reasoning", "reasoningBudget", "extraServerArgs"]
+  const requiresRestart = ["contextTokens", "gpuLayers", "threads", "threadsBatch", "batchSize", "ubatchSize", "parallel", "fastStartup", "flashAttention", "cacheTypeK", "cacheTypeV", "reasoning", "reasoningBudget", "extraServerArgs"]
     .some((key) => settings[key] !== undefined);
   if (requiresRestart && serverOwned && targetModelId === selectedModelId) {
     await stopOwnedServer();

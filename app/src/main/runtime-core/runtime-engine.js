@@ -12,8 +12,12 @@ function createRuntimeEngine(options = {}) {
     baselineMetrics,
     emit = () => {},
     getSelectedModelId = () => "",
+    isServerOwned = () => false,
     getRunningModelId = () => null,
+    getRunningContextTokens = () => null,
+    getRunningGpuLayers = () => null,
     setRunningModelId = () => {},
+    setRunningRuntimeConfig = () => {},
   } = options;
 
   async function ensureReady(port) {
@@ -24,16 +28,37 @@ function createRuntimeEngine(options = {}) {
       throw new Error("Ten model nie jest lokalnym GGUF.");
     }
 
+    const desiredContextTokens = Number(modelSettings.contextTokens ?? config.contextTokens ?? 8192);
+    const desiredGpuLayers = Number(modelSettings.gpuLayers ?? config.gpuLayers ?? 99);
+
     if (await isServerReady(port)) {
       const liveModel = await getServerModelId(port);
       const expectedFile = config.file || "";
       const matchesCurrent = getRunningModelId() === selectedModelId ||
         liveModel === config.serverModel ||
         (liveModel && liveModel.includes(expectedFile));
+      const ownedServer = Boolean(isServerOwned());
+      const sameContext = Number(getRunningContextTokens()) === desiredContextTokens;
+      const sameGpuLayers = Number(getRunningGpuLayers()) === desiredGpuLayers;
+      const runtimeCompatible = !ownedServer || (sameContext && sameGpuLayers);
       if (matchesCurrent) {
-        setRunningModelId(selectedModelId);
-        emit("status", { status: "server-ready", detail: `Uzywam aktywnego serwera: ${config.displayName}.` });
-        return;
+        if (!runtimeCompatible && ownedServer) {
+          emit("status", {
+            status: "server-restart-required",
+            detail: `Restart runtime: ctx ${getRunningContextTokens() || "?"} -> ${desiredContextTokens}, GPU ${getRunningGpuLayers() || 0} -> ${desiredGpuLayers}.`,
+          });
+          await stopOwnedServer();
+        } else {
+          if (!runtimeCompatible && !ownedServer) {
+            throw new Error(
+              `Aktywny serwer modelu działa z inną konfiguracją runtime. Użyj kill switcha i uruchom ponownie, aby zastosować ctx ${desiredContextTokens}.`,
+            );
+          }
+          setRunningModelId(selectedModelId);
+          setRunningRuntimeConfig({ contextTokens: desiredContextTokens, gpuLayers: desiredGpuLayers });
+          emit("status", { status: "server-ready", detail: `Uzywam aktywnego serwera: ${config.displayName}.` });
+          return;
+        }
       }
       await stopOwnedServer();
     }
@@ -45,8 +70,8 @@ function createRuntimeEngine(options = {}) {
       throw new Error(`Model nie jest jeszcze gotowy: ${config.displayName} (${percent}%).`);
     }
 
-    const contextTokens = modelSettings.contextTokens ?? config.contextTokens ?? 8192;
-    const configuredGpuLayers = modelSettings.gpuLayers ?? config.gpuLayers ?? 99;
+    const contextTokens = desiredContextTokens;
+    const configuredGpuLayers = desiredGpuLayers;
     const gpuLayerAttempts = modelSettings.gpuLayers != null
       ? [configuredGpuLayers]
       : [...new Set([configuredGpuLayers, ...(config.gpuLayerFallbacks || [])])];
@@ -78,6 +103,7 @@ function createRuntimeEngine(options = {}) {
       try {
         await launchServerProcess(runtimeConfig, modelPath, port, contextTokens, gpuLayerAttempts[i]);
         setRunningModelId(selectedModelId);
+        setRunningRuntimeConfig({ contextTokens, gpuLayers: gpuLayerAttempts[i] });
         resetRuntimeRecoveryState(selectedModelId);
         return;
       } catch (error) {

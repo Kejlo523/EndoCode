@@ -1,35 +1,27 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="EndoCode">
   <defs>
-    <linearGradient id="bg" x1="38" y1="20" x2="220" y2="236" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#172033"/>
-      <stop offset="1" stop-color="#080b11"/>
+    <linearGradient id="bg" x1="28" y1="16" x2="236" y2="248" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#1e2740"/>
+      <stop offset="1" stop-color="#090c12"/>
     </linearGradient>
-    <linearGradient id="mark" x1="56" y1="60" x2="202" y2="196" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#20e6bd"/>
-      <stop offset="0.55" stop-color="#37b7ff"/>
+    <linearGradient id="orb" x1="78" y1="52" x2="186" y2="198" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#7cf6de"/>
+      <stop offset="0.5" stop-color="#46b9ff"/>
+      <stop offset="1" stop-color="#9f8bff"/>
+    </linearGradient>
+    <linearGradient id="ring" x1="52" y1="40" x2="210" y2="214" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#9ff3df"/>
       <stop offset="1" stop-color="#f0b952"/>
     </linearGradient>
-    <filter id="softGlow" x="-30%" y="-30%" width="160%" height="160%">
-      <feGaussianBlur stdDeviation="7" result="blur"/>
-      <feColorMatrix in="blur" type="matrix" values="0 0 0 0 0.12 0 0 0 0 0.86 0 0 0 0 0.72 0 0 0 0.5 0"/>
-      <feMerge>
-        <feMergeNode/>
-        <feMergeNode in="SourceGraphic"/>
-      </feMerge>
-    </filter>
   </defs>
 
-  <rect x="12" y="12" width="232" height="232" rx="54" fill="url(#bg)"/>
-  <rect x="22" y="22" width="212" height="212" rx="44" fill="none" stroke="#273244" stroke-width="3"/>
+  <rect x="10" y="10" width="236" height="236" rx="58" fill="url(#bg)"/>
+  <rect x="22" y="22" width="212" height="212" rx="46" fill="none" stroke="#2a3550" stroke-width="3"/>
 
-  <g filter="url(#softGlow)" stroke="url(#mark)" stroke-linecap="round" stroke-linejoin="round" fill="none">
-    <path d="M62 84 L106 128 L62 172" stroke-width="18"/>
-    <path d="M130 84 H196" stroke-width="16"/>
-    <path d="M130 128 H184" stroke-width="16"/>
-    <path d="M130 172 H198" stroke-width="16"/>
-    <path d="M130 84 V172" stroke-width="16"/>
-  </g>
-
-  <circle cx="199" cy="69" r="12" fill="#f0b952"/>
-  <circle cx="199" cy="69" r="5" fill="#fff2ca"/>
+  <circle cx="128" cy="128" r="54" fill="url(#orb)" opacity="0.92"/>
+  <path d="M60 145c0-48 34-84 86-84 29 0 53 10 71 27" fill="none" stroke="url(#ring)" stroke-width="14" stroke-linecap="round"/>
+  <path d="M195 105l22-17" stroke="#f0b952" stroke-width="10" stroke-linecap="round"/>
+  <path d="M196 152c-8 25-30 43-68 43-31 0-52-8-68-24" fill="none" stroke="#8cc7ff" stroke-width="10" stroke-linecap="round"/>
+  <circle cx="170" cy="86" r="7" fill="#fff2ca"/>
+  <circle cx="92" cy="182" r="6" fill="#b8f6e6"/>
 </svg>
