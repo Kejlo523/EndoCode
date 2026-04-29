@@ -220,7 +220,7 @@ DOSTEPNE NARZEDZIA:
 ${TOOLS_PROMPT_BLOCK}
 
 PODSTAWOWY LOOP:
-1. Zrozum zadanie i sprawdz obecny folder. Jesli wejdziesz do podfolderu (cd), pracuj dalej w nim dopoki zadanie nie wymaga innego miejsca.
+1. Zrozum zadanie i sprawdz obecny folder. Przy operacjach na plikach i komendach uwzgledniaj biezacy folder jako kontekst sciezek; zmieniaj folder tylko gdy to ma sens dla zadania.
 2. Przed edycja istniejacego pliku przeczytaj istotny fragment.
 3. Zmieniaj najmniejszy sensowny fragment. Nie przepisuj calego pliku dla drobnej poprawki.
 4. Po bledzie przeczytaj dokladna tresc bledu, popraw przyczyne i sprobuj ponownie.
@@ -2486,7 +2486,7 @@ function getContextInfo() {
     ? Math.min(configuredContextLimit, runtimeSlotLimit)
     : runtimeContextLimit != null
       ? Math.min(configuredContextLimit, runtimeContextLimit)
-    : configuredContextLimit;
+      : configuredContextLimit;
   const maxMessages = getActiveMaxMessages();
   const isNearCompaction = messages.length > maxMessages - 4 || tokens > contextTokensLimit * 0.8;
   return {
@@ -2999,7 +2999,7 @@ async function hoistRuntimeDlls(runtimeDir) {
   for (const dllPath of dlls) {
     if (path.dirname(dllPath) === runtimeDir) continue;
     const target = path.join(runtimeDir, path.basename(dllPath));
-    await fsp.copyFile(dllPath, target).catch(() => {});
+    await fsp.copyFile(dllPath, target).catch(() => { });
   }
 }
 
@@ -3020,7 +3020,7 @@ async function installLlamaRuntime() {
         source: "existing",
         installTarget: target,
         expectedBackend,
-      }).catch(() => {});
+      }).catch(() => { });
       return { ok: true, alreadyInstalled: true, serverExe: alreadyInstalled, target, expectedBackend };
     }
     emit("status", {
@@ -3088,7 +3088,7 @@ async function installLlamaRuntime() {
           await downloadFileWithProgress(cudaCompanionAsset.browser_download_url, companionArchivePath, "Pobieranie cudart");
           emit("runtime-install-progress", { phase: "extract", progress: 90, detail: "Rozpakowywanie cudart..." });
           await extractRuntimeArchive(companionArchivePath, extractDir);
-          await fsp.rm(companionArchivePath, { force: true }).catch(() => {});
+          await fsp.rm(companionArchivePath, { force: true }).catch(() => { });
         }
 
         emit("runtime-install-progress", { phase: "install", progress: 92, detail: "Kopiowanie runtime..." });
@@ -3110,11 +3110,11 @@ async function installLlamaRuntime() {
           assetName: asset.name,
           installTarget: target,
           expectedBackend: inferBackendFromAssetName(asset.name),
-        }).catch(() => {});
+        }).catch(() => { });
         return { ok: true, serverExe, asset: asset.name, tag: release?.tag_name || "latest", target };
       } catch (error) {
         lastError = error;
-        await fsp.rm(archivePath, { force: true }).catch(() => {});
+        await fsp.rm(archivePath, { force: true }).catch(() => { });
         if (i < runtimeAssets.length - 1) {
           emit("status", { status: "runtime-install", detail: `Wybrany asset nieudany (${asset.name}). Probuje kolejny...` });
           continue;
@@ -3123,7 +3123,7 @@ async function installLlamaRuntime() {
     }
     throw lastError || new Error("Nie udalo sie zainstalowac runtime llama.cpp.");
   } finally {
-    await fsp.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    await fsp.rm(tempDir, { recursive: true, force: true }).catch(() => { });
   }
 }
 
@@ -3277,7 +3277,7 @@ async function launchServerProcess(config, modelPath, port, contextTokens, gpuLa
         expectedBackend,
         activeBackend,
         lastLaunchAt: new Date().toISOString(),
-      }).catch(() => {});
+      }).catch(() => { });
       emit("status", { status: "server-ready", detail: `${config.displayName} gotowy na http://127.0.0.1:${port}` });
       return;
     }
@@ -3344,7 +3344,7 @@ async function stopOwnedServer(options = {}) {
       await sleep(100);
     }
     if (child.exitCode === null) {
-      try { process.kill(child.pid, "SIGKILL"); } catch {}
+      try { process.kill(child.pid, "SIGKILL"); } catch { }
     }
   }
 
@@ -5569,7 +5569,7 @@ async function downloadFileWithProgress(url, targetPath, label, onProgress = nul
 
       const abortWith = (error) => {
         try { file.destroy(); } catch { /* ignore */ }
-        fs.unlink(targetPath, () => {});
+        fs.unlink(targetPath, () => { });
         reject(error);
       };
 
@@ -5598,7 +5598,7 @@ async function downloadFileWithProgress(url, targetPath, label, onProgress = nul
       request.destroy(new Error(`Timeout pobierania ${label}.`));
     });
     request.on("error", (err) => {
-      fs.unlink(targetPath, () => {});
+      fs.unlink(targetPath, () => { });
       reject(err);
     });
   });
@@ -7028,7 +7028,7 @@ ipcMain.handle("app:open-external", async (_event, url) => {
 
 async function performDownload(url, dest, modelId) {
   if (activeDownloads.get(modelId)?.state === "downloading") throw new Error("Pobieranie juz trwa.");
-  
+
   const destDir = path.dirname(dest);
   if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
 
@@ -7048,7 +7048,7 @@ async function performDownload(url, dest, modelId) {
     activeDownloads.delete(modelId);
     emit("agent:event", { type: "model-download-state", modelId, state: "cancelled", progress: 0, downloaded: 0, total: 0, error: "Anulowano przez użytkownika." });
   };
-  
+
   activeDownloads.set(modelId, { state: "queued", progress: 0, downloaded: 0, total: 0, error: null, cancel: cancelDownload });
   emit("agent:event", { type: "model-download-state", modelId, state: "queued", progress: 0, downloaded: 0, total: 0 });
 
@@ -7079,7 +7079,7 @@ async function performDownload(url, dest, modelId) {
         }
 
         if (response.statusCode !== 200) {
-          fs.unlink(tempDest, () => {});
+          fs.unlink(tempDest, () => { });
           activeDownloads.delete(modelId);
           safeReject(new Error(`Serwer zwrocil blad ${response.statusCode}`));
           return;
@@ -7109,16 +7109,16 @@ async function performDownload(url, dest, modelId) {
           finished = true;
           file.close();
           try {
-             if (fs.existsSync(dest)) fs.unlinkSync(dest);
-             fs.renameSync(tempDest, dest);
-             activeDownloads.delete(modelId);
-             emit("agent:event", { type: "model-download-state", modelId, state: "completed", progress: 100, downloaded, total });
-              safeResolve();
-           } catch (e) {
-              activeDownloads.set(modelId, { state: "failed", progress: 0, downloaded: 0, total: 0, error: String(e?.message || e) });
-              emit("agent:event", { type: "model-download-state", modelId, state: "failed", progress: 0, downloaded: 0, total: 0, error: String(e?.message || e) });
-              safeReject(e);
-           }
+            if (fs.existsSync(dest)) fs.unlinkSync(dest);
+            fs.renameSync(tempDest, dest);
+            activeDownloads.delete(modelId);
+            emit("agent:event", { type: "model-download-state", modelId, state: "completed", progress: 100, downloaded, total });
+            safeResolve();
+          } catch (e) {
+            activeDownloads.set(modelId, { state: "failed", progress: 0, downloaded: 0, total: 0, error: String(e?.message || e) });
+            emit("agent:event", { type: "model-download-state", modelId, state: "failed", progress: 0, downloaded: 0, total: 0, error: String(e?.message || e) });
+            safeReject(e);
+          }
         });
       });
 
@@ -7129,13 +7129,13 @@ async function performDownload(url, dest, modelId) {
 
       request.on("error", (err) => {
         if (cancelled || String(err?.message || "").includes("cancelled-by-user")) return safeReject(new Error("Pobieranie anulowane."));
-        fs.unlink(tempDest, () => {});
+        fs.unlink(tempDest, () => { });
         activeDownloads.set(modelId, { state: "failed", progress: 0, downloaded: 0, total: 0, error: String(err?.message || err), cancel: null });
         emit("agent:event", { type: "model-download-state", modelId, state: "failed", progress: 0, downloaded: 0, total: 0, error: String(err?.message || err) });
         safeReject(err);
       });
     }
-    
+
     startRequest(url);
   });
 }
