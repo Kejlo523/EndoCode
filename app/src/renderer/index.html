@@ -281,6 +281,22 @@
       </div>
 
       <div id="modelsDiscoverView" class="hidden">
+        <div class="discover-hero">
+          <div class="discover-hero-copy">
+            <strong>Odkrywaj modele GGUF pod swój sprzęt</strong>
+            <span>Szukaj po rodzinie modelu, rozmiarze albo repo. Karty niżej pokazują szybkie dopasowanie do Twojego PC i skróty do pobrania.</span>
+          </div>
+          <div class="discover-hero-stats">
+            <div class="discover-hero-stat">
+              <span>Źródło</span>
+              <strong>Hugging Face</strong>
+            </div>
+            <div class="discover-hero-stat">
+              <span>Sortowanie</span>
+              <strong>Dopasowanie + popularność</strong>
+            </div>
+          </div>
+        </div>
         <div class="models-toolbar">
           <div class="models-import-group">
             <input type="text" id="hfSearchInput" list="hfSearchSuggestions" placeholder="Szukaj modeli GGUF na Hugging Face lub wpisz repo owner/model..." />
@@ -293,6 +309,12 @@
              <button class="filter-btn" data-filter="medium">Średnie (14B)</button>
              <button class="filter-btn" data-filter="large">Duże (30B+)</button>
           </div>
+        </div>
+        <div class="discover-pills" id="discoverPills">
+          <button class="discover-pill" type="button" data-discovery-query="qwen coder 7b">Qwen Coder 7B</button>
+          <button class="discover-pill" type="button" data-discovery-query="deepseek coder lite">DeepSeek Coder Lite</button>
+          <button class="discover-pill" type="button" data-discovery-query="llama instruct 8b">Llama Instruct 8B</button>
+          <button class="discover-pill" type="button" data-discovery-query="mistral instruct gguf">Mistral Instruct</button>
         </div>
         <div class="discovery-list" id="discoveryList">
           <div class="models-empty">Ładuję listę modeli z sieci...</div>

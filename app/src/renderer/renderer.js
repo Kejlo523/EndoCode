@@ -997,66 +997,135 @@ function renderDiff(diff) {
 
 function fileChangeActionLabel(action) {
   if (action === "write_file") return "Zapisano";
-  if (action === "patch_edit") return "Patch";
+  if (action === "patch_edit") return "Edytowano";
   if (action === "download_file") return "Pobrano";
+  if (action === "undo_file_change") return "Cofnięto";
+  if (action === "redo_file_change") return "Przywrócono";
   return "Edycja";
 }
 
-function buildFileChangesHtml(changes = []) {
-  if (!changes.length) return "";
+function historyKeyFromPath(filePath = "") {
+  return normalizePathForMatch(filePath);
+}
+
+function buildFileHistoryControlsHtml(history = {}, filePath = "") {
+  if (!history || history.available !== true) return "";
+  const safeKey = escapeAttr(historyKeyFromPath(filePath));
+  const safePath = escapeAttr(filePath);
+  const undoDisabled = history.canUndo ? "" : "disabled";
+  const redoDisabled = history.canRedo ? "" : "disabled";
+  const undoRevisionId = escapeAttr(history.undoRevisionId || "");
+  const redoRevisionId = escapeAttr(history.redoRevisionId || "");
   return `
-    <div class="file-change-list">
-      ${changes.map((change) => {
-        const { added, removed } = collectDiffHunks(change.diff);
-        const diffEl = buildDiffDetailsElement(Array.isArray(change.diff) ? change.diff : [], { open: false });
-        return `
-          <div class="file-change-item">
-            <div class="file-change-head">
-              <span class="file-change-action">${escapeHtml(fileChangeActionLabel(change.action))}</span>
-              <span class="file-change-path">${escapeHtml(change.path || "")}</span>
-              <span class="file-change-stats">
-                <span class="diff-stat-plus">+${added}</span>
-                <span class="diff-stat-minus">-${removed}</span>
-              </span>
-            </div>
-            ${diffEl.outerHTML}
-          </div>
-        `;
-      }).join("")}
+    <div class="file-change-controls">
+      <button class="file-change-btn" type="button" data-file-history-action="undo" data-file-history-key="${safeKey}" data-file-path="${safePath}" data-revision-id="${undoRevisionId}" ${undoDisabled}>Cofnij</button>
+      <button class="file-change-btn" type="button" data-file-history-action="redo" data-file-history-key="${safeKey}" data-file-path="${safePath}" data-revision-id="${redoRevisionId}" ${redoDisabled}>Przywróć</button>
     </div>
   `;
 }
 
+function createFileChangeBlock(change = {}) {
+  const wrap = document.createElement("div");
+  wrap.className = "file-change-item";
+  const { added, removed } = collectDiffHunks(change.diff);
+  const controlsHtml = buildFileHistoryControlsHtml(change.history, change.path || "");
+  wrap.innerHTML = `
+    <div class="file-change-head">
+      <span class="file-change-action">${escapeHtml(fileChangeActionLabel(change.action))}</span>
+      <span class="file-change-path">${escapeHtml(change.path || "")}</span>
+      <span class="file-change-stats">
+        <span class="diff-stat-plus">+${added}</span>
+        <span class="diff-stat-minus">-${removed}</span>
+      </span>
+    </div>
+    ${controlsHtml}
+  `;
+  wrap.appendChild(buildDiffDetailsElement(Array.isArray(change.diff) ? change.diff : [], { open: false }));
+  return wrap;
+}
+
+function buildToolPrimaryHtml(tool, args = {}) {
+  const toolBadge = tool === "run_powershell"
+    ? "PowerShell"
+    : tool === "read_file"
+      ? "Odczyt"
+      : tool === "write_file"
+        ? "Zapis"
+        : tool === "patch_edit" || tool === "patch_batch"
+          ? "Patch"
+          : "Tool";
+  const secondary = tool === "run_powershell"
+    ? String(args.command || "").trim()
+    : String(toolSegmentPath(tool, args) || args.path || args.url || "").trim();
+  const tertiary = tool === "run_powershell" && args?.cwd ? `cwd: ${args.cwd}` : "";
+  return `
+    <div class="tool-run-placeholder">
+      <span class="tool-run-badge">${escapeHtml(toolBadge)}</span>
+      ${secondary ? `<span class="tool-run-path">${escapeHtml(secondary)}</span>` : ""}
+      ${tertiary ? `<span class="tool-run-note">${escapeHtml(tertiary)}</span>` : ""}
+    </div>
+  `;
+}
+
+function createToolCardSegment(event) {
+  const label = toolActionLabel(event.tool, event.args);
+  const detail = toolActionDetail(event.tool, event.args, event.note || "");
+  const el = addInlineEvent("tool", label, detail, "", {
+    variant: "toolcard",
+    primaryHtml: buildToolPrimaryHtml(event.tool, event.args || {}),
+    eventAt: event.at,
+    defaultExpanded: false,
+    showDuration: true,
+    duration: "00:00",
+  });
+  return {
+    key: `tool-${event.tool || "unknown"}-${event.id || Date.now()}`,
+    tool: event.tool,
+    path: toolSegmentPath(event.tool, event.args),
+    startedAtMs: parseEventTimeMs(event),
+    el,
+  };
+}
+
+function syncFileHistoryControls(filePath, history = {}) {
+  const key = historyKeyFromPath(filePath);
+  if (!key || !conversation) return;
+  conversation.querySelectorAll(`button[data-file-history-key="${CSS.escape(key)}"]`).forEach((button) => {
+    const action = button.getAttribute("data-file-history-action");
+    const isUndo = action === "undo";
+    const enabled = isUndo ? history.canUndo === true : history.canRedo === true;
+    button.disabled = !enabled;
+    button.setAttribute("data-revision-id", isUndo ? String(history.undoRevisionId || "") : String(history.redoRevisionId || ""));
+  });
+}
+
 function upsertFileChangeEvent(event) {
-  currentFileChanges.push({
+  const change = {
     path: String(event.path || ""),
     action: event.action || "change",
     diff: Array.isArray(event.diff) ? event.diff : [],
     at: event.at || new Date().toISOString(),
-  });
-  const count = currentFileChanges.length;
-  const title = count === 1
-    ? `Zmieniony plik: ${currentFileChanges[0].path}`
-    : `Zmienione pliki · ${count}`;
-  const extraHtml = buildFileChangesHtml(currentFileChanges);
+    history: event.history || null,
+  };
+  currentFileChanges.push(change);
 
-  if (!currentFileChangeEvent || !currentFileChangeEvent.isConnected) {
-    currentFileChangeEvent = addInlineEvent("change", title, "", extraHtml, {
-      eventAt: event.at,
-      defaultExpanded: false,
-    });
-    currentFileChangeEvent.setAttribute("data-activity-id", `file-changes-${event.id || Date.now()}`);
+  if (change.history) {
+    syncFileHistoryControls(change.path, change.history);
+  }
+
+  const matchingSegment = findSegmentForFileChange(change);
+  if (matchingSegment) {
+    mergeFileChangeIntoToolCard(matchingSegment, change);
+    if (change.history) syncFileHistoryControls(change.path, change.history);
     return;
   }
 
-  const titleEl = currentFileChangeEvent.querySelector(".inline-event-title");
-  if (titleEl) titleEl.textContent = title;
-  currentFileChangeEvent.setAttribute("data-title", title);
-  currentFileChangeEvent.setAttribute("data-extra-html", extraHtml);
-  const expandEl = currentFileChangeEvent.querySelector(".inline-event-expand");
-  if (expandEl) expandEl.innerHTML = extraHtml;
-  syncInlineEventPersistAttrs(currentFileChangeEvent);
-  smartScroll();
+  const card = createFileChangeBlock(change);
+  addInlineEvent("change", `${fileChangeActionLabel(change.action)}: ${change.path || "plik"}`, "", "", {
+    eventAt: event.at,
+    defaultExpanded: false,
+    primaryHtml: card.outerHTML,
+  });
 }
 
 function buildWebLookupHtml(event = {}) {
@@ -1141,12 +1210,9 @@ function mergeFileChangeIntoToolCard(segment, event) {
   }
   const block = document.createElement("div");
   block.className = "tool-file-change-block";
-  const head = document.createElement("div");
-  head.className = "tool-file-change-path";
-  head.textContent = String(event.path || "");
-  block.appendChild(head);
-  block.appendChild(buildDiffDetailsElement(Array.isArray(event.diff) ? event.diff : []));
+  block.appendChild(createFileChangeBlock(event));
   bucket.appendChild(block);
+  if (event.history) syncFileHistoryControls(event.path, event.history);
   syncInlineEventPersistAttrs(segment.el);
 }
 
@@ -1167,6 +1233,24 @@ function finalizeToolCardSuccess(segment, event) {
     if (primary) {
       const trunc = result.truncated ? `<div class="file-truncated-hint">Plik skrócony do limitu bajtów (maxBytes).</div>` : "";
       primary.innerHTML = `${trunc}<pre class="file-read-preview">${escapeHtml(String(result.content || ""))}</pre>`;
+    }
+    if (detailEl) detailEl.textContent = compactJsonPreview(result);
+  } else if (tool === "run_powershell") {
+    const exitCode = Number(result.exitCode);
+    if (titleEl) {
+      titleEl.textContent = Number.isFinite(exitCode)
+        ? `Polecenie zakończone · exit ${exitCode}`
+        : "Polecenie zakończone";
+    }
+    if (primary) {
+      const stdout = String(result.stdout || "").trim();
+      const stderr = String(result.stderr || "").trim();
+      const snippet = [
+        result.cwd ? `[cwd] ${result.cwd}` : "",
+        stdout ? `[stdout]\n${stdout}` : "",
+        stderr ? `[stderr]\n${stderr}` : "",
+      ].filter(Boolean).join("\n\n");
+      primary.innerHTML = `<pre class="tool-result-snippet">${escapeHtml((snippet || "Brak danych wyjściowych.").slice(0, 12000))}</pre>`;
     }
     if (detailEl) detailEl.textContent = compactJsonPreview(result);
   } else if (tool === "patch_edit" || tool === "write_file" || tool === "patch_batch" || tool === "download_file") {
@@ -1241,21 +1325,25 @@ function extractSourcesFromAnswer(text = "") {
 }
 
 // ── Thinking Bubble ──
-function createThinkingBubble(step = null) {
+function createThinkingBubble(step = null, options = {}) {
   const stepLabel = step ? `Krok ${step}: ` : "";
+  const durationLabel = escapeHtml(options.duration || "00:00");
+  const showSpinner = options.showSpinner !== false;
   const bubble = document.createElement("div");
   bubble.className = "thinking-bubble";
   bubble.innerHTML = `
     <button class="thinking-toggle" type="button">
-      ${stepLabel}Myślenie modelu <span class="thinking-duration">00:00</span> <span class="thinking-spinner"></span>
+      ${escapeHtml(options.title || `${stepLabel}Myślenie modelu`)} <span class="thinking-duration">${durationLabel}</span>${showSpinner ? ' <span class="thinking-spinner"></span>' : ""}
     </button>
     <div class="thinking-content"></div>
   `;
-  bubble.classList.add("expanded");
+  if (options.expanded === true) bubble.classList.add("expanded");
 
   bubble.querySelector(".thinking-toggle").addEventListener("click", () => {
     bubble.classList.toggle("expanded");
   });
+  const content = bubble.querySelector(".thinking-content");
+  if (content && options.content) content.textContent = String(options.content || "");
   conversation.appendChild(bubble);
   smartScroll();
   updateWelcome();
@@ -1281,6 +1369,17 @@ function finalizeThinkingBubble(bubble) {
     const durationText = bubble.querySelector(".thinking-duration")?.textContent || "00:00";
     toggle.innerHTML = `Myślenie modelu · ${lines} linii · ${durationText}`;
   }
+}
+
+function restoreThinkingBubble(entry = {}) {
+  const bubble = createThinkingBubble(null, {
+    title: entry.title || "Myślenie modelu",
+    content: entry.content || "",
+    duration: entry.duration || "00:00",
+    expanded: entry.expanded === true,
+    showSpinner: false,
+  });
+  finalizeThinkingBubble(bubble);
 }
 
 function addTotalDurationDivider(durationMs) {
@@ -1371,6 +1470,8 @@ async function switchToChat(chatId) {
           primaryHtml: entry.primaryHtml || "",
           defaultExpanded: entry.techExpanded === true,
         });
+      } else if (entry.type === "thinking") {
+        restoreThinkingBubble(entry);
       }
     }
     // Fallback: if no entries but has messages (old format)
@@ -1436,7 +1537,7 @@ async function saveChatSession(firstMessage = null) {
 
   // Capture ALL conversation entries (messages + inline events)
   const entries = [];
-  conversation.querySelectorAll(".message, .inline-event").forEach((el) => {
+  conversation.querySelectorAll(".message, .inline-event, .thinking-bubble").forEach((el) => {
     if (el.classList.contains("message")) {
       entries.push({
         type: "message",
@@ -1462,6 +1563,14 @@ async function saveChatSession(firstMessage = null) {
       if (techExpanded) payload.techExpanded = true;
       if (variant) payload.variant = variant;
       entries.push(payload);
+    } else if (el.classList.contains("thinking-bubble")) {
+      entries.push({
+        type: "thinking",
+        title: el.querySelector(".thinking-toggle")?.textContent?.trim() || "Myślenie modelu",
+        duration: el.querySelector(".thinking-duration")?.textContent || "00:00",
+        content: el.querySelector(".thinking-content")?.textContent || "",
+        expanded: el.classList.contains("expanded"),
+      });
     }
   });
 
@@ -2180,6 +2289,24 @@ if (promptQueueList) {
 }
 
 conversation.addEventListener("click", (event) => {
+  const historyTarget = event.target.closest("button[data-file-history-action]");
+  if (historyTarget) {
+    const action = historyTarget.getAttribute("data-file-history-action");
+    const path = historyTarget.getAttribute("data-file-path") || "";
+    const revisionId = historyTarget.getAttribute("data-revision-id") || "";
+    historyTarget.disabled = true;
+    showLive(action === "undo" ? "Cofam zmianę..." : "Przywracam zmianę...", path);
+    const promise = action === "undo"
+      ? window.endocode.undoFileChange({ path, revisionId })
+      : window.endocode.redoFileChange({ path, revisionId });
+    void promise.catch((error) => {
+      historyTarget.disabled = false;
+      addInlineEvent("error", action === "undo" ? "Undo pliku" : "Redo pliku", error.message || String(error));
+    }).finally(() => {
+      hideLive();
+    });
+    return;
+  }
   const target = event.target.closest("button[data-quick-choice]");
   if (!target) return;
   const mode = target.getAttribute("data-quick-choice");
@@ -2429,6 +2556,7 @@ window.endocode.onEvent(async (event) => {
     activeToolSegments.length = 0;
     currentThinkingSegment = null;
     lastAgentPhaseSignature = "";
+    removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
     removeInlineEventByActivityId(AGENT_NOTE_ACTIVITY_ID);
     if (!finalReceivedInRun && hasStreamingAssistantContent()) {
       finalizeStreamingAssistantMessage("", { overwriteText: false });
@@ -2441,6 +2569,7 @@ window.endocode.onEvent(async (event) => {
   }
   if (event.type === "note") {
     removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
+    upsertInlineEvent(AGENT_NOTE_ACTIVITY_ID, "note", "Notatka agenta", String(event.note || ""));
     showLive("Plan", event.note);
     return;
   }
@@ -2526,7 +2655,7 @@ window.endocode.onEvent(async (event) => {
     const livePhrase = event.plainChat ? "Pisze…" : "Planuje akcję...";
 
     if (event.plainChat) {
-      removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
+      upsertInlineEvent(MODEL_WRITING_ACTIVITY_ID, "note", "Pisze odpowiedź...", preview.slice(-800));
       updateStreamingAssistantMessage(event.text || "", full);
       showLive(livePhrase, preview.slice(-500));
       return;
@@ -2547,31 +2676,33 @@ window.endocode.onEvent(async (event) => {
 
   if (event.type === "tool-start") {
     removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
-    const label = toolActionLabel(event.tool, event.args);
-    const detail = toolActionDetail(event.tool, event.args, event.note || "");
-    const path = toolSegmentPath(event.tool, event.args);
-    const durationKey = `tool-${event.tool || "unknown"}-${event.id || Date.now()}`;
-    activeToolSegments.push({ key: durationKey, tool: event.tool, path, startedAtMs: parseEventTimeMs(event) });
-    showLive(label, detail || shortPath(path) || path || "");
+    const segment = createToolCardSegment(event);
+    const durationEl = segment.el.querySelector(".inline-event-duration");
+    if (durationEl) startLiveDuration(segment.key, segment.startedAtMs, durationEl);
+    activeToolSegments.push(segment);
+    showLive(toolActionLabel(event.tool, event.args), toolActionDetail(event.tool, event.args, event.note || "") || shortPath(segment.path) || segment.path || "");
     return;
   }
   if (event.type === "tool-result") {
-    const matchingIndex = activeToolSegments.findIndex((segment) => segment.tool === event.tool);
-    const segment = matchingIndex >= 0 ? activeToolSegments.splice(matchingIndex, 1)[0] : activeToolSegments.shift();
+    const segment = activeToolSegments.pop();
+    if (segment?.key) stopLiveDuration(segment.key, parseEventTimeMs(event));
     if (!event.ok) {
-      addInlineEvent("error", `Błąd: ${event.tool}`, `${event.error || ""}${event.recoveryHint ? `\nObejście: ${event.recoveryHint}` : ""}`, "", {
-        eventAt: event.at,
-        defaultExpanded: true,
-      });
+      if (!finalizeToolCardError(segment, event)) {
+        addInlineEvent("error", `Błąd: ${event.tool}`, `${event.error || ""}${event.recoveryHint ? `\nObejście: ${event.recoveryHint}` : ""}`, "", {
+          eventAt: event.at,
+          defaultExpanded: true,
+        });
+      }
       showLive(`Błąd: ${event.tool}`, event.error || "");
     } else {
+      finalizeToolCardSuccess(segment, event);
       showLive(`Gotowe: ${event.tool}`, compactToolResultSummary(event.tool, event.result || {}));
     }
     return;
   }
   if (event.type === "file-change") {
     upsertFileChangeEvent(event);
-    showLive(`Zapisano: ${event.path}`);
+    showLive(`${fileChangeActionLabel(event.action)}: ${event.path}`);
     return;
   }
   if (event.type === "approval-request") {
@@ -2905,6 +3036,7 @@ const hfSearchBtn = document.getElementById("hfSearchBtn");
 const hfSearchSuggestions = document.getElementById("hfSearchSuggestions");
 const discoveryStatus = document.getElementById("discoveryStatus");
 const discoverySentinel = document.getElementById("discoverySentinel");
+const discoverPills = document.getElementById("discoverPills");
 let currentFilter = "all";
 let lastDiscoveryResults = new Map();
 let discoveryAllResults = [];
@@ -2982,6 +3114,7 @@ function buildDiscoveryCard(model) {
   if (m.recommended) badges.push(`<span class="model-badge recommended">Zalecane dla Twojego PC</span>`);
   if (m.sourceLabel) badges.push(`<span class="model-badge source">${escapeHtml(m.sourceLabel)}</span>`);
   if (m.hardwareProfile && m.recommended) badges.push(`<span class="model-badge fit">${escapeHtml(m.hardwareProfile)}</span>`);
+  const fitLabel = m.recommendation?.fitLabel || m.hardwareProfile || (m.recommended ? "Dobre dopasowanie" : "Sprawdź ręcznie");
   const fileLine = m.fileName
     ? `<span class="model-meta-item">Plik: <strong>${escapeHtml(m.fileName)}</strong>${m.expectedBytes ? ` (${escapeHtml((m.expectedBytes / 1024 / 1024 / 1024).toFixed(1))} GB)` : ""}</span>`
     : "";
@@ -3001,6 +3134,11 @@ function buildDiscoveryCard(model) {
           <span class="model-id">${escapeHtml(m.id || "")}</span>
         </div>
         <div class="model-badges">${badges.join("")}</div>
+      </div>
+      <div class="model-quick-stats">
+        <div class="model-quick-stat"><span>Plik</span><strong>${escapeHtml(m.expectedBytes ? `${(m.expectedBytes / 1024 / 1024 / 1024).toFixed(1)} GB` : "—")}</strong></div>
+        <div class="model-quick-stat"><span>Dopasowanie</span><strong>${escapeHtml(fitLabel)}</strong></div>
+        <div class="model-quick-stat"><span>Wariantów</span><strong>${escapeHtml(String(Array.isArray(m.files) ? m.files.length : (m.fileName ? 1 : 0)))}</strong></div>
       </div>
       <p class="model-desc">${escapeHtml(m.description || "Brak opisu.")}</p>
       <div class="model-meta">
@@ -3069,6 +3207,15 @@ if (hfSearchBtn) {
 if (hfSearchInput) {
   hfSearchInput.addEventListener("input", () => {
     scheduleDiscoverySearch(260);
+  });
+}
+
+if (discoverPills) {
+  discoverPills.addEventListener("click", (event) => {
+    const target = event.target.closest("button[data-discovery-query]");
+    if (!target || !hfSearchInput) return;
+    hfSearchInput.value = target.getAttribute("data-discovery-query") || "";
+    void runDiscoverySearch({ resetResults: true });
   });
 }
 

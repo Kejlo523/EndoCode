@@ -3,10 +3,11 @@
 function detectInstallTarget(platform, gpuInfo = {}) {
   const gpuVendorRaw = String(gpuInfo?.gpuVendor || "unknown").toLowerCase();
   const gpuName = String(gpuInfo?.gpuName || "").toLowerCase();
+  const gpuSignature = `${gpuVendorRaw} ${gpuName}`.trim();
   const gpuVendor =
-    gpuVendorRaw.includes("nvidia") ? "nvidia"
-      : gpuVendorRaw.includes("amd") || gpuVendorRaw.includes("radeon") ? "amd"
-        : gpuVendorRaw.includes("intel") || gpuName.includes("arc") ? "intel"
+    gpuSignature.includes("nvidia") || gpuSignature.includes("geforce") || gpuSignature.includes("quadro") ? "nvidia"
+      : gpuSignature.includes("amd") || gpuSignature.includes("radeon") || gpuSignature.includes("ati") || gpuSignature.includes("advanced micro devices") ? "amd"
+        : gpuSignature.includes("intel") || gpuSignature.includes("arc") || gpuSignature.includes("iris") || gpuSignature.includes("uhd") ? "intel"
           : "unknown";
   let runtimePreference = ["cpu"];
   if (platform === "linux") {

@@ -34,6 +34,7 @@ const { registerAgentIpcHandlers } = require("./main/agent/ipc-compat");
 
 const DEFAULT_PORT = 8088;
 const MAX_FILE_BYTES = 220000;
+const FILE_HISTORY_SNAPSHOT_MAX_BYTES = 220000;
 /** Modele czasem generuja absurdalnie dlugie "url" (padding zer) — odcinamy przed fetch. */
 const MAX_TOOL_URL_LENGTH = 2048;
 const MODEL_JSON_RETRY_LIMIT = 2;
@@ -241,6 +242,7 @@ ZASADY NARZEDZI I SIECI:
 - Nie zgaduj URL-i. Przy 404/403 wroc do strony glownej, dokumentacji, API albo uzyj extract_media.
 - Nie powtarzaj identycznego nieudanego wywolania narzedzia. Po drugim podobnym bledzie zmien taktyke.
 - Fetch nie renderuje JavaScriptu. Preferuj API JSON/CSV/XML lub stabilne zrodla.
+- Gdy user prosi o sprawdzenie czegos w sieci, aktualne dane, ceny, oferty, dokumentacje, produkty albo rekomendacje, preferuj realny lookup/fetch zamiast odpowiadac z pamieci.
 - Pobieraj i zapisuj duze odpowiedzi jako pliki, nie wklejaj ich w JSON.
 - Decyduj samodzielnie: gdy odpowiedz wymaga realnej weryfikacji, uzyj narzedzi zamiast zgadywac.
 - Gdy korzystasz z internetu, final ma zawierac sekcje "Źródła:" z URL-ami faktycznie uzytymi do odpowiedzi.
@@ -291,6 +293,7 @@ const agentRecoveryMetrics = {
 let accessLevel = "sandbox"; // "sandbox" or "full"
 let chatHistory = [];
 let currentChatId = null;
+const fileRevisionHistory = new Map();
 const telemetryMonitor = createTelemetryMonitor();
 const baselineMetrics = createBaselineMetrics();
 let runtimeManifestStore = null;
@@ -1776,6 +1779,7 @@ async function deriveLookupQueryWithModel(userText, history, abortSignal) {
         "Najpierw oceń, czy do odpowiedzi POTRZEBNY jest internet.",
         "Jesli internet NIE jest potrzebny, zwroc dokladnie: NONE",
         "Jesli internet jest potrzebny, zwroc zapytanie 2-8 slow kluczowych do wyszukiwarki.",
+        "Badz liberalny: jesli user prosi o sprawdzenie czegos w sieci, chce aktualnych danych, cen, ofert, rekomendacji, dokumentacji albo informacji o konkretnej stronie/firmie, internet jest potrzebny domyslnie.",
         "Wyjscie: TYLKO jedna linia tekstu (bez markdown, bez cudzyslowow, bez komentarzy).",
         "Jesli user pyta o konkretna domene, domena musi zostac w zapytaniu.",
         "Jesli user pisze 'jeszcze raz' i brak kontekstu, zwroc NONE.",
@@ -1789,17 +1793,35 @@ async function deriveLookupQueryWithModel(userText, history, abortSignal) {
     const parsed = await callModelWithRecovery(promptMessages, abortSignal, failed, { plainChat: true, silent: true });
     const raw = String(parsed?.content || "").split(/\r?\n/)[0] || "";
     const cleanedRaw = normalizeWebQuery(raw.replace(/^["'`]+|["'`]+$/g, ""));
-    if (/^none$/i.test(cleanedRaw)) return "";
+    if (/^none$/i.test(cleanedRaw)) {
+      if (isExplicitWebLookupRequest(text) || looksLikeWebsiteFactQuestion(text) || looksLikeFreshFactQuestion(text)) {
+        return buildForcedLookupQuery(text);
+      }
+      return "";
+    }
     const cleaned = cleanedRaw;
-    if (!cleaned) return "";
+    if (!cleaned) {
+      if (isExplicitWebLookupRequest(text) || looksLikeWebsiteFactQuestion(text) || looksLikeFreshFactQuestion(text)) {
+        return buildForcedLookupQuery(text);
+      }
+      return "";
+    }
     if (!isLookupQueryCompatible(text, cleaned)) {
       const fallback = buildWebLookupCandidates(text)[0] || "";
-      return fallback;
+      if (fallback) return fallback;
+      if (isExplicitWebLookupRequest(text) || looksLikeWebsiteFactQuestion(text) || looksLikeFreshFactQuestion(text)) {
+        return buildForcedLookupQuery(text);
+      }
+      return "";
     }
     return cleaned.slice(0, 140);
   } catch {
     const fallback = buildWebLookupCandidates(text)[0] || "";
-    return fallback;
+    if (fallback) return fallback;
+    if (isExplicitWebLookupRequest(text) || looksLikeWebsiteFactQuestion(text) || looksLikeFreshFactQuestion(text)) {
+      return buildForcedLookupQuery(text);
+    }
+    return "";
   }
 }
 
@@ -2850,6 +2872,50 @@ function findCudaCompanionAsset(assets, target) {
   return candidates[0] || null;
 }
 
+function inspectInstalledRuntime(serverExe) {
+  const runtimeDir = path.dirname(String(serverExe || ""));
+  const backendProbe = detectLoadedBackendsFromVersion(serverExe);
+  const hasCudaPlugin = Boolean(runtimeDir && fs.existsSync(path.join(runtimeDir, "ggml-cuda.dll")));
+  const hasVulkanPlugin = Boolean(runtimeDir && fs.existsSync(path.join(runtimeDir, "ggml-vulkan.dll")));
+  return {
+    backendProbe,
+    hasCudaPlugin,
+    hasVulkanPlugin,
+    binaryBackend: inferBackendFromRuntimeBinaries(serverExe),
+    supportedBackends: {
+      cpu: true,
+      cuda: backendProbe.cuda || hasCudaPlugin,
+      vulkan: backendProbe.vulkan || hasVulkanPlugin,
+    },
+  };
+}
+
+function chooseExpectedInstalledBackend(target, runtimeInfo) {
+  const preferences = Array.isArray(target?.runtimePreference) && target.runtimePreference.length
+    ? target.runtimePreference
+    : ["cpu"];
+  for (const backend of preferences) {
+    if (backend === "cpu" || runtimeInfo?.supportedBackends?.[backend]) return backend;
+  }
+  return runtimeInfo?.binaryBackend && runtimeInfo.binaryBackend !== "unknown"
+    ? runtimeInfo.binaryBackend
+    : "cpu";
+}
+
+function describeRuntimeRepair(target, runtimeInfo, expectedBackend) {
+  if (runtimeInfo?.hasCudaPlugin && !runtimeInfo?.backendProbe?.cuda) {
+    return "Wykryto runtime z ggml-cuda.dll, ale backend CUDA sie nie laduje. Naprawiam instalacje...";
+  }
+  if (runtimeInfo?.hasVulkanPlugin && !runtimeInfo?.backendProbe?.vulkan) {
+    return "Wykryto runtime z ggml-vulkan.dll, ale backend Vulkan sie nie laduje. Naprawiam instalacje...";
+  }
+  const preferredGpuBackend = (target?.runtimePreference || []).find((backend) => backend !== "cpu") || "cpu";
+  if (preferredGpuBackend !== "cpu" && expectedBackend !== preferredGpuBackend) {
+    return `Wykryty runtime nie wspiera preferowanego backendu ${preferredGpuBackend} dla ${target?.gpuVendor || "gpu"}. Przeinstalowuje runtime...`;
+  }
+  return "Naprawiam instalacje runtime...";
+}
+
 async function extractRuntimeArchive(archivePath, extractDir) {
   if (process.platform === "win32") {
     await new Promise((resolve, reject) => {
@@ -2912,6 +2978,22 @@ async function collectDllFilesRecursive(rootDir) {
   return out;
 }
 
+function findServerExecutableInDir(rootDir) {
+  const expectedName = process.platform === "win32" ? "llama-server.exe" : "llama-server";
+  const stack = [rootDir];
+  while (stack.length) {
+    const current = stack.pop();
+    if (!current || !fs.existsSync(current)) continue;
+    const entries = fs.readdirSync(current, { withFileTypes: true });
+    for (const entry of entries) {
+      const full = path.join(current, entry.name);
+      if (entry.isDirectory()) stack.push(full);
+      if (entry.isFile() && entry.name.toLowerCase() === expectedName.toLowerCase()) return full;
+    }
+  }
+  return null;
+}
+
 async function hoistRuntimeDlls(runtimeDir) {
   const dlls = await collectDllFilesRecursive(runtimeDir);
   for (const dllPath of dlls) {
@@ -2922,24 +3004,31 @@ async function hoistRuntimeDlls(runtimeDir) {
 }
 
 async function installLlamaRuntime() {
+  const target = detectInstallTarget();
   const alreadyInstalled = getRuntimeServerExe();
   if (alreadyInstalled) {
-    const backendProbe = detectLoadedBackendsFromVersion(alreadyInstalled);
-    const hasCudaPlugin = fs.existsSync(path.join(path.dirname(alreadyInstalled), "ggml-cuda.dll"));
-    if (!(hasCudaPlugin && !backendProbe.cuda)) {
+    const runtimeInfo = inspectInstalledRuntime(alreadyInstalled);
+    const expectedBackend = chooseExpectedInstalledBackend(target, runtimeInfo);
+    const preferredGpuBackend = (target.runtimePreference || []).find((backend) => backend !== "cpu") || "cpu";
+    const needsRepair =
+      (runtimeInfo.hasCudaPlugin && !runtimeInfo.backendProbe.cuda)
+      || (runtimeInfo.hasVulkanPlugin && !runtimeInfo.backendProbe.vulkan)
+      || (preferredGpuBackend !== "cpu" && expectedBackend !== preferredGpuBackend);
+    if (!needsRepair) {
       await runtimeManifestStore.writeManifest({
         serverExe: alreadyInstalled,
         source: "existing",
+        installTarget: target,
+        expectedBackend,
       }).catch(() => {});
-      return { ok: true, alreadyInstalled: true, serverExe: alreadyInstalled };
+      return { ok: true, alreadyInstalled: true, serverExe: alreadyInstalled, target, expectedBackend };
     }
     emit("status", {
       status: "runtime-install",
-      detail: "Wykryto runtime z ggml-cuda.dll, ale backend CUDA sie nie laduje. Naprawiam instalacje...",
+      detail: describeRuntimeRepair(target, runtimeInfo, expectedBackend),
     });
   }
 
-  const target = detectInstallTarget();
   emit("status", { status: "runtime-install", detail: `Wykryty target runtime: ${target.platform} + ${target.gpuVendor}.` });
   emit("status", { status: "runtime-install", detail: `Preferencja backendów: ${target.runtimePreference.join(" -> ")}.` });
   emit("status", { status: "runtime-install", detail: `Sprawdzam najnowsze wydanie llama.cpp dla ${target.platform}...` });
@@ -3008,7 +3097,7 @@ async function installLlamaRuntime() {
         await fsp.cp(extractDir, finalDir, { recursive: true, force: true });
         await hoistRuntimeDlls(finalDir);
 
-        const serverExe = getRuntimeServerExe();
+        const serverExe = findServerExecutableInDir(finalDir);
         if (!serverExe) {
           const expectedName = process.platform === "win32" ? "llama-server.exe" : "llama-server";
           throw new Error(`Paczka ${asset.name} nie zawiera ${expectedName}`);
@@ -3157,11 +3246,16 @@ async function launchServerProcess(config, modelPath, port, contextTokens, gpuLa
       const backendByLogs = inferBackendFromLogs(backendLog);
       const backendByBinary = inferBackendFromRuntimeBinaries(serverExe);
       const gpuOffloadDetected = /offloaded\s+\d+\/\d+\s+layers?\s+to\s+gpu/i.test(backendLog);
+      const requiredGpuBackend = gpuLayers > 0 && expectedBackend !== "unknown" && expectedBackend !== "cpu"
+        ? expectedBackend
+        : (gpuLayers > 0 && backendByBinary !== "unknown" && backendByBinary !== "cpu" ? backendByBinary : null);
       const activeBackend = backendByLogs !== "unknown"
         ? backendByLogs
         : (gpuOffloadDetected ? backendByBinary : backendByBinary);
-      if (gpuLayers > 0 && backendByBinary === "cuda" && activeBackend !== "cuda" && !gpuOffloadDetected) {
-        throw new Error("Runtime CUDA nie zostal aktywowany (ggml-cuda.dll bez zaladowanego backendu). Uruchom ponownie instalacje runtime.");
+      if (requiredGpuBackend && activeBackend !== requiredGpuBackend && !gpuOffloadDetected) {
+        const backendLabel = requiredGpuBackend.toUpperCase();
+        const backendLibrary = requiredGpuBackend === "cuda" ? "ggml-cuda.dll" : requiredGpuBackend === "vulkan" ? "ggml-vulkan.dll" : requiredGpuBackend;
+        throw new Error(`Runtime ${backendLabel} nie zostal aktywowany (${backendLibrary} bez zaladowanego backendu). Uruchom ponownie instalacje runtime.`);
       }
       runtimeBackendStatus = {
         expectedBackend,
@@ -4489,6 +4583,163 @@ async function readTextIfExists(file) {
   }
 }
 
+function normalizeFileHistoryKey(filePath = "") {
+  return String(filePath || "").replace(/\\/g, "/").toLowerCase();
+}
+
+function createFileHistorySnapshot(exists, content, supported = true) {
+  return {
+    exists: Boolean(exists),
+    content: exists ? String(content ?? "") : "",
+    supported: supported === true,
+  };
+}
+
+function snapshotFromKnownText(exists, content) {
+  if (!exists) return createFileHistorySnapshot(false, "", true);
+  const text = String(content ?? "");
+  const byteLength = Buffer.byteLength(text, "utf8");
+  if (byteLength > FILE_HISTORY_SNAPSHOT_MAX_BYTES) {
+    return createFileHistorySnapshot(true, "", false);
+  }
+  return createFileHistorySnapshot(true, text, true);
+}
+
+async function snapshotFileForHistory(targetPath) {
+  try {
+    const stat = await fsp.stat(targetPath);
+    if (!stat.isFile()) return createFileHistorySnapshot(false, "", false);
+    if (stat.size > FILE_HISTORY_SNAPSHOT_MAX_BYTES) {
+      return createFileHistorySnapshot(true, "", false);
+    }
+    const content = await fsp.readFile(targetPath, "utf8");
+    return createFileHistorySnapshot(true, content, true);
+  } catch (error) {
+    if (error?.code === "ENOENT") return createFileHistorySnapshot(false, "", true);
+    return createFileHistorySnapshot(false, "", false);
+  }
+}
+
+function fileHistoryStateForPath(relativePath, record = null, requestedRevisionId = "") {
+  const entries = Array.isArray(record?.entries) ? record.entries : [];
+  const pointer = Number.isInteger(record?.pointer) ? record.pointer : -1;
+  return {
+    path: relativePath,
+    available: entries.length > 0,
+    requestedRevisionId: requestedRevisionId || null,
+    activeRevisionId: pointer >= 0 ? entries[pointer]?.id || null : null,
+    totalRevisions: entries.length,
+    activeRevisionIndex: pointer,
+    canUndo: pointer >= 0,
+    canRedo: pointer + 1 < entries.length,
+    undoRevisionId: pointer >= 0 ? entries[pointer]?.id || null : null,
+    redoRevisionId: pointer + 1 < entries.length ? entries[pointer + 1]?.id || null : null,
+  };
+}
+
+function recordFileRevision(targetPath, beforeSnapshot, afterSnapshot, meta = {}) {
+  const relativePath = relativeToRoot(targetPath);
+  if (!beforeSnapshot?.supported || !afterSnapshot?.supported) {
+    fileRevisionHistory.delete(normalizeFileHistoryKey(relativePath));
+    return { entry: null, history: fileHistoryStateForPath(relativePath, null, "") };
+  }
+  const key = normalizeFileHistoryKey(relativePath);
+  const record = fileRevisionHistory.get(key) || { path: relativePath, entries: [], pointer: -1 };
+  if (record.pointer < record.entries.length - 1) {
+    record.entries = record.entries.slice(0, record.pointer + 1);
+  }
+  const entry = {
+    id: crypto.randomUUID(),
+    at: new Date().toISOString(),
+    action: meta.action || "change",
+    beforeExists: beforeSnapshot.exists,
+    beforeContent: beforeSnapshot.content,
+    afterExists: afterSnapshot.exists,
+    afterContent: afterSnapshot.content,
+  };
+  record.entries.push(entry);
+  record.pointer = record.entries.length - 1;
+  fileRevisionHistory.set(key, record);
+  return { entry, history: fileHistoryStateForPath(relativePath, record, entry.id) };
+}
+
+function fileStatesEqual(left, right) {
+  return Boolean(left?.exists) === Boolean(right?.exists)
+    && String(left?.content ?? "") === String(right?.content ?? "");
+}
+
+async function writeSnapshotToFile(targetPath, snapshot) {
+  if (!snapshot?.exists) {
+    await fsp.rm(targetPath, { force: true });
+    return;
+  }
+  await fsp.mkdir(path.dirname(targetPath), { recursive: true });
+  await fsp.writeFile(targetPath, String(snapshot.content ?? ""), "utf8");
+}
+
+async function applyFileRevisionAction(filePath, direction = "undo", requestedRevisionId = "") {
+  const targetPath = normalizeInsideRoot(filePath);
+  const relativePath = relativeToRoot(targetPath);
+  const key = normalizeFileHistoryKey(relativePath);
+  const record = fileRevisionHistory.get(key);
+  if (!record?.entries?.length) {
+    throw new Error("Brak historii zmian dla tego pliku w bieżącej sesji.");
+  }
+
+  const pointer = Number.isInteger(record.pointer) ? record.pointer : -1;
+  if (direction === "undo") {
+    if (pointer < 0) throw new Error("Nie ma już czego cofnąć.");
+    const entry = record.entries[pointer];
+    if (requestedRevisionId && requestedRevisionId !== entry.id) {
+      throw new Error("Można cofnąć tylko najnowszą aktywną zmianę tego pliku.");
+    }
+    const currentSnapshot = await snapshotFileForHistory(targetPath);
+    const expectedCurrent = createFileHistorySnapshot(entry.afterExists, entry.afterContent, true);
+    if (!currentSnapshot.supported || !fileStatesEqual(currentSnapshot, expectedCurrent)) {
+      throw new Error("Plik zmienił się poza historią undo/redo. Odśwież stan i spróbuj ponownie.");
+    }
+    const nextSnapshot = createFileHistorySnapshot(entry.beforeExists, entry.beforeContent, true);
+    await writeSnapshotToFile(targetPath, nextSnapshot);
+    record.pointer -= 1;
+    fileRevisionHistory.set(key, record);
+    return {
+      operation: "undo",
+      path: relativePath,
+      diff: makeLineDiff(currentSnapshot.content, nextSnapshot.content),
+      before: textPreview(currentSnapshot.content),
+      after: textPreview(nextSnapshot.content),
+      history: fileHistoryStateForPath(relativePath, record, entry.id),
+    };
+  }
+
+  if (pointer + 1 >= record.entries.length) {
+    throw new Error("Nie ma czego przywrócić.");
+  }
+  const entry = record.entries[pointer + 1];
+  if (requestedRevisionId && requestedRevisionId !== entry.id) {
+    throw new Error("Można przywrócić tylko najbliższą cofniętą zmianę tego pliku.");
+  }
+  const currentSnapshot = await snapshotFileForHistory(targetPath);
+  const expectedCurrent = pointer >= 0
+    ? createFileHistorySnapshot(record.entries[pointer].afterExists, record.entries[pointer].afterContent, true)
+    : createFileHistorySnapshot(entry.beforeExists, entry.beforeContent, true);
+  if (!currentSnapshot.supported || !fileStatesEqual(currentSnapshot, expectedCurrent)) {
+    throw new Error("Plik zmienił się poza historią undo/redo. Odśwież stan i spróbuj ponownie.");
+  }
+  const nextSnapshot = createFileHistorySnapshot(entry.afterExists, entry.afterContent, true);
+  await writeSnapshotToFile(targetPath, nextSnapshot);
+  record.pointer += 1;
+  fileRevisionHistory.set(key, record);
+  return {
+    operation: "redo",
+    path: relativePath,
+    diff: makeLineDiff(currentSnapshot.content, nextSnapshot.content),
+    before: textPreview(currentSnapshot.content),
+    after: textPreview(nextSnapshot.content),
+    history: fileHistoryStateForPath(relativePath, record, entry.id),
+  };
+}
+
 function makeLineDiff(before, after) {
   if (before === after) return [];
   const a = String(before ?? "").split(/\r?\n/);
@@ -4826,6 +5077,12 @@ function looksLikeFreshFactQuestion(text) {
   return (asksCurrent || hasDate) && topicNeedsFacts;
 }
 
+function isExplicitWebLookupRequest(text) {
+  const q = String(text || "").toLowerCase();
+  if (!q) return false;
+  return /\b(wyszukaj|szukaj|sprawdz w internecie|sprawdź w internecie|sprawdz online|sprawdź online|poszukaj|look up|search the web|search online|use internet|uzyj internetu)\b/i.test(q);
+}
+
 function buildForcedLookupQuery(text) {
   const normalized = normalizeWebQuery(text);
   const domain = extractDomainCandidate(normalized);
@@ -4876,6 +5133,23 @@ function appendSourcesSection(text, sourceUrls = []) {
   if (!urls.length) return body;
   if (/^zrodla\s*:|^źródła\s*:/im.test(body)) return body;
   return `${body}\n\nŹródła:\n${urls.map((url) => `- ${url}`).join("\n")}`;
+}
+
+function injectWebLookupContext(chatMessages, webLookup) {
+  const nextMessages = Array.isArray(chatMessages) ? [...chatMessages] : [];
+  if (!webLookup?.context) return nextMessages;
+  nextMessages.splice(1, 0, { role: "user", content: `Kontekst z internetu:\n${webLookup.context}` });
+  nextMessages.splice(2, 0, { role: "user", content: buildWebConfidenceInstruction(webLookup) });
+  const sourceUrls = Array.isArray(webLookup.sources)
+    ? webLookup.sources.map((source) => String(source?.url || "").trim()).filter(Boolean).slice(0, 6)
+    : [];
+  if (sourceUrls.length) {
+    nextMessages.splice(3, 0, {
+      role: "user",
+      content: `Zweryfikowane zrodla URL:\n${sourceUrls.map((url) => `- ${url}`).join("\n")}`,
+    });
+  }
+  return nextMessages;
 }
 
 function replaceByExactMatch(content, search, replace, count = 1) {
@@ -5106,6 +5380,7 @@ async function executeTool(action) {
     result = { path: relativeToRoot(target) };
   } else if (tool === "write_file") {
     const target = normalizeInsideRoot(args.path);
+    const beforeSnapshot = await snapshotFileForHistory(target);
     const before = await readTextIfExists(target);
     if (isSuspiciousStatusOverwrite(target, args.content, args.mode)) {
       throw new Error(
@@ -5119,6 +5394,8 @@ async function executeTool(action) {
       await fsp.writeFile(target, String(args.content ?? ""), "utf8");
     }
     const after = await readTextIfExists(target);
+    const afterSnapshot = await snapshotFileForHistory(target);
+    const revision = recordFileRevision(target, beforeSnapshot, afterSnapshot, { action: "write_file" });
     result = { path: relativeToRoot(target), bytes: fs.statSync(target).size, mode: args.mode || "overwrite" };
     emit("file-change", {
       path: relativeToRoot(target),
@@ -5126,6 +5403,7 @@ async function executeTool(action) {
       diff: makeLineDiff(before ?? "", after ?? ""),
       before: textPreview(before ?? ""),
       after: textPreview(after ?? ""),
+      history: revision.history,
     });
   } else if (tool === "patch_edit") {
     const target = normalizeInsideRoot(args.path);
@@ -5138,6 +5416,12 @@ async function executeTool(action) {
     if (!patched) throw new Error(`SEARCH_REPLACE_NO_EXACT_MATCH path=${relativeToRoot(target)} :: SEARCH block failed to exactly match lines w pliku.`);
     const after = patched.updated;
     await fsp.writeFile(target, after, "utf8");
+    const revision = recordFileRevision(
+      target,
+      snapshotFromKnownText(true, before),
+      snapshotFromKnownText(true, after),
+      { action: "patch_edit" },
+    );
     result = { path: relativeToRoot(target), replaced: patched.replaced, strategy: patched.strategy };
     emit("file-change", {
       path: relativeToRoot(target),
@@ -5145,6 +5429,7 @@ async function executeTool(action) {
       diff: makeLineDiff(before, after),
       before: textPreview(before),
       after: textPreview(after),
+      history: revision.history,
     });
   } else if (tool === "patch_batch") {
     const blocks = Array.isArray(args.blocks) && args.blocks.length
@@ -5168,6 +5453,12 @@ async function executeTool(action) {
       }
       const after = patched.updated;
       await fsp.writeFile(target, after, "utf8");
+      const revision = recordFileRevision(
+        target,
+        snapshotFromKnownText(true, before),
+        snapshotFromKnownText(true, after),
+        { action: "patch_edit" },
+      );
       applied.push({ path: relativeToRoot(target), strategy: patched.strategy });
       emit("file-change", {
         path: relativeToRoot(target),
@@ -5175,6 +5466,7 @@ async function executeTool(action) {
         diff: makeLineDiff(before, after),
         before: textPreview(before),
         after: textPreview(after),
+        history: revision.history,
       });
     }
     result = { appliedCount: applied.length, applied };
@@ -5769,14 +6061,20 @@ async function runSimpleChat(userText) {
         emit("status", { status: "model-thinking", detail: `Czat: ${extracted.reason}` });
       }
     }
-    const modelLookupQuery = await deriveLookupQueryWithModel(text, history, signal);
+    const derivedLookupQuery = await deriveLookupQueryWithModel(text, history, signal);
+    const modelLookupQuery = derivedLookupQuery
+      || (isExplicitWebLookupRequest(text) || looksLikeWebsiteFactQuestion(text) || looksLikeFreshFactQuestion(text)
+        ? buildForcedLookupQuery(text)
+        : "");
     let webLookup = null;
     if (modelLookupQuery) {
       emit("chat-web-lookup", {
         phase: "start",
         query: text,
         lookupQuery: modelLookupQuery,
-        detail: "Model zdecydowal, ze potrzebny jest web lookup.",
+        detail: derivedLookupQuery
+          ? "Model zdecydowal, ze potrzebny jest web lookup."
+          : "Wymuszono web lookup dla pytania wyglądającego na aktualne lub web-first.",
       });
       webLookup = await getLightWebContext(text, modelLookupQuery, { strictPreferred: false });
       if (webLookup?.error) {
@@ -5801,18 +6099,10 @@ async function runSimpleChat(userText) {
       });
     }
     if (webLookup?.context) {
-      chatMessages.splice(1, 0, { role: "user", content: `Kontekst z internetu:\n${webLookup.context}` });
-      chatMessages.splice(2, 0, { role: "user", content: buildWebConfidenceInstruction(webLookup) });
+      const enrichedMessages = injectWebLookupContext(chatMessages, webLookup);
+      chatMessages.length = 0;
+      chatMessages.push(...enrichedMessages);
       emit("status", { status: "model-thinking", detail: "Czat: dolaczono lekki kontekst internetowy." });
-      const sourceUrls = Array.isArray(webLookup.sources)
-        ? webLookup.sources.map((source) => String(source?.url || "").trim()).filter(Boolean).slice(0, 6)
-        : [];
-      if (sourceUrls.length) {
-        chatMessages.splice(3, 0, {
-          role: "user",
-          content: `Dostepne zrodla URL z tej tury:\n${sourceUrls.map((url) => `- ${url}`).join("\n")}`,
-        });
-      }
       emit("chat-web-lookup", {
         phase: "result",
         used: true,
@@ -5852,6 +6142,58 @@ async function runSimpleChat(userText) {
           ? rawReply.content
           : rawReply;
     let reply = String(replySource ?? "").trim();
+
+    if (!webLookup?.sources?.length && looksLikeNeedsWebInReply(reply)) {
+      const forcedLookupQuery = buildForcedLookupQuery(text);
+      emit("chat-web-lookup", {
+        phase: "start",
+        query: text,
+        lookupQuery: forcedLookupQuery,
+        detail: "Pierwsza odpowiedź modelu sugerowała potrzebę dodatkowego sprawdzenia w sieci.",
+      });
+      const forcedLookup = await getLightWebContext(text, forcedLookupQuery, { strictPreferred: false });
+      if (forcedLookup?.context) {
+        webLookup = forcedLookup;
+        const retryMessages = injectWebLookupContext(chatMessages, forcedLookup);
+        emit("status", { status: "model-thinking", detail: "Czat: dokładam lookup z sieci i proszę model o drugą próbę." });
+        emit("chat-web-lookup", {
+          phase: "result",
+          used: true,
+          fromCache: Boolean(forcedLookup.fromCache),
+          lookupUrl: forcedLookup.lookupUrl || "",
+          query: forcedLookup.query || text,
+          lookupQuery: forcedLookup.lookupQuery || forcedLookupQuery,
+          sources: Array.isArray(forcedLookup.sources) ? forcedLookup.sources.slice(0, 5) : [],
+          visitedUrls: Array.isArray(forcedLookup.visitedUrls) ? forcedLookup.visitedUrls.slice(0, 5) : [],
+          quality: forcedLookup.quality || null,
+          sourceDiagnostics: Array.isArray(forcedLookup.sourceDiagnostics) ? forcedLookup.sourceDiagnostics.slice(0, 8) : [],
+          detail: "Dołączono dodatkowy kontekst internetowy po pierwszej odpowiedzi modelu.",
+        });
+        const retriedReply = await callModelWithRecovery(retryMessages, signal, failedModelIds, { plainChat: true });
+        const retriedSource =
+          typeof retriedReply === "string"
+            ? retriedReply
+            : retriedReply && typeof retriedReply === "object" && "content" in retriedReply
+              ? retriedReply.content
+              : retriedReply;
+        reply = String(retriedSource ?? "").trim();
+        if (forcedLookup.lookupQuery) lastChatLookupQuery = forcedLookup.lookupQuery;
+      } else {
+        emit("chat-web-lookup", {
+          phase: "result",
+          used: false,
+          fromCache: Boolean(forcedLookup?.fromCache),
+          lookupUrl: forcedLookup?.lookupUrl || "",
+          query: forcedLookup?.query || text,
+          lookupQuery: forcedLookup?.lookupQuery || forcedLookupQuery,
+          sources: Array.isArray(forcedLookup?.sources) ? forcedLookup.sources.slice(0, 5) : [],
+          visitedUrls: Array.isArray(forcedLookup?.visitedUrls) ? forcedLookup.visitedUrls.slice(0, 5) : [],
+          quality: forcedLookup?.quality || null,
+          sourceDiagnostics: Array.isArray(forcedLookup?.sourceDiagnostics) ? forcedLookup.sourceDiagnostics.slice(0, 8) : [],
+          detail: forcedLookup?.skipped ? "Pominięto dodatkowy web lookup." : "Dodatkowy web lookup nie dał wystarczającego kontekstu.",
+        });
+      }
+    }
 
     if (webLookup?.sources?.length) {
       const usedUrls = webLookup.sources.map((entry) => String(entry?.url || "").trim()).filter(Boolean).slice(0, 8);
@@ -6118,6 +6460,30 @@ ipcMain.handle("app:delete-chat", (_event, chatId) => {
   chatHistory = chatHistory.filter((c) => c.id !== chatId);
   saveChatHistory();
   return chatHistory;
+});
+ipcMain.handle("app:file-history-undo", async (_event, payload = {}) => {
+  const result = await applyFileRevisionAction(payload.path || "", "undo", payload.revisionId || "");
+  emit("file-change", {
+    path: result.path,
+    action: "undo_file_change",
+    diff: result.diff,
+    before: result.before,
+    after: result.after,
+    history: result.history,
+  });
+  return { ok: true, ...result };
+});
+ipcMain.handle("app:file-history-redo", async (_event, payload = {}) => {
+  const result = await applyFileRevisionAction(payload.path || "", "redo", payload.revisionId || "");
+  emit("file-change", {
+    path: result.path,
+    action: "redo_file_change",
+    diff: result.diff,
+    before: result.before,
+    after: result.after,
+    history: result.history,
+  });
+  return { ok: true, ...result };
 });
 
 async function fetchProviderModels(providerId) {

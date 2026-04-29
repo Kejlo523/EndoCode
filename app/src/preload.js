@@ -20,6 +20,8 @@ contextBridge.exposeInMainWorld("endocode", {
   loadChats: () => ipcRenderer.invoke("app:load-chats"),
   loadChatContext: (chatId) => ipcRenderer.invoke("app:load-chat-context", chatId),
   deleteChat: (chatId) => ipcRenderer.invoke("app:delete-chat", chatId),
+  undoFileChange: (payload) => ipcRenderer.invoke("app:file-history-undo", payload),
+  redoFileChange: (payload) => ipcRenderer.invoke("app:file-history-redo", payload),
   getModelSettings: (modelId) => ipcRenderer.invoke("app:get-model-settings", modelId),
   getModelRecommendedSettings: (modelId) => ipcRenderer.invoke("app:get-model-recommended-settings", modelId),
   setModelSettings: (payload) => ipcRenderer.invoke("app:set-model-settings", payload),
