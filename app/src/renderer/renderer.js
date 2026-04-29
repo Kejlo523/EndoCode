@@ -1632,7 +1632,8 @@ function finalizeToolCardError(segment, event) {
     el.setAttribute("data-expanded", "true");
   }
   const detailEl = el.querySelector(".inline-event-detail");
-  if (detailEl) detailEl.textContent = compactJsonPreview({ tool: event.tool, error: event.error, recoveryHint: event.recoveryHint });
+  appendJsonDetails(el, { tool: event.tool, error: event.error, recoveryHint: event.recoveryHint });
+  if (detailEl) detailEl.textContent = "";
   syncInlineEventPersistAttrs(el);
   return true;
 }
