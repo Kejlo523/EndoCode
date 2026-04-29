@@ -18,6 +18,7 @@ function createRuntimeEngine(options = {}) {
     getRunningGpuLayers = () => null,
     setRunningModelId = () => {},
     setRunningRuntimeConfig = () => {},
+    persistRecoveredSettings = async () => {},
   } = options;
 
   async function ensureReady(port) {
@@ -72,9 +73,12 @@ function createRuntimeEngine(options = {}) {
 
     const contextTokens = desiredContextTokens;
     const configuredGpuLayers = desiredGpuLayers;
-    const gpuLayerAttempts = modelSettings.gpuLayers != null
-      ? [configuredGpuLayers]
-      : [...new Set([configuredGpuLayers, ...(config.gpuLayerFallbacks || [])])];
+    const fallbackLayers = Array.isArray(modelSettings.gpuLayerFallbacks) && modelSettings.gpuLayerFallbacks.length
+      ? modelSettings.gpuLayerFallbacks
+      : (Array.isArray(config.gpuLayerFallbacks) ? config.gpuLayerFallbacks : []);
+    const gpuLayerAttempts = Number(configuredGpuLayers || 0) > 0
+      ? [...new Set([configuredGpuLayers, ...fallbackLayers, 0])]
+      : [0];
     const runtimeConfig = {
       ...config,
       threads: modelSettings.threads ?? config.threads,
@@ -102,6 +106,15 @@ function createRuntimeEngine(options = {}) {
     for (let i = 0; i < gpuLayerAttempts.length; i += 1) {
       try {
         await launchServerProcess(runtimeConfig, modelPath, port, contextTokens, gpuLayerAttempts[i]);
+        if (gpuLayerAttempts[i] !== configuredGpuLayers) {
+          await persistRecoveredSettings({
+            modelId: selectedModelId,
+            requestedContextTokens: desiredContextTokens,
+            appliedContextTokens: contextTokens,
+            requestedGpuLayers: configuredGpuLayers,
+            appliedGpuLayers: gpuLayerAttempts[i],
+          });
+        }
         setRunningModelId(selectedModelId);
         setRunningRuntimeConfig({ contextTokens, gpuLayers: gpuLayerAttempts[i] });
         resetRuntimeRecoveryState(selectedModelId);

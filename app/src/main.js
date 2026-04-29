@@ -309,16 +309,16 @@ let instructionPolicyMeta = { loadedFiles: [], omittedFiles: [], sizeChars: 0, h
 let activeDownloads = new Map();
 let pendingCustomModelDownloads = new Map();
 const DEFAULT_MODEL_SETTINGS = {
-  temperature: null,     // null = use reasoning profile default
+  temperature: 1.0,
   maxTokens: null,
-  maxSteps: null,        // null = use reasoning profile, 0 = unlimited
+  maxSteps: 0,           // 0 = unlimited
   topP: null,
   topK: null,
   repeatPenalty: null,
   contextTokens: null,   // override for model context window
   runtimeContextCap: 0,  // 0 = auto, >0 hard runtime cap
   gpuLayers: null,       // override for GPU offload layers
-  maxMessages: null,     // override for compaction threshold
+  maxMessages: 1000,
   threads: null,
   threadsBatch: null,
   batchSize: null,
@@ -862,10 +862,20 @@ function applyRuntimeSafetyGuards(rawConfig = {}, modelMeta = {}) {
   const profile = getCachedModelProfile();
   const sizeGB = Number(modelMeta.expectedBytes || 0) / 1073741824;
   const category = String(modelMeta.category || rawConfig.category || "").toLowerCase();
-  const gpuAccelerated = String(profile?.gpuBackendClass || "cpu-only") !== "cpu-only";
+  const gpuBackendClass = String(profile?.gpuBackendClass || "cpu-only");
+  const gpuAvailable = gpuBackendClass !== "cpu-only";
+  const vramGB = Number(profile?.vramGB || 0);
   const threadProfile = getRuntimeThreadProfile(profile, category);
 
   const config = { ...rawConfig };
+  config.gpuLayers = clampInt(config.gpuLayers ?? 0, 0, 99, 0);
+  if (!gpuAvailable || vramGB <= 0) {
+    config.gpuLayers = 0;
+  } else {
+    const suggestedGpuLayers = suggestGpuLayersForProfile(profile, sizeGB);
+    if (suggestedGpuLayers > 0) config.gpuLayers = Math.min(config.gpuLayers, suggestedGpuLayers);
+  }
+  const gpuEnabled = gpuAvailable && config.gpuLayers > 0;
   config.contextTokens = clampContextTokens(clampInt(
     config.contextTokens ?? 8192,
     SAFE_RUNTIME_LIMITS.contextMin,
@@ -876,7 +886,7 @@ function applyRuntimeSafetyGuards(rawConfig = {}, modelMeta = {}) {
   if (sizeGB >= 10 || category === "large") config.contextTokens = Math.min(config.contextTokens, 8192);
   if (sizeGB >= 16) config.contextTokens = Math.min(config.contextTokens, 6144);
   if (Number(profile?.ramGB || 0) > 0 && Number(profile.ramGB) < 24) config.contextTokens = Math.min(config.contextTokens, 4096);
-  if (gpuAccelerated && Number(profile?.vramGB || 0) > 0 && Number(profile.vramGB) < 10) {
+  if (gpuEnabled && vramGB > 0 && vramGB < 10) {
     config.contextTokens = Math.min(config.contextTokens, 6144);
   }
 
@@ -895,10 +905,10 @@ function applyRuntimeSafetyGuards(rawConfig = {}, modelMeta = {}) {
   if (config.threadsBatch < config.threads) config.threadsBatch = config.threads;
 
   config.batchSize = clampInt(
-    config.batchSize ?? (gpuAccelerated ? 512 : 768),
+    config.batchSize ?? (gpuEnabled ? 512 : 768),
     SAFE_RUNTIME_LIMITS.batchMin,
     SAFE_RUNTIME_LIMITS.batchMax,
-    gpuAccelerated ? 512 : 768,
+    gpuEnabled ? 512 : 768,
   );
   config.ubatchSize = clampInt(
     config.ubatchSize ?? Math.max(128, Math.floor(config.batchSize / 2)),
@@ -914,15 +924,23 @@ function applyRuntimeSafetyGuards(rawConfig = {}, modelMeta = {}) {
     1,
   );
 
-  config.gpuLayers = clampInt(config.gpuLayers ?? 0, 0, 99, 0);
-  if (Number(profile?.vramGB || 0) <= 0 || String(profile?.gpuBackendClass || "") === "cpu-only") {
-    config.gpuLayers = 0;
+  if (gpuEnabled && vramGB > 0 && vramGB < 8) {
+    config.parallel = 1;
+    config.batchSize = Math.min(config.batchSize, 256);
+    config.ubatchSize = Math.min(config.ubatchSize, 64);
   }
+  if (gpuEnabled && vramGB > 0 && vramGB < 6 && sizeGB >= 6) {
+    config.gpuLayers = Math.min(config.gpuLayers, gpuBackendClass === "amd" ? 4 : 6);
+  }
+  if (gpuEnabled && vramGB > 0 && vramGB < 8 && config.contextTokens > 8192) {
+    config.gpuLayers = Math.min(config.gpuLayers, 4);
+  }
+  if (config.ubatchSize > config.batchSize) config.ubatchSize = Math.min(config.batchSize, SAFE_RUNTIME_LIMITS.ubatchMax);
   config.gpuLayerFallbacks = createGpuLayerFallbacks(config.gpuLayers, profile?.gpuBackendClass || "cpu-only");
 
   config.flashAttention = String(config.flashAttention ?? "on");
-  config.cacheTypeK = config.cacheTypeK || (gpuAccelerated ? "q4_0" : "q8_0");
-  config.cacheTypeV = config.cacheTypeV || (gpuAccelerated ? "q4_0" : "q8_0");
+  config.cacheTypeK = config.cacheTypeK || (gpuEnabled ? "q4_0" : "q8_0");
+  config.cacheTypeV = config.cacheTypeV || (gpuEnabled ? "q4_0" : "q8_0");
   return config;
 }
 
@@ -1250,6 +1268,26 @@ function getRuntimeThreadProfile(profile = {}, category = "medium") {
   return { threads: cpuThreads, threadsBatch };
 }
 
+function suggestGpuLayersForProfile(profile = {}, sizeGB = 0) {
+  const backendClass = String(profile.gpuBackendClass || "cpu-only");
+  const vramGB = Number(profile.vramGB || 0);
+  if (backendClass === "nvidia") {
+    if (!sizeGB || sizeGB <= vramGB * 0.72) return 99;
+    if (sizeGB <= vramGB * 0.95) return 64;
+    if (sizeGB <= vramGB * 1.2) return 36;
+    return vramGB >= 10 ? 24 : 12;
+  }
+  if (backendClass === "amd") {
+    if (!sizeGB || sizeGB <= vramGB * 0.7) return 64;
+    if (sizeGB <= vramGB * 1.0) return 32;
+    return vramGB >= 8 ? 16 : 8;
+  }
+  if (backendClass === "intel-igpu") {
+    return vramGB >= 4 ? 8 : 0;
+  }
+  return 0;
+}
+
 function inferModelCategory({ file, displayName, expectedBytes, category }) {
   if (category) return category;
   const paramB = inferParamB(displayName, file);
@@ -1300,19 +1338,7 @@ function createRuntimeModelConfig(model = {}) {
     contextTokens = clampContextTokens(model.contextTokens);
   }
 
-  let gpuLayers = 0;
-  if (profile.gpuBackendClass === "nvidia") {
-    if (!sizeGB || sizeGB <= profile.vramGB * 0.72) gpuLayers = 99;
-    else if (sizeGB <= profile.vramGB * 0.95) gpuLayers = 64;
-    else if (sizeGB <= profile.vramGB * 1.2) gpuLayers = 36;
-    else gpuLayers = profile.vramGB >= 10 ? 24 : 12;
-  } else if (profile.gpuBackendClass === "amd") {
-    if (!sizeGB || sizeGB <= profile.vramGB * 0.7) gpuLayers = 64;
-    else if (sizeGB <= profile.vramGB * 1.0) gpuLayers = 32;
-    else gpuLayers = profile.vramGB >= 8 ? 16 : 8;
-  } else if (profile.gpuBackendClass === "intel-igpu") {
-    gpuLayers = profile.vramGB >= 4 ? 8 : 0;
-  }
+  let gpuLayers = suggestGpuLayersForProfile(profile, sizeGB);
   if (Number.isFinite(Number(model.gpuLayers)) && Number(model.gpuLayers) >= 0) {
     gpuLayers = Number(model.gpuLayers);
   }
@@ -1461,7 +1487,7 @@ async function importLocalModelFromFile(input = {}) {
   catalog.models.push(newModel);
   saveModelCatalog(catalog);
   setModelSettingsForId(id, {
-    maxMessages: 32,
+    maxMessages: DEFAULT_MODEL_SETTINGS.maxMessages,
     contextTokens: runtimeConfig.contextTokens,
     gpuLayers: runtimeConfig.gpuLayers,
     threads: runtimeConfig.threads,
@@ -2516,21 +2542,15 @@ function getModelConfig() {
 
 function getModelSettingsForId(modelId = selectedModelId) {
   const raw = customModelSettingsByModelId?.[modelId] || {};
-  return { ...DEFAULT_MODEL_SETTINGS, ...raw };
+  const merged = { ...DEFAULT_MODEL_SETTINGS, ...raw };
+  if (merged.temperature == null) merged.temperature = DEFAULT_MODEL_SETTINGS.temperature;
+  if (merged.maxSteps == null) merged.maxSteps = DEFAULT_MODEL_SETTINGS.maxSteps;
+  if (merged.maxMessages == null) merged.maxMessages = DEFAULT_MODEL_SETTINGS.maxMessages;
+  return merged;
 }
 
 function getEffectiveContextTokensForModel(modelId = selectedModelId) {
-  const catalog = loadModelCatalog();
-  const model = catalog.models.find((entry) => entry.id === modelId) || getModelConfig();
-  if (!model) return MIN_CONTEXT_TOKENS;
-  const tokenLimits = getTokenRuntimeLimits();
-  const settings = getModelSettingsForId(model.id);
-  let effective = clampContextTokens(settings.contextTokens ?? model.contextTokens ?? 8192, tokenLimits);
-  const hardCap = Number(settings.runtimeContextCap || 0);
-  if (Number.isFinite(hardCap) && hardCap > 0) {
-    effective = Math.min(effective, clampContextTokens(hardCap, tokenLimits));
-  }
-  return effective;
+  return getEffectiveSettingsForModel(modelId).contextTokens;
 }
 
 function setModelSettingsForId(modelId, patch = {}) {
@@ -2540,7 +2560,7 @@ function setModelSettingsForId(modelId, patch = {}) {
 
 function settingsPatchFromRuntimeConfig(runtimeConfig = {}) {
   return {
-    maxMessages: 32,
+    maxMessages: DEFAULT_MODEL_SETTINGS.maxMessages,
     contextTokens: runtimeConfig.contextTokens,
     gpuLayers: runtimeConfig.gpuLayers,
     threads: runtimeConfig.threads,
@@ -2562,10 +2582,10 @@ function getRecommendedSettingsForModelId(modelId = selectedModelId) {
   const recommended = {
     temperature: 1.0,
     maxSteps: 0,
-    contextTokens: clampContextTokens(8196, tokenLimits),
+    contextTokens: clampContextTokens(runtime.contextTokens ?? 8192, tokenLimits),
     gpuLayers: clampRuntimeNumber(runtime.gpuLayers ?? model?.gpuLayers ?? 99, 0, 99),
     maxTokens: clampResponseTokens(4096, tokenLimits),
-    maxMessages: clampMaxMessages(100, tokenLimits),
+    maxMessages: clampMaxMessages(DEFAULT_MODEL_SETTINGS.maxMessages, tokenLimits),
     threads: clampRuntimeNumber(runtime.threads, SAFE_RUNTIME_LIMITS.threadsMin, SAFE_RUNTIME_LIMITS.threadsMax),
     threadsBatch: clampRuntimeNumber(runtime.threadsBatch, SAFE_RUNTIME_LIMITS.threadsBatchMin, SAFE_RUNTIME_LIMITS.threadsBatchMax),
     batchSize: clampRuntimeNumber(runtime.batchSize, SAFE_RUNTIME_LIMITS.batchMin, SAFE_RUNTIME_LIMITS.batchMax),
@@ -2585,7 +2605,7 @@ function resetModelSettingsForId(modelId) {
 function getActiveMaxMessages() {
   const model = getModelConfig();
   const selected = getModelSettingsForId(model?.id || selectedModelId);
-  return clampMaxMessages(selected.maxMessages ?? model?.maxMessages ?? 32);
+  return clampMaxMessages(selected.maxMessages ?? model?.maxMessages ?? DEFAULT_MODEL_SETTINGS.maxMessages);
 }
 
 function getReasoningProfile() {
@@ -3314,7 +3334,7 @@ function getRuntimeEngine() {
       getModelConfig,
       getModelPath,
       getModelFileStatus,
-      getModelSettingsForId,
+      getModelSettingsForId: getEffectiveSettingsForModel,
       resetRuntimeRecoveryState,
       baselineMetrics,
       emit,
@@ -3327,6 +3347,22 @@ function getRuntimeEngine() {
       setRunningRuntimeConfig: (payload = {}) => {
         runningContextTokens = Number(payload.contextTokens || 0) || null;
         runningGpuLayers = Number(payload.gpuLayers || 0) || 0;
+      },
+      persistRecoveredSettings: async (payload = {}) => {
+        const modelId = String(payload.modelId || selectedModelId);
+        const requestedGpuLayers = Number(payload.requestedGpuLayers || 0) || 0;
+        const appliedGpuLayers = Number(payload.appliedGpuLayers || 0) || 0;
+        const appliedContextTokens = Number(payload.appliedContextTokens || 0) || null;
+        if (appliedGpuLayers === requestedGpuLayers && !appliedContextTokens) return;
+        const patch = {};
+        if (appliedContextTokens) patch.contextTokens = appliedContextTokens;
+        patch.gpuLayers = appliedGpuLayers;
+        setModelSettingsForId(modelId, patch);
+        saveAppSettings();
+        emit("status", {
+          status: "server-starting",
+          detail: `Runtime dopasowal GPU layers ${requestedGpuLayers} -> ${appliedGpuLayers} do dostepnego VRAM.`,
+        });
       },
     });
   }
@@ -3656,6 +3692,11 @@ function isTransientModelError(error) {
 function isModelApi500Error(error) {
   const message = String(error?.message || error);
   return /\bModel API 500\b/i.test(message);
+}
+
+function isRuntimeMemoryPressureError(error) {
+  const message = String(error?.message || error || "");
+  return /erroroutofdevicememory|cannot meet free memory target|failed to fit params to free (device )?memory|device memory allocation|unable to allocate (vulkan\d*\s+)?buffer|out of memory/i.test(message);
 }
 
 function isTemplateConversationError(error) {
@@ -5818,6 +5859,9 @@ function formatChatFacingError(error, options = {}) {
   if (/image input is not supported/i.test(raw)) {
     return "Uzywany model jest klasycznym LLM bez obslugi obrazow. Przelacz na model Vision (VLM) albo wyslij samo polecenie tekstowe.";
   }
+  if (isRuntimeMemoryPressureError(raw)) {
+    return `Runtime dla ${modelName} uruchamia backend GPU, ale brakuje wolnego VRAM na obecne ustawienia. Zmniejsz Context Window, GPU Layers albo Parallel, ewentualnie wybierz lzejszy model.`;
+  }
   if (/llama-server zakonczyl prace przed startem API|Serwer nie odpowiedzial/i.test(raw)) {
     return `Nie udalo sie uruchomic runtime dla ${modelName}. Zmniejsz ustawienia modelu (kontekst/GPU layers) albo wybierz lzejszy model.`;
   }
@@ -7235,6 +7279,21 @@ function getEffectiveSettingsForModel(modelId) {
   const contextTokens = Number.isFinite(hardCap) && hardCap > 0
     ? Math.min(rawContextTokens, clampContextTokens(hardCap, tokenLimits))
     : rawContextTokens;
+  const runtimeSettings = applyRuntimeSafetyGuards({
+    contextTokens,
+    gpuLayers: selected.gpuLayers ?? model?.gpuLayers ?? 99,
+    threads: selected.threads ?? model?.threads ?? null,
+    threadsBatch: selected.threadsBatch ?? model?.threadsBatch ?? null,
+    batchSize: selected.batchSize ?? model?.batchSize ?? null,
+    ubatchSize: selected.ubatchSize ?? model?.ubatchSize ?? null,
+    parallel: selected.parallel ?? model?.parallel ?? null,
+    flashAttention: selected.flashAttention ?? model?.flashAttention ?? null,
+    cacheTypeK: selected.cacheTypeK ?? model?.cacheTypeK ?? null,
+    cacheTypeV: selected.cacheTypeV ?? model?.cacheTypeV ?? null,
+  }, {
+    expectedBytes: Number(model?.expectedBytes || 0),
+    category: model?.category || "",
+  });
   return {
     temperature: selected.temperature ?? getReasoningProfile().temperature,
     maxTokens: clampResponseTokens(selected.maxTokens ?? getReasoningProfile().maxTokens, tokenLimits),
@@ -7242,24 +7301,25 @@ function getEffectiveSettingsForModel(modelId) {
     topP: selected.topP ?? null,
     topK: selected.topK ?? null,
     repeatPenalty: selected.repeatPenalty ?? null,
-    contextTokens,
+    contextTokens: runtimeSettings.contextTokens,
     runtimeContextCap: Number(selected.runtimeContextCap || 0) > 0
       ? clampContextTokens(selected.runtimeContextCap, tokenLimits)
       : 0,
-    gpuLayers: selected.gpuLayers ?? model?.gpuLayers ?? 99,
-    maxMessages: clampMaxMessages(selected.maxMessages ?? model?.maxMessages ?? 32, tokenLimits),
-    threads: selected.threads ?? model?.threads ?? null,
-    threadsBatch: selected.threadsBatch ?? model?.threadsBatch ?? null,
-    batchSize: selected.batchSize ?? model?.batchSize ?? null,
-    ubatchSize: selected.ubatchSize ?? model?.ubatchSize ?? null,
-    parallel: selected.parallel ?? model?.parallel ?? null,
+    gpuLayers: runtimeSettings.gpuLayers,
+    maxMessages: clampMaxMessages(selected.maxMessages ?? model?.maxMessages ?? DEFAULT_MODEL_SETTINGS.maxMessages, tokenLimits),
+    threads: runtimeSettings.threads,
+    threadsBatch: runtimeSettings.threadsBatch,
+    batchSize: runtimeSettings.batchSize,
+    ubatchSize: runtimeSettings.ubatchSize,
+    parallel: runtimeSettings.parallel,
     fastStartup: selected.fastStartup ?? model?.fastStartup ?? "on",
-    flashAttention: selected.flashAttention ?? model?.flashAttention ?? null,
-    cacheTypeK: selected.cacheTypeK ?? model?.cacheTypeK ?? null,
-    cacheTypeV: selected.cacheTypeV ?? model?.cacheTypeV ?? null,
+    flashAttention: runtimeSettings.flashAttention,
+    cacheTypeK: runtimeSettings.cacheTypeK,
+    cacheTypeV: runtimeSettings.cacheTypeV,
     reasoning: selected.reasoning ?? model?.reasoning ?? null,
     reasoningBudget: selected.reasoningBudget == null ? (model?.reasoningBudget ?? null) : clampReasoningBudget(selected.reasoningBudget, tokenLimits),
     extraServerArgs: selected.extraServerArgs ?? model?.extraServerArgs ?? [],
+    gpuLayerFallbacks: runtimeSettings.gpuLayerFallbacks,
   };
 }
 
