@@ -7,7 +7,7 @@ EndoCode to desktopowa aplikacja Electron do pracy z lokalnym agentem kodującym
 
 ## Podglad aplikacji
 
-<img width="1261" height="849" alt="app-screenshot" src="https://github.com/user-attachments/assets/34c894b3-a254-412a-81cd-b1b0cd794f81" />
+<img width="800" height="auto" alt="app-screenshot" src="https://github.com/user-attachments/assets/34c894b3-a254-412a-81cd-b1b0cd794f81" />
 
 ## Co potrafi
 
