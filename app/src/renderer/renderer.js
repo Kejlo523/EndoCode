@@ -491,15 +491,23 @@ function showLive(label, detail = "") {
   const cleanLabel = String(label || "Pracuję...").trim();
   const cleanDetail = String(detail || "").replace(/\s+/g, " ").trim();
   const title = cleanDetail ? `${cleanLabel}: ${cleanDetail}` : cleanLabel;
-  liveActivity.dataset.liveState = inferLiveState(cleanLabel, cleanDetail);
+  upsertInlineEvent(
+    LIVE_CHAT_ACTIVITY_ID,
+    "activity",
+    cleanLabel,
+    cleanDetail || "Przetwarzanie",
+    { defaultExpanded: false, keepExpanded: false },
+  );
+  liveActivity.classList.add("hidden");
+  liveActivity.removeAttribute("data-live-state");
+  liveActivity.removeAttribute("aria-label");
   liveActivity.title = title;
-  liveActivity.setAttribute("aria-label", title);
   liveLabel.textContent = "";
   liveDetail.textContent = "";
-  liveActivity.classList.remove("hidden");
 }
 
 function hideLive() {
+  removeInlineEventByActivityId(LIVE_CHAT_ACTIVITY_ID);
   liveActivity.classList.add("hidden");
   liveActivity.removeAttribute("data-live-state");
   liveActivity.removeAttribute("aria-label");
@@ -878,6 +886,7 @@ function removeInlineEventByActivityId(activityId) {
 const MODEL_WRITING_ACTIVITY_ID = "model-writing";
 const AGENT_PHASE_ACTIVITY_ID = "agent-phase";
 const AGENT_NOTE_ACTIVITY_ID = "agent-note";
+const LIVE_CHAT_ACTIVITY_ID = "live-chat";
 let lastAgentPhaseSignature = "";
 let agentPhaseHistoryLines = [];
 
@@ -903,11 +912,13 @@ function friendlyAgentPhaseDetail(event = {}) {
   return parts.join(" · ");
 }
 
-function upsertInlineEvent(activityId, kind, title, body = "") {
+function upsertInlineEvent(activityId, kind, title, body = "", options = {}) {
   const safeBody = String(body ?? "").slice(0, 50000);
+  const keepExpanded = options.keepExpanded === true;
+  const defaultExpanded = options.defaultExpanded === true;
   let el = conversation.querySelector(`.inline-event[data-activity-id="${activityId}"]`);
   if (!el) {
-    el = addInlineEvent(kind, title, safeBody);
+    el = addInlineEvent(kind, title, safeBody, "", { defaultExpanded });
     el.setAttribute("data-activity-id", activityId);
   } else {
     el.setAttribute("data-title", title);
@@ -931,6 +942,12 @@ function upsertInlineEvent(activityId, kind, title, body = "") {
     if (summaryBtn) {
       summaryBtn.disabled = !hasDetailsNow && !hadDetailsBefore;
       summaryBtn.classList.toggle("no-detail", summaryBtn.disabled);
+    }
+    if (keepExpanded) {
+      const detailWrap = el.querySelector(".inline-event-detail-wrap");
+      if (detailWrap) detailWrap.classList.remove("hidden");
+      if (summaryBtn) summaryBtn.setAttribute("aria-expanded", "true");
+      el.setAttribute("data-expanded", "true");
     }
     syncInlineEventPersistAttrs(el);
     smartScroll();
@@ -1134,12 +1151,14 @@ function createFileChangeBlock(change = {}) {
     <div class="file-change-head">
       <span class="file-change-action">${escapeHtml(fileChangeActionLabel(change.action))}</span>
       <span class="file-change-path">${escapeHtml(change.path || "")}</span>
-      <span class="file-change-stats">
-        <span class="diff-stat-plus">+${added}</span>
-        <span class="diff-stat-minus">-${removed}</span>
-      </span>
+      <div class="file-change-meta">
+        <span class="file-change-stats">
+          <span class="diff-stat-plus">+${added}</span>
+          <span class="diff-stat-minus">-${removed}</span>
+        </span>
+        ${controlsHtml}
+      </div>
     </div>
-    ${controlsHtml}
   `;
   wrap.appendChild(buildDiffDetailsElement(Array.isArray(change.diff) ? change.diff : [], { open: false }));
   return wrap;
@@ -2815,9 +2834,9 @@ window.endocode.onEvent(async (event) => {
     removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
     removeInlineEventByActivityId(AGENT_PHASE_ACTIVITY_ID);
     removeInlineEventByActivityId(AGENT_NOTE_ACTIVITY_ID);
+    removeInlineEventByActivityId(LIVE_CHAT_ACTIVITY_ID);
     const rawInput = String(event.text || "").trim();
     const shortInput = rawInput.length > 240 ? `${rawInput.slice(0, 240)}...` : rawInput;
-    upsertInlineEvent(AGENT_PHASE_ACTIVITY_ID, "activity", "Startuję zadanie", shortInput || "Przygotowuję kontekst i pierwszy krok.");
     showLive("Planowanie...", shortInput || "Przygotowanie kontekstu i kolejnych kroków.");
     return;
   }
@@ -2853,7 +2872,6 @@ window.endocode.onEvent(async (event) => {
       const line = `${event.step ? `krok ${event.step}` : "teraz"} · ${phaseLabel}${detail ? ` · ${detail}` : ""}`;
       agentPhaseHistoryLines.push(line);
       if (agentPhaseHistoryLines.length > 10) agentPhaseHistoryLines = agentPhaseHistoryLines.slice(-10);
-      upsertInlineEvent(AGENT_PHASE_ACTIVITY_ID, "activity", event.step ? `Krok ${event.step} · ${phaseLabel}` : phaseLabel, agentPhaseHistoryLines.join("\n"));
       showLive(event.step ? `Krok ${event.step}: ${phaseLabel}` : phaseLabel, detail || "Przetwarzanie");
     }
     return;
