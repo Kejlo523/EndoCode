@@ -700,7 +700,7 @@ select:focus {
   border-radius: 0;
   border: none;
   background: transparent;
-  gap: 7px;
+  gap: 6px;
 }
 
 .inline-event.inline-event--toolcard-done {
@@ -932,9 +932,9 @@ select:focus {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  min-height: 22px;
+  min-height: 20px;
   color: var(--text-secondary);
-  font-size: 11px;
+  font-size: 10.5px;
 }
 
 .tool-result-label {
@@ -1110,6 +1110,16 @@ select:focus {
   flex-wrap: wrap;
 }
 
+.file-change-summary {
+  padding: 0;
+  margin: 0;
+  background: transparent;
+}
+
+.file-change-summary:hover .file-change-head {
+  border-color: rgba(155, 122, 214, 0.35);
+}
+
 .file-change-btn {
   border: 1px solid rgba(255, 255, 255, 0.16);
   background: rgba(255, 255, 255, 0.04);
@@ -1206,7 +1216,7 @@ select:focus {
   gap: 8px;
   text-align: left;
   cursor: pointer;
-  min-height: 20px;
+  min-height: 18px;
 }
 .inline-event-summary.no-detail {
   cursor: default;
@@ -1247,6 +1257,19 @@ select:focus {
   font-family: var(--mono);
   font-size: 10px;
   color: var(--text-muted);
+}
+
+.inline-event.live-chat-event {
+  padding: 4px 0;
+}
+
+.inline-event.live-chat-event .inline-event-body {
+  padding: 2px 0;
+}
+
+.inline-event.live-chat-event .inline-event-summary {
+  min-height: 24px;
+  padding: 1px 0;
 }
 
 .inline-event-expand {
@@ -1417,7 +1440,16 @@ details.diff-details > summary.diff-summary::-webkit-details-marker {
   user-select: none;
 }
 .diff-summary:hover { background: rgba(255, 255, 255, 0.04); }
+.diff-summary.file-change-summary {
+  display: block;
+  width: 100%;
+  padding: 0;
+}
+.diff-summary.file-change-summary .file-change-head {
+  width: 100%;
+}
 details.diff-details[open] > summary.diff-summary { padding: 6px 10px; }
+details.diff-details[open] > summary.diff-summary.file-change-summary { padding: 0; }
 .diff-stat-plus { color: var(--success); }
 .diff-stat-minus { color: var(--danger); }
 .diff-toggle-hint {
@@ -3075,6 +3107,16 @@ details.diff-details[open] > summary.diff-summary { padding: 6px 10px; }
   white-space: nowrap;
   color: var(--text-muted);
   font-family: var(--mono);
+  font-size: 10.5px;
+}
+
+.models-download-inline-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.models-download-inline-actions .model-btn {
+  padding: 3px 8px;
   font-size: 10.5px;
 }
 

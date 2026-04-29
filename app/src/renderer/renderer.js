@@ -109,6 +109,7 @@ let activeRunStartedAtMs = null;
 let currentThinkingSegment = null;
 const activeToolSegments = [];
 let autoScrollPinned = true;
+let lastConversationScrollTop = 0;
 let currentFileChangeEvent = null;
 let currentFileChanges = [];
 let currentWebLookupEvent = null;
@@ -496,18 +497,18 @@ function showLive(label, detail = "") {
     "activity",
     cleanLabel,
     cleanDetail || "Przetwarzanie",
-    { defaultExpanded: false, keepExpanded: false },
+    { defaultExpanded: true, keepExpanded: true, className: "live-chat-event", moveToBottom: true },
   );
-  liveActivity.classList.add("hidden");
-  liveActivity.removeAttribute("data-live-state");
-  liveActivity.removeAttribute("aria-label");
   liveActivity.title = title;
-  liveLabel.textContent = "";
+  liveActivity.dataset.liveState = inferLiveState(cleanLabel, cleanDetail);
+  liveActivity.setAttribute("aria-label", title);
+  liveLabel.textContent = cleanLabel;
+  // Belka live pokazuje tylko aktualny status (bez opisowych komentarzy).
   liveDetail.textContent = "";
+  liveActivity.classList.remove("hidden");
 }
 
 function hideLive() {
-  removeInlineEventByActivityId(LIVE_CHAT_ACTIVITY_ID);
   liveActivity.classList.add("hidden");
   liveActivity.removeAttribute("data-live-state");
   liveActivity.removeAttribute("aria-label");
@@ -531,7 +532,15 @@ function isConversationNearBottom(threshold = 140) {
 }
 
 conversation.addEventListener("scroll", () => {
-  autoScrollPinned = isConversationNearBottom(96);
+  const currentTop = conversation.scrollTop;
+  const scrollingUp = currentTop < lastConversationScrollTop - 2;
+  const nearBottom = isConversationNearBottom(24);
+  if (scrollingUp) {
+    autoScrollPinned = false;
+  } else if (nearBottom) {
+    autoScrollPinned = true;
+  }
+  lastConversationScrollTop = currentTop;
 }, { passive: true });
 
 function smartScroll(options = {}) {
@@ -916,10 +925,13 @@ function upsertInlineEvent(activityId, kind, title, body = "", options = {}) {
   const safeBody = String(body ?? "").slice(0, 50000);
   const keepExpanded = options.keepExpanded === true;
   const defaultExpanded = options.defaultExpanded === true;
+  const moveToBottom = options.moveToBottom === true;
+  const className = String(options.className || "").trim();
   let el = conversation.querySelector(`.inline-event[data-activity-id="${activityId}"]`);
   if (!el) {
     el = addInlineEvent(kind, title, safeBody, "", { defaultExpanded });
     el.setAttribute("data-activity-id", activityId);
+    if (className) el.classList.add(...className.split(/\s+/).filter(Boolean));
   } else {
     el.setAttribute("data-title", title);
     el.setAttribute("data-body", safeBody);
@@ -949,7 +961,12 @@ function upsertInlineEvent(activityId, kind, title, body = "", options = {}) {
       if (summaryBtn) summaryBtn.setAttribute("aria-expanded", "true");
       el.setAttribute("data-expanded", "true");
     }
+    if (className) el.classList.add(...className.split(/\s+/).filter(Boolean));
     syncInlineEventPersistAttrs(el);
+    smartScroll();
+  }
+  if (moveToBottom && el?.isConnected && conversation.lastElementChild !== el) {
+    conversation.appendChild(el);
     smartScroll();
   }
 }
@@ -1073,14 +1090,21 @@ function buildDiffDetailsElement(diff, options = {}) {
   details.className = "diff-details";
   details.open = options.open === true;
   const summary = document.createElement("summary");
-  summary.className = "diff-summary";
+  summary.className = String(options.summaryClass || "diff-summary");
   const { hunks, added, removed } = collectDiffHunks(diff);
   if (hunks.length === 0) {
-    summary.textContent = "Brak zmian w diffie";
+    if (options.summaryHtml) summary.innerHTML = String(options.summaryHtml);
+    else summary.textContent = "Brak zmian w diffie";
     details.appendChild(summary);
     return details;
   }
-  summary.innerHTML = `<span class="diff-stat-plus">+${added}</span> <span class="diff-stat-minus">−${removed}</span><span class="diff-toggle-hint">podgląd zmian</span>`;
+  if (options.summaryHtml) {
+    summary.innerHTML = String(options.summaryHtml)
+      .replaceAll("{{added}}", String(added))
+      .replaceAll("{{removed}}", String(removed));
+  } else {
+    summary.innerHTML = `<span class="diff-stat-plus">+${added}</span> <span class="diff-stat-minus">−${removed}</span><span class="diff-toggle-hint">podgląd zmian</span>`;
+  }
   const inner = document.createElement("div");
   inner.className = "diff diff--scroll";
   for (const hunk of hunks) {
@@ -1145,22 +1169,27 @@ function buildFileHistoryControlsHtml(history = {}, filePath = "") {
 function createFileChangeBlock(change = {}) {
   const wrap = document.createElement("div");
   wrap.className = "file-change-item";
-  const { added, removed } = collectDiffHunks(change.diff);
   const controlsHtml = buildFileHistoryControlsHtml(change.history, change.path || "");
-  wrap.innerHTML = `
+  const summaryHtml = `
     <div class="file-change-head">
       <span class="file-change-action">${escapeHtml(fileChangeActionLabel(change.action))}</span>
       <span class="file-change-path">${escapeHtml(change.path || "")}</span>
       <div class="file-change-meta">
         <span class="file-change-stats">
-          <span class="diff-stat-plus">+${added}</span>
-          <span class="diff-stat-minus">-${removed}</span>
+          <span class="diff-stat-plus">+{{added}}</span>
+          <span class="diff-stat-minus">-{{removed}}</span>
         </span>
         ${controlsHtml}
+        <span class="diff-toggle-hint">podgląd zmian</span>
       </div>
     </div>
   `;
-  wrap.appendChild(buildDiffDetailsElement(Array.isArray(change.diff) ? change.diff : [], { open: false }));
+  const details = buildDiffDetailsElement(Array.isArray(change.diff) ? change.diff : [], {
+    open: false,
+    summaryHtml,
+    summaryClass: "diff-summary file-change-summary",
+  });
+  wrap.appendChild(details);
   return wrap;
 }
 
@@ -1278,7 +1307,7 @@ function buildReadFileResultHtml(result = {}) {
   return buildResultCompactHtml(
     `Odczyt: ${compactPath(result.path || "", 2) || "plik"}`,
     chips,
-    buildCodePreviewDetails("pokaż treść", content),
+    "",
   );
 }
 
@@ -1299,7 +1328,7 @@ function buildShellResultHtml(result = {}) {
   return buildResultCompactHtml(
     "Wynik komendy",
     chips,
-    buildCodePreviewDetails("pokaż wyjście", snippet || "Brak danych wyjściowych.", 5000),
+    "",
   );
 }
 
@@ -1307,7 +1336,34 @@ function buildGenericResultHtml(result = {}) {
   return buildResultCompactHtml(
     "Wynik narzędzia",
     [],
-    buildCodePreviewDetails("pokaż wynik", compactJsonPreview(result), 3600),
+    "",
+  );
+}
+
+function ensureInlineEventExpand(el) {
+  if (!el) return null;
+  const detailWrap = el.querySelector(".inline-event-detail-wrap");
+  if (!detailWrap) return null;
+  let expand = detailWrap.querySelector(".inline-event-expand");
+  if (!expand) {
+    expand = document.createElement("div");
+    expand.className = "inline-event-expand";
+    detailWrap.appendChild(expand);
+  }
+  return expand;
+}
+
+function appendInlineEventExpandHtml(el, html = "") {
+  const expand = ensureInlineEventExpand(el);
+  if (!expand || !String(html || "").trim()) return;
+  expand.insertAdjacentHTML("beforeend", html);
+  syncInlineEventPersistAttrs(el);
+}
+
+function appendJsonDetails(el, payload) {
+  appendInlineEventExpandHtml(
+    el,
+    `<pre class="tool-result-snippet">${escapeHtml(compactJsonPreview(payload))}</pre>`,
   );
 }
 
@@ -1450,12 +1506,13 @@ function mergeFileChangeIntoToolCard(segment, event) {
   if (!bucket) {
     bucket = document.createElement("div");
     bucket.className = "tool-file-changes";
+    primary.innerHTML = "";
     primary.appendChild(bucket);
   }
-  const block = document.createElement("div");
-  block.className = "tool-file-change-block";
-  block.appendChild(createFileChangeBlock(event));
-  bucket.appendChild(block);
+  const blockWrap = document.createElement("div");
+  blockWrap.className = "tool-file-change-block tool-file-change-block--inline";
+  blockWrap.appendChild(createFileChangeBlock(event));
+  bucket.appendChild(blockWrap);
   if (event.history) syncFileHistoryControls(event.path, event.history);
   syncInlineEventPersistAttrs(segment.el);
 }
@@ -1477,7 +1534,11 @@ function finalizeToolCardSuccess(segment, event) {
     if (primary) {
       primary.innerHTML = buildReadFileResultHtml(result);
     }
-    if (detailEl) detailEl.textContent = compactJsonPreview(result);
+    appendInlineEventExpandHtml(
+      el,
+      `<pre class="file-read-preview">${escapeHtml(String(result.content || ""))}</pre>`,
+    );
+    if (detailEl) detailEl.textContent = "";
   } else if (tool === "run_powershell") {
     const exitCode = Number(result.exitCode);
     if (titleEl) {
@@ -1489,8 +1550,18 @@ function finalizeToolCardSuccess(segment, event) {
       const stdout = String(result.stdout || "").trim();
       const stderr = String(result.stderr || "").trim();
       primary.innerHTML = buildShellResultHtml({ ...result, stdout, stderr });
+      const snippet = [
+        result.cwd ? `[cwd] ${result.cwd}` : "",
+        stdout ? `[stdout]\n${stdout}` : "",
+        stderr ? `[stderr]\n${stderr}` : "",
+      ].filter(Boolean).join("\n\n");
+      appendInlineEventExpandHtml(
+        el,
+        `<pre class="tool-result-snippet">${escapeHtml(snippet || "Brak danych wyjściowych.")}</pre>`,
+      );
     }
-    if (detailEl) detailEl.textContent = compactJsonPreview(result);
+    appendJsonDetails(el, result);
+    if (detailEl) detailEl.textContent = "";
   } else if (tool === "patch_edit" || tool === "write_file" || tool === "patch_batch" || tool === "download_file") {
     const labels = {
       patch_edit: "Zastosowano zmiany",
@@ -1506,16 +1577,32 @@ function finalizeToolCardSuccess(segment, event) {
         titleEl.textContent = `${labels[tool] || "Gotowe"}: ${pathHint}`;
       }
     }
-    if (primary && !primary.querySelector(".tool-file-changes") && !primary.querySelector(".file-read-preview")) {
-      primary.innerHTML = buildResultCompactHtml("Zakończono", [buildToolChip(compactToolResultSummary(tool, result), "ok")]);
+    if (primary && !primary.querySelector(".tool-file-changes")) {
+      const pathHint = String(result.path || segment.path || "").trim();
+      if (pathHint) {
+        const syntheticChange = {
+          action: tool,
+          path: pathHint,
+          diff: Array.isArray(result.diff) ? result.diff : [],
+          history: result.history || null,
+        };
+        const blockWrap = document.createElement("div");
+        blockWrap.className = "tool-file-change-block tool-file-change-block--inline";
+        blockWrap.appendChild(createFileChangeBlock(syntheticChange));
+        primary.innerHTML = `<div class="tool-file-changes"></div>`;
+        const bucket = primary.querySelector(".tool-file-changes");
+        if (bucket) bucket.appendChild(blockWrap);
+      }
     }
-    if (detailEl) detailEl.textContent = compactJsonPreview(result);
+    appendJsonDetails(el, result);
+    if (detailEl) detailEl.textContent = "";
   } else {
     if (titleEl) titleEl.textContent = `Gotowe: ${tool}`;
     if (primary) {
       primary.innerHTML = buildGenericResultHtml(result);
     }
-    if (detailEl) detailEl.textContent = compactJsonPreview(result);
+    appendJsonDetails(el, result);
+    if (detailEl) detailEl.textContent = "";
   }
 
   el.classList.add("inline-event--toolcard-done");
@@ -2176,6 +2263,9 @@ function renderModelsDownloadInline(items = []) {
       <div class="download-progress-fill" style="width:${progress}%"></div>
     </div>
     <div class="models-download-inline-name">${escapeHtml(downloadEntryLabel(first))}</div>
+    <div class="models-download-inline-actions">
+      <button class="model-btn delete" data-download-cancel="${escapeAttr(first.modelId || "")}">Anuluj</button>
+    </div>
   `;
 }
 
@@ -2380,6 +2470,18 @@ if (downloadCenterList) {
   });
 }
 
+if (modelsDownloadInline) {
+  modelsDownloadInline.addEventListener("click", async (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) return;
+    const cancelBtn = target.closest("button[data-download-cancel]");
+    if (!cancelBtn) return;
+    const modelId = cancelBtn.getAttribute("data-download-cancel");
+    if (!modelId) return;
+    await window.cancelModelDownload(modelId);
+  });
+}
+
 accessToggle.addEventListener("click", async () => {
   const newLevel = currentAccessLevel === "sandbox" ? "full" : "sandbox";
   try {
@@ -2572,6 +2674,8 @@ if (promptQueueList) {
 conversation.addEventListener("click", (event) => {
   const historyTarget = event.target.closest("button[data-file-history-action]");
   if (historyTarget) {
+    event.preventDefault();
+    event.stopPropagation();
     const action = historyTarget.getAttribute("data-file-history-action");
     const path = historyTarget.getAttribute("data-file-path") || "";
     const revisionId = historyTarget.getAttribute("data-revision-id") || "";
@@ -2837,6 +2941,13 @@ window.endocode.onEvent(async (event) => {
     removeInlineEventByActivityId(LIVE_CHAT_ACTIVITY_ID);
     const rawInput = String(event.text || "").trim();
     const shortInput = rawInput.length > 240 ? `${rawInput.slice(0, 240)}...` : rawInput;
+    upsertInlineEvent(
+      AGENT_PHASE_ACTIVITY_ID,
+      "activity",
+      "Startuję zadanie",
+      shortInput || "Przygotowuję kontekst i pierwszy krok.",
+      { defaultExpanded: true, keepExpanded: true, moveToBottom: true },
+    );
     showLive("Planowanie...", shortInput || "Przygotowanie kontekstu i kolejnych kroków.");
     return;
   }
@@ -2872,6 +2983,13 @@ window.endocode.onEvent(async (event) => {
       const line = `${event.step ? `krok ${event.step}` : "teraz"} · ${phaseLabel}${detail ? ` · ${detail}` : ""}`;
       agentPhaseHistoryLines.push(line);
       if (agentPhaseHistoryLines.length > 10) agentPhaseHistoryLines = agentPhaseHistoryLines.slice(-10);
+      upsertInlineEvent(
+        AGENT_PHASE_ACTIVITY_ID,
+        "activity",
+        event.step ? `Krok ${event.step} · ${phaseLabel}` : phaseLabel,
+        agentPhaseHistoryLines.join("\n"),
+        { defaultExpanded: true, keepExpanded: true, moveToBottom: true },
+      );
       showLive(event.step ? `Krok ${event.step}: ${phaseLabel}` : phaseLabel, detail || "Przetwarzanie");
     }
     return;
