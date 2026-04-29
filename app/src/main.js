@@ -307,6 +307,7 @@ let runtimeBackendStatus = {
 let instructionPolicyMeta = { loadedFiles: [], omittedFiles: [], sizeChars: 0, hash: "" };
 
 let activeDownloads = new Map();
+let pendingCustomModelDownloads = new Map();
 const DEFAULT_MODEL_SETTINGS = {
   temperature: null,     // null = use reasoning profile default
   maxTokens: null,
@@ -2535,6 +2536,22 @@ function getEffectiveContextTokensForModel(modelId = selectedModelId) {
 function setModelSettingsForId(modelId, patch = {}) {
   const base = getModelSettingsForId(modelId);
   customModelSettingsByModelId[modelId] = { ...base, ...patch };
+}
+
+function settingsPatchFromRuntimeConfig(runtimeConfig = {}) {
+  return {
+    maxMessages: 32,
+    contextTokens: runtimeConfig.contextTokens,
+    gpuLayers: runtimeConfig.gpuLayers,
+    threads: runtimeConfig.threads,
+    threadsBatch: runtimeConfig.threadsBatch,
+    batchSize: runtimeConfig.batchSize,
+    ubatchSize: runtimeConfig.ubatchSize,
+    parallel: runtimeConfig.parallel,
+    flashAttention: runtimeConfig.flashAttention,
+    cacheTypeK: runtimeConfig.cacheTypeK,
+    cacheTypeV: runtimeConfig.cacheTypeV,
+  };
 }
 
 function getRecommendedSettingsForModelId(modelId = selectedModelId) {
@@ -6630,7 +6647,9 @@ ipcMain.handle("app:model-library-stats", () => getModelLibraryStats());
 
 ipcMain.handle("app:download-model", async (_event, modelId) => {
   const catalog = loadModelCatalog();
-  const model = catalog.models.find(m => m.id === modelId);
+  let model = catalog.models.find(m => m.id === modelId);
+  const pending = pendingCustomModelDownloads.get(modelId);
+  if (!model && pending?.model) model = pending.model;
   if (!model) throw new Error("Model nie znaleziony w katalogu.");
   if (model.kind !== "local-gguf") throw new Error("Ten model nie jest lokalnym plikiem GGUF.");
 
@@ -6648,11 +6667,18 @@ ipcMain.handle("app:download-model", async (_event, modelId) => {
   if (!url) throw new Error("Brak adresu pobierania dla tego modelu.");
 
   try {
-    await performDownload(url, dest, modelId);
-    emit("status", { status: "download-complete", modelId, detail: `Pobrano model: ${model.displayName}` });
-    return { ok: true };
+    await performDownload(url, dest, modelId, {
+      displayName: model.displayName,
+      fileName,
+    });
+    if (pending?.model) {
+      model = registerDownloadedCustomModel(pending.model, pending.runtimeConfig);
+    }
+    emit("status", { status: "download-complete", modelId, displayName: model.displayName, detail: `Pobrano model: ${model.displayName}` });
+    return { ok: true, model };
   } catch (error) {
     const message = String(error?.message || error || "");
+    if (pending?.model) pendingCustomModelDownloads.delete(modelId);
     if (/anulowan|cancel/i.test(message)) {
       return { ok: false, cancelled: true };
     }
@@ -6764,15 +6790,11 @@ function parseModelDownloadInput(input) {
   };
 }
 
-ipcMain.handle("app:add-custom-model", async (_event, input) => {
-  const catalog = loadModelCatalog();
-  const parsed = parseModelDownloadInput(input);
+function createCustomDownloadModel(parsed) {
   const { repo, file, sourceType, downloadUrl } = parsed;
   const id = createModelId(file, repo || sourceType);
-  if (catalog.models.find(m => m.id === id)) throw new Error("Ten model jest juz w katalogu.");
   const runtimeConfig = createRuntimeModelConfig(parsed);
-
-  const newModel = {
+  const model = {
     id,
     displayName: parsed.displayName,
     kind: "local-gguf",
@@ -6785,24 +6807,54 @@ ipcMain.handle("app:add-custom-model", async (_event, input) => {
     ...runtimeConfig,
     description: parsed.description || `Własny model dodany z ${sourceType === "direct" ? "bezpośredniego linku" : sourceType}.`,
   };
+  return { model, runtimeConfig };
+}
 
-  catalog.models.push(newModel);
-  saveModelCatalog(catalog);
-  setModelSettingsForId(id, {
-    maxMessages: 32,
-    contextTokens: runtimeConfig.contextTokens,
-    gpuLayers: runtimeConfig.gpuLayers,
-    threads: runtimeConfig.threads,
-    threadsBatch: runtimeConfig.threadsBatch,
-    batchSize: runtimeConfig.batchSize,
-    ubatchSize: runtimeConfig.ubatchSize,
-    parallel: runtimeConfig.parallel,
-    flashAttention: runtimeConfig.flashAttention,
-    cacheTypeK: runtimeConfig.cacheTypeK,
-    cacheTypeV: runtimeConfig.cacheTypeV,
-  });
+function registerDownloadedCustomModel(model, runtimeConfig = null) {
+  if (!model?.id) throw new Error("Brak danych modelu do rejestracji.");
+  const catalog = loadModelCatalog();
+  const existing = catalog.models.find((entry) => entry.id === model.id);
+  if (!existing) {
+    catalog.models.push(model);
+    saveModelCatalog(catalog);
+  }
+  const runtime = runtimeConfig || createRuntimeModelConfig(model);
+  setModelSettingsForId(model.id, settingsPatchFromRuntimeConfig(runtime));
   saveAppSettings();
-  return { ok: true, model: newModel };
+  pendingCustomModelDownloads.delete(model.id);
+  return existing || model;
+}
+
+ipcMain.handle("app:add-custom-model", async (_event, input) => {
+  const catalog = loadModelCatalog();
+  const parsed = parseModelDownloadInput(input);
+  const { model: newModel, runtimeConfig } = createCustomDownloadModel(parsed);
+  const id = newModel.id;
+  const existing = catalog.models.find(m => m.id === id);
+  if (existing) {
+    const existingPath = existing.file ? path.resolve(ENDOCODE_HOME, existing.file) : "";
+    const canReplaceStaleEntry = (
+      existing.kind === "local-gguf" &&
+      existing.file === newModel.file &&
+      String(existing.downloadUrl || "").trim() === String(newModel.downloadUrl || "").trim() &&
+      existingPath &&
+      !fs.existsSync(existingPath)
+    );
+    if (!canReplaceStaleEntry) throw new Error("Ten model jest juz w katalogu.");
+    catalog.models = catalog.models.filter((model) => model.id !== id);
+    delete customModelSettingsByModelId[id];
+    if (selectedModelId === id) {
+      selectedModelId = catalog.defaultModelId || catalog.models[0]?.id || selectedModelId;
+      if (!catalog.models.some((model) => model.id === selectedModelId)) {
+        selectedModelId = catalog.models[0]?.id || selectedModelId;
+      }
+    }
+    saveModelCatalog(catalog);
+    saveAppSettings();
+  }
+  if (pendingCustomModelDownloads.has(id)) throw new Error("Pobieranie tego modelu jest już przygotowane.");
+  pendingCustomModelDownloads.set(id, { model: newModel, runtimeConfig });
+  return { ok: true, pending: true, model: newModel };
 });
 ipcMain.handle("app:import-local-model", async (_event, payload) => importLocalModelFromFile(payload));
 
@@ -7026,8 +7078,11 @@ ipcMain.handle("app:open-external", async (_event, url) => {
   return { ok: true };
 });
 
-async function performDownload(url, dest, modelId) {
-  if (activeDownloads.get(modelId)?.state === "downloading") throw new Error("Pobieranie juz trwa.");
+async function performDownload(url, dest, modelId, meta = {}) {
+  const activeDownload = activeDownloads.get(modelId);
+  if (activeDownload?.state === "queued" || activeDownload?.state === "downloading") {
+    throw new Error("Pobieranie juz trwa.");
+  }
 
   const destDir = path.dirname(dest);
   if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
@@ -7038,6 +7093,34 @@ async function performDownload(url, dest, modelId) {
   let requestRef = null;
   let finished = false;
   let settled = false;
+  const failDownload = (error, progress = 0, downloaded = 0, total = 0) => {
+    const errorMessage = String(error?.message || error || "Błąd pobierania");
+    if (settled) return error instanceof Error ? error : new Error(errorMessage);
+    try { file.destroy(); } catch { /* ignore */ }
+    fs.unlink(tempDest, () => { });
+    activeDownloads.set(modelId, {
+      state: "failed",
+      progress,
+      downloaded,
+      total,
+      error: errorMessage,
+      cancel: null,
+      displayName: meta.displayName || "",
+      fileName: meta.fileName || "",
+    });
+    emit("agent:event", {
+      type: "model-download-state",
+      modelId,
+      displayName: meta.displayName || "",
+      fileName: meta.fileName || "",
+      state: "failed",
+      progress,
+      downloaded,
+      total,
+      error: errorMessage,
+    });
+    return error instanceof Error ? error : new Error(errorMessage);
+  };
 
   const cancelDownload = (reason = "cancelled") => {
     if (finished || cancelled) return;
@@ -7046,11 +7129,11 @@ async function performDownload(url, dest, modelId) {
     try { file.destroy(); } catch { /* ignore */ }
     try { if (fs.existsSync(tempDest)) fs.unlinkSync(tempDest); } catch { /* ignore */ }
     activeDownloads.delete(modelId);
-    emit("agent:event", { type: "model-download-state", modelId, state: "cancelled", progress: 0, downloaded: 0, total: 0, error: "Anulowano przez użytkownika." });
+    emit("agent:event", { type: "model-download-state", modelId, displayName: meta.displayName || "", fileName: meta.fileName || "", state: "cancelled", progress: 0, downloaded: 0, total: 0, error: "Anulowano przez użytkownika." });
   };
 
-  activeDownloads.set(modelId, { state: "queued", progress: 0, downloaded: 0, total: 0, error: null, cancel: cancelDownload });
-  emit("agent:event", { type: "model-download-state", modelId, state: "queued", progress: 0, downloaded: 0, total: 0 });
+  activeDownloads.set(modelId, { state: "queued", progress: 0, downloaded: 0, total: 0, error: null, cancel: cancelDownload, displayName: meta.displayName || "", fileName: meta.fileName || "" });
+  emit("agent:event", { type: "model-download-state", modelId, displayName: meta.displayName || "", fileName: meta.fileName || "", state: "queued", progress: 0, downloaded: 0, total: 0 });
 
   return new Promise((resolve, reject) => {
     const safeResolve = (value) => {
@@ -7064,32 +7147,37 @@ async function performDownload(url, dest, modelId) {
       reject(error);
     };
 
+    file.on("error", (err) => {
+      if (cancelled) return safeReject(new Error("Pobieranie anulowane."));
+      safeReject(failDownload(err));
+    });
+
     function startRequest(requestUrl) {
       const request = https.get(requestUrl, { headers: { "User-Agent": "EndoCode-Desktop-App" } }, (response) => {
-        requestRef = request;
         if (cancelled) return;
         if ([301, 302, 303, 307, 308].includes(response.statusCode)) {
           const location = response.headers.location;
           if (!location) {
-            safeReject(new Error("Przekierowanie bez nagłówka Location."));
+            safeReject(failDownload("Przekierowanie bez nagłówka Location."));
             return;
           }
+          response.resume();
           startRequest(new URL(location, requestUrl).toString());
           return;
         }
 
         if (response.statusCode !== 200) {
-          fs.unlink(tempDest, () => { });
-          activeDownloads.delete(modelId);
-          safeReject(new Error(`Serwer zwrocil blad ${response.statusCode}`));
+          const errorMessage = `Serwer zwrocil blad ${response.statusCode}`;
+          response.resume();
+          safeReject(failDownload(errorMessage));
           return;
         }
 
         const total = parseInt(response.headers["content-length"], 10) || 0;
         let downloaded = 0;
         let lastPercent = -1;
-        activeDownloads.set(modelId, { state: "downloading", progress: 0, downloaded: 0, total, error: null, cancel: cancelDownload });
-        emit("agent:event", { type: "model-download-state", modelId, state: "downloading", progress: 0, downloaded: 0, total });
+        activeDownloads.set(modelId, { state: "downloading", progress: 0, downloaded: 0, total, error: null, cancel: cancelDownload, displayName: meta.displayName || "", fileName: meta.fileName || "" });
+        emit("agent:event", { type: "model-download-state", modelId, displayName: meta.displayName || "", fileName: meta.fileName || "", state: "downloading", progress: 0, downloaded: 0, total });
 
         response.on("data", (chunk) => {
           if (cancelled) return;
@@ -7097,8 +7185,8 @@ async function performDownload(url, dest, modelId) {
           const progress = total > 0 ? Math.round((downloaded / total) * 100) : 0;
           if (progress !== lastPercent) {
             lastPercent = progress;
-            activeDownloads.set(modelId, { state: "downloading", progress, downloaded, total, error: null, cancel: cancelDownload });
-            emit("agent:event", { type: "model-download-progress", modelId, progress, downloaded, total });
+            activeDownloads.set(modelId, { state: "downloading", progress, downloaded, total, error: null, cancel: cancelDownload, displayName: meta.displayName || "", fileName: meta.fileName || "" });
+            emit("agent:event", { type: "model-download-progress", modelId, displayName: meta.displayName || "", fileName: meta.fileName || "", progress, downloaded, total });
           }
         });
 
@@ -7112,27 +7200,18 @@ async function performDownload(url, dest, modelId) {
             if (fs.existsSync(dest)) fs.unlinkSync(dest);
             fs.renameSync(tempDest, dest);
             activeDownloads.delete(modelId);
-            emit("agent:event", { type: "model-download-state", modelId, state: "completed", progress: 100, downloaded, total });
+            emit("agent:event", { type: "model-download-state", modelId, displayName: meta.displayName || "", fileName: meta.fileName || "", state: "completed", progress: 100, downloaded, total });
             safeResolve();
           } catch (e) {
-            activeDownloads.set(modelId, { state: "failed", progress: 0, downloaded: 0, total: 0, error: String(e?.message || e) });
-            emit("agent:event", { type: "model-download-state", modelId, state: "failed", progress: 0, downloaded: 0, total: 0, error: String(e?.message || e) });
-            safeReject(e);
+            safeReject(failDownload(e));
           }
         });
       });
-
-      file.on("error", (err) => {
-        if (cancelled) return safeReject(new Error("Pobieranie anulowane."));
-        safeReject(err);
-      });
+      requestRef = request;
 
       request.on("error", (err) => {
         if (cancelled || String(err?.message || "").includes("cancelled-by-user")) return safeReject(new Error("Pobieranie anulowane."));
-        fs.unlink(tempDest, () => { });
-        activeDownloads.set(modelId, { state: "failed", progress: 0, downloaded: 0, total: 0, error: String(err?.message || err), cancel: null });
-        emit("agent:event", { type: "model-download-state", modelId, state: "failed", progress: 0, downloaded: 0, total: 0, error: String(err?.message || err) });
-        safeReject(err);
+        safeReject(failDownload(err));
       });
     }
 

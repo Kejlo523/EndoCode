@@ -43,6 +43,19 @@
       </div>
 
       <div class="sidebar-bottom">
+        <aside class="download-center hidden collapsed" id="downloadCenter">
+          <div class="download-center-head">
+            <div class="download-center-title">
+              <strong>Pobieranie</strong>
+              <span id="downloadCenterCount">0</span>
+            </div>
+            <button type="button" class="download-center-toggle" id="downloadCenterToggle" title="Rozwiń pobieranie">+</button>
+          </div>
+          <div class="download-center-summary" id="downloadCenterSummary">Brak aktywnych pobrań.</div>
+          <div class="download-center-list" id="downloadCenterList">
+            <div class="models-empty">Brak aktywnych pobrań.</div>
+          </div>
+        </aside>
         <button class="sidebar-menu-btn" id="modelsBtn" title="Modele">
           <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
             <path d="M1 4h14M1 8h14M1 12h14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
@@ -265,6 +278,7 @@
             <button class="model-tab-btn" id="tabManual">Dodaj ręcznie</button>
             <button class="model-tab-btn" id="tabApi">API</button>
           </div>
+          <div class="models-download-inline hidden" id="modelsDownloadInline"></div>
         </aside>
         <section class="models-main">
       <div id="modelsLibraryView">
@@ -361,23 +375,6 @@
       </div>
     </div>
   </div>
-
-  <aside class="download-center hidden" id="downloadCenter">
-    <div class="download-center-head">
-      <strong>Pobieranie modeli</strong>
-      <div class="download-center-head-actions">
-        <span id="downloadCenterCount">0</span>
-        <button type="button" class="download-center-toggle" id="downloadCenterToggle" title="Zwiń pobieranie">−</button>
-      </div>
-    </div>
-    <div class="download-center-list" id="downloadCenterList">
-      <div class="models-empty">Brak aktywnych pobrań.</div>
-    </div>
-  </aside>
-  <button type="button" class="download-center-restore hidden" id="downloadCenterRestore" title="Pokaż pobieranie modeli">
-    Pobieranie modeli (<span id="downloadCenterRestoreCount">0</span>)
-  </button>
-
 
   <!-- ── SETTINGS MODAL ── -->
   <div class="modal-overlay hidden" id="settingsModal">

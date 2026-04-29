@@ -56,8 +56,8 @@ const downloadCenter = document.getElementById("downloadCenter");
 const downloadCenterList = document.getElementById("downloadCenterList");
 const downloadCenterCount = document.getElementById("downloadCenterCount");
 const downloadCenterToggle = document.getElementById("downloadCenterToggle");
-const downloadCenterRestore = document.getElementById("downloadCenterRestore");
-const downloadCenterRestoreCount = document.getElementById("downloadCenterRestoreCount");
+const downloadCenterSummary = document.getElementById("downloadCenterSummary");
+const modelsDownloadInline = document.getElementById("modelsDownloadInline");
 const runtimeWarning = document.getElementById("runtimeWarning");
 const installRuntimeBtn = document.getElementById("installRuntimeBtn");
 const runtimeInstallProgress = document.getElementById("runtimeInstallProgress");
@@ -118,7 +118,7 @@ let promptQueueProcessing = false;
 let finalReceivedInRun = false;
 let apiProvidersState = [];
 const modelDownloadState = new Map();
-let downloadCenterCollapsed = false;
+let downloadCenterCollapsed = true;
 const modelsModule = window.EndoModules?.createModelsModule?.({
   modelsList,
   modelsInstalledList,
@@ -208,6 +208,52 @@ function shortPath(fullPath) {
   if (!fullPath) return "workspace";
   const parts = fullPath.replace(/\\/g, "/").split("/");
   return parts.length > 2 ? `.../${parts.slice(-2).join("/")}` : fullPath;
+}
+
+function compactPath(fullPath, maxParts = 2) {
+  const normalized = String(fullPath || "").replace(/\\/g, "/").trim();
+  if (!normalized) return "";
+  const parts = normalized.split("/").filter(Boolean);
+  if (parts.length <= maxParts) return normalized;
+  return `.../${parts.slice(-maxParts).join("/")}`;
+}
+
+function fileNameFromPath(fullPath) {
+  const normalized = String(fullPath || "").replace(/\\/g, "/").trim();
+  const parts = normalized.split("/").filter(Boolean);
+  return parts.at(-1) || normalized || "plik";
+}
+
+function shortenMiddle(value, max = 96) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  if (text.length <= max) return text;
+  const left = Math.max(12, Math.floor((max - 3) * 0.58));
+  const right = Math.max(8, max - 3 - left);
+  return `${text.slice(0, left)}...${text.slice(-right)}`;
+}
+
+function textStats(value) {
+  const text = String(value ?? "");
+  const lines = text ? text.split(/\r\n|\r|\n/).length : 0;
+  let bytes = text.length;
+  try {
+    bytes = new TextEncoder().encode(text).length;
+  } catch { /* keep char-length fallback */ }
+  return { lines, bytes };
+}
+
+function formatBytes(bytes) {
+  const n = Math.max(0, Number(bytes) || 0);
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(n < 10 * 1024 ? 1 : 0)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function pickVariant(list, seed = 0) {
+  if (!Array.isArray(list) || list.length === 0) return "";
+  const n = Number(seed);
+  const idx = Number.isFinite(n) ? Math.abs(Math.floor(n)) % list.length : 0;
+  return list[idx];
 }
 
 function parseEventTimeMs(event) {
@@ -428,18 +474,37 @@ async function processPromptQueue() {
 }
 
 // ── Live Activity ──
+function inferLiveState(label, detail = "") {
+  const text = `${label} ${detail}`.toLowerCase();
+  if (/błąd|blad|error|nieudane|failed/.test(text)) return "error";
+  if (/gotowe|zakończ|zakoncz|zapisano|odczytano|pobrano|complete/.test(text)) return "done";
+  if (/pisz|zapis|patch|edyt|plik|diff|kreśl|kresl/.test(text)) return "write";
+  if (/czyta|odczyt|listuje|lista|katalog|ścieżk|sciezk|read|ls\b|pwd|cd\b/.test(text)) return "read";
+  if (/powershell|komend|runtime|server|kill|shell/.test(text)) return "shell";
+  if (/web|lookup|szuk|pobier|download|sieci|url/.test(text)) return "search";
+  if (/czeka|zatwierd|approval|kolejka/.test(text)) return "wait";
+  if (/myśli|mysli|plan|krok|analiz|walid|akcj|kontekst|finaliz/.test(text)) return "think";
+  return "work";
+}
+
 function showLive(label, detail = "") {
   const cleanLabel = String(label || "Pracuję...").trim();
   const cleanDetail = String(detail || "").replace(/\s+/g, " ").trim();
-  liveLabel.textContent = cleanLabel;
-  liveDetail.textContent = cleanDetail.length > 220 ? `${cleanDetail.slice(0, 220)}...` : cleanDetail;
-  liveActivity.title = cleanDetail || cleanLabel;
+  const title = cleanDetail ? `${cleanLabel}: ${cleanDetail}` : cleanLabel;
+  liveActivity.dataset.liveState = inferLiveState(cleanLabel, cleanDetail);
+  liveActivity.title = title;
+  liveActivity.setAttribute("aria-label", title);
+  liveLabel.textContent = "";
+  liveDetail.textContent = "";
   liveActivity.classList.remove("hidden");
 }
 
 function hideLive() {
   liveActivity.classList.add("hidden");
+  liveActivity.removeAttribute("data-live-state");
+  liveActivity.removeAttribute("aria-label");
   liveDetail.textContent = "";
+  liveLabel.textContent = "";
   liveActivity.title = "";
 }
 
@@ -816,6 +881,28 @@ const AGENT_NOTE_ACTIVITY_ID = "agent-note";
 let lastAgentPhaseSignature = "";
 let agentPhaseHistoryLines = [];
 
+const AGENT_PHASE_MESSAGES = {
+  understand: ["Łapię sens zadania", "Czytam intencję", "Porządkuję kontekst"],
+  plan: ["Układam następny krok", "Szkicuję mały plan", "Dobieram ruch"],
+  validate: ["Sprawdzam kontrakt akcji", "Prześwietlam następny ruch", "Pilnuję formatu"],
+  execute: ["Wykonuję krok", "Pracuję na plikach", "Odpalam działanie"],
+  observe: ["Czytam wynik", "Patrzę, co wróciło", "Zbieram efekt"],
+  recover: ["Naprawiam tor jazdy", "Koryguję odpowiedź modelu", "Szukam obejścia"],
+  finalize: ["Składam odpowiedź", "Domykam zadanie", "Porządkuję wynik"],
+};
+
+function friendlyAgentPhaseLabel(phase, event = {}) {
+  const list = AGENT_PHASE_MESSAGES[phase] || ["Pracuję nad zadaniem"];
+  return pickVariant(list, Number(event.step || agentPhaseHistoryLines.length || 0));
+}
+
+function friendlyAgentPhaseDetail(event = {}) {
+  const parts = [];
+  if (event.tool) parts.push(`narzędzie: ${event.tool}`);
+  if (event.reason) parts.push(shortenMiddle(event.reason, 90));
+  return parts.join(" · ");
+}
+
 function upsertInlineEvent(activityId, kind, title, body = "") {
   const safeBody = String(body ?? "").slice(0, 50000);
   let el = conversation.querySelector(`.inline-event[data-activity-id="${activityId}"]`);
@@ -871,31 +958,45 @@ function compactJsonPreview(value) {
   }
 }
 
+function toolTargetText(tool, args = {}) {
+  if (tool === "run_powershell") return shortenMiddle(args?.command || "", 120);
+  if (tool === "fetch_url" || tool === "download_file") return shortenMiddle(args?.url || args?.downloadUrl || args?.path || "", 120);
+  return compactPath(toolSegmentPath(tool, args) || args?.path || args?.url || "", 2);
+}
+
 function toolActionDetail(tool, args, note = "") {
   const parts = [];
   if (note) parts.push(note);
   if (tool === "run_powershell" && args?.command) parts.push(args.command);
-  else if (tool === "write_file" && args?.path) parts.push(`plik: ${args.path}`);
+  else if (tool === "write_file" && args?.path) {
+    const stats = textStats(args.content || "");
+    parts.push(`plik: ${args.path}`);
+    if (stats.lines || stats.bytes) parts.push(`${stats.lines} linii · ${formatBytes(stats.bytes)}`);
+  }
   else if (tool === "patch_edit" && args?.path) parts.push(`plik: ${args.path}`);
-  else if (tool === "patch_batch") parts.push("pakiet blokow SEARCH/REPLACE");
+  else if (tool === "patch_batch") parts.push("pakiet bloków SEARCH/REPLACE");
   else if (args && Object.keys(args).length) parts.push(compactJsonPreview(args));
   return parts.join("\n");
 }
 
 function toolActionLabel(tool, args) {
+  const target = toolTargetText(tool, args || {});
   if (tool == null) {
-    return "Blad: brak pola tool w odpowiedzi modelu";
+    return "Błąd: brak pola tool w odpowiedzi modelu";
   }
   switch (tool) {
-    case "read_file": return `Czyta: ${args?.path || ""}`;
-    case "write_file": return `Zapisuje: ${args?.path || ""}`;
-    case "patch_edit": return `Patch edit: ${args?.path || ""}`;
-    case "patch_batch": return "Patch batch: pakiet zmian";
-    case "ls": return `Listuje: ${args?.path || "."}`;
-    case "cd": return `cd ${args?.path || ""}`;
+    case "read_file": return `Czytam plik${target ? `: ${target}` : ""}`;
+    case "write_file": return `Piszę plik${target ? `: ${target}` : ""}`;
+    case "patch_edit": return `Kreślę zmiany${target ? `: ${target}` : ""}`;
+    case "patch_batch": return "Nakładam pakiet zmian";
+    case "ls": return `Przeglądam katalog${target ? `: ${target}` : ""}`;
+    case "cd": return `Przechodzę do ${target || "katalogu"}`;
     case "pwd": return "Sprawdza ścieżkę";
-    case "mkdir": return `mkdir ${args?.path || ""}`;
-    case "run_powershell": return `Komenda PowerShell`;
+    case "mkdir": return `Tworzę katalog${target ? `: ${target}` : ""}`;
+    case "run_powershell": return "Uruchamiam komendę";
+    case "fetch_url": return `Pobieram stronę${target ? `: ${target}` : ""}`;
+    case "extract_media": return `Szukam mediów${target ? `: ${target}` : ""}`;
+    case "download_file": return `Pobieram plik${target ? `: ${target}` : ""}`;
     default: return `Narzędzie: ${tool}`;
   }
 }
@@ -962,7 +1063,7 @@ function buildDiffDetailsElement(diff, options = {}) {
     details.appendChild(summary);
     return details;
   }
-  summary.innerHTML = `<span class="diff-stat-plus">+${added}</span> <span class="diff-stat-minus">−${removed}</span><span class="diff-toggle-hint">▸ rozwiń / zwiń</span>`;
+  summary.innerHTML = `<span class="diff-stat-plus">+${added}</span> <span class="diff-stat-minus">−${removed}</span><span class="diff-toggle-hint">podgląd zmian</span>`;
   const inner = document.createElement("div");
   inner.className = "diff diff--scroll";
   for (const hunk of hunks) {
@@ -1044,27 +1145,151 @@ function createFileChangeBlock(change = {}) {
   return wrap;
 }
 
-function buildToolPrimaryHtml(tool, args = {}) {
-  const toolBadge = tool === "run_powershell"
-    ? "PowerShell"
-    : tool === "read_file"
-      ? "Odczyt"
-      : tool === "write_file"
-        ? "Zapis"
-        : tool === "patch_edit" || tool === "patch_batch"
-          ? "Patch"
-          : "Tool";
-  const secondary = tool === "run_powershell"
-    ? String(args.command || "").trim()
-    : String(toolSegmentPath(tool, args) || args.path || args.url || "").trim();
-  const tertiary = tool === "run_powershell" && args?.cwd ? `cwd: ${args.cwd}` : "";
+function toolVisualKind(tool) {
+  if (tool === "write_file" || tool === "patch_edit" || tool === "patch_batch") return "write";
+  if (tool === "read_file" || tool === "ls" || tool === "pwd" || tool === "cd") return "read";
+  if (tool === "run_powershell") return "shell";
+  if (tool === "fetch_url" || tool === "extract_media" || tool === "download_file") return "search";
+  if (tool === "mkdir") return "folder";
+  return "work";
+}
+
+function buildToolChip(text, tone = "") {
+  const clean = String(text || "").trim();
+  if (!clean) return "";
+  return `<span class="tool-chip ${tone ? `tool-chip--${escapeAttr(tone)}` : ""}">${escapeHtml(clean)}</span>`;
+}
+
+function buildCodePreviewDetails(summary, content, maxChars = 3200) {
+  const text = String(content || "");
+  if (!text.trim()) return "";
+  const truncated = text.length > maxChars;
+  const preview = truncated ? `${text.slice(0, maxChars)}\n...` : text;
   return `
-    <div class="tool-run-placeholder">
-      <span class="tool-run-badge">${escapeHtml(toolBadge)}</span>
-      ${secondary ? `<span class="tool-run-path">${escapeHtml(secondary)}</span>` : ""}
-      ${tertiary ? `<span class="tool-run-note">${escapeHtml(tertiary)}</span>` : ""}
+    <details class="tool-preview-details">
+      <summary>${escapeHtml(summary)}${truncated ? " · skrócone" : ""}</summary>
+      <pre class="tool-preview-code">${escapeHtml(preview)}</pre>
+    </details>
+  `;
+}
+
+function buildToolPrimaryHtml(tool, args = {}) {
+  const visualKind = toolVisualKind(tool);
+  const targetRaw = tool === "run_powershell"
+    ? String(args.command || "").trim()
+    : String(toolSegmentPath(tool, args) || args.path || args.url || args.downloadUrl || "").trim();
+  const target = tool === "run_powershell" ? shortenMiddle(targetRaw, 110) : compactPath(targetRaw, 2);
+  const chips = [];
+  let line = "Pracuję";
+  let previewHtml = "";
+
+  if (tool === "write_file") {
+    const stats = textStats(args.content || "");
+    line = `Kreślę ${fileNameFromPath(args.path)}`;
+    chips.push(buildToolChip(`${stats.lines} linii`, "info"));
+    chips.push(buildToolChip(formatBytes(stats.bytes), "info"));
+    chips.push(buildToolChip((args.mode || "overwrite") === "append" ? "append" : "overwrite"));
+    previewHtml = buildCodePreviewDetails("podgląd pisanego pliku", args.content || "");
+  } else if (tool === "patch_edit") {
+    line = `Szukam i podmieniam w ${fileNameFromPath(args.path)}`;
+    chips.push(buildToolChip("SEARCH/REPLACE", "info"));
+    previewHtml = buildCodePreviewDetails("podgląd patcha", `SEARCH\n${args.search || ""}\n\nREPLACE\n${args.replace || ""}`);
+  } else if (tool === "patch_batch") {
+    const blocks = Array.isArray(args.blocks) ? args.blocks : [];
+    line = "Nakładam kilka zmian";
+    chips.push(buildToolChip(`${blocks.length || "?"} bloków`, "info"));
+    previewHtml = blocks.length
+      ? buildCodePreviewDetails("lista zmian", blocks.map((block, idx) => `${idx + 1}. ${block.path || args.defaultPath || "plik"}`).join("\n"), 1200)
+      : "";
+  } else if (tool === "read_file") {
+    line = `Otwieram ${fileNameFromPath(args.path)}`;
+    if (args.maxBytes) chips.push(buildToolChip(`limit ${formatBytes(args.maxBytes)}`));
+  } else if (tool === "run_powershell") {
+    line = "Uruchamiam PowerShell";
+    if (args.timeout) chips.push(buildToolChip(`${args.timeout} ms`));
+    if (args.cwd) chips.push(buildToolChip(`cwd ${compactPath(args.cwd, 2)}`));
+  } else if (tool === "ls") {
+    line = `Skanuję ${target || "."}`;
+  } else if (tool === "mkdir") {
+    line = `Tworzę ${fileNameFromPath(args.path)}`;
+  } else if (tool === "fetch_url") {
+    line = "Pobieram tekst strony";
+  } else if (tool === "download_file") {
+    line = `Pobieram ${fileNameFromPath(args.path || args.url)}`;
+  } else if (tool === "extract_media") {
+    line = "Wyciągam media ze strony";
+  } else {
+    line = `Wykonuję ${tool || "narzędzie"}`;
+    if (args && Object.keys(args).length) previewHtml = buildCodePreviewDetails("argumenty", compactJsonPreview(args), 1800);
+  }
+
+  return `
+    <div class="tool-run-placeholder tool-compact" data-tool-state="${escapeAttr(visualKind)}">
+      <div class="tool-compact-row">
+        <span class="tool-inline-visual" aria-hidden="true"></span>
+        <span class="tool-inline-copy">
+          <span class="tool-inline-main">${escapeHtml(line)}</span>
+          ${target && tool !== "ls" ? `<span class="tool-inline-target" title="${escapeAttr(targetRaw)}">${escapeHtml(target)}</span>` : ""}
+        </span>
+        ${chips.length ? `<span class="tool-inline-metrics">${chips.join("")}</span>` : ""}
+      </div>
+      ${previewHtml}
     </div>
   `;
+}
+
+function buildResultCompactHtml(label, chips = [], details = "") {
+  return `
+    <div class="tool-result-compact">
+      <span class="tool-result-label">${escapeHtml(label)}</span>
+      ${chips.length ? `<span class="tool-inline-metrics">${chips.join("")}</span>` : ""}
+    </div>
+    ${details || ""}
+  `;
+}
+
+function buildReadFileResultHtml(result = {}) {
+  const content = String(result.content || "");
+  const stats = textStats(content);
+  const chips = [
+    buildToolChip(`${stats.lines} linii`, "info"),
+    buildToolChip(formatBytes(stats.bytes), "info"),
+    result.truncated ? buildToolChip("skrócone", "warn") : "",
+  ].filter(Boolean);
+  return buildResultCompactHtml(
+    `Odczyt: ${compactPath(result.path || "", 2) || "plik"}`,
+    chips,
+    buildCodePreviewDetails("pokaż treść", content),
+  );
+}
+
+function buildShellResultHtml(result = {}) {
+  const exitCode = Number(result.exitCode);
+  const stdout = String(result.stdout || "").trim();
+  const stderr = String(result.stderr || "").trim();
+  const snippet = [
+    result.cwd ? `[cwd] ${result.cwd}` : "",
+    stdout ? `[stdout]\n${stdout}` : "",
+    stderr ? `[stderr]\n${stderr}` : "",
+  ].filter(Boolean).join("\n\n");
+  const chips = [
+    Number.isFinite(exitCode) ? buildToolChip(`exit ${exitCode}`, exitCode === 0 ? "ok" : "warn") : "",
+    stdout ? buildToolChip("stdout", "info") : "",
+    stderr ? buildToolChip("stderr", "warn") : "",
+  ].filter(Boolean);
+  return buildResultCompactHtml(
+    "Wynik komendy",
+    chips,
+    buildCodePreviewDetails("pokaż wyjście", snippet || "Brak danych wyjściowych.", 5000),
+  );
+}
+
+function buildGenericResultHtml(result = {}) {
+  return buildResultCompactHtml(
+    "Wynik narzędzia",
+    [],
+    buildCodePreviewDetails("pokaż wynik", compactJsonPreview(result), 3600),
+  );
 }
 
 function createToolCardSegment(event) {
@@ -1231,8 +1456,7 @@ function finalizeToolCardSuccess(segment, event) {
   if (tool === "read_file") {
     if (titleEl) titleEl.textContent = `Odczytano: ${result.path || segment.path || ""}`;
     if (primary) {
-      const trunc = result.truncated ? `<div class="file-truncated-hint">Plik skrócony do limitu bajtów (maxBytes).</div>` : "";
-      primary.innerHTML = `${trunc}<pre class="file-read-preview">${escapeHtml(String(result.content || ""))}</pre>`;
+      primary.innerHTML = buildReadFileResultHtml(result);
     }
     if (detailEl) detailEl.textContent = compactJsonPreview(result);
   } else if (tool === "run_powershell") {
@@ -1245,12 +1469,7 @@ function finalizeToolCardSuccess(segment, event) {
     if (primary) {
       const stdout = String(result.stdout || "").trim();
       const stderr = String(result.stderr || "").trim();
-      const snippet = [
-        result.cwd ? `[cwd] ${result.cwd}` : "",
-        stdout ? `[stdout]\n${stdout}` : "",
-        stderr ? `[stderr]\n${stderr}` : "",
-      ].filter(Boolean).join("\n\n");
-      primary.innerHTML = `<pre class="tool-result-snippet">${escapeHtml((snippet || "Brak danych wyjściowych.").slice(0, 12000))}</pre>`;
+      primary.innerHTML = buildShellResultHtml({ ...result, stdout, stderr });
     }
     if (detailEl) detailEl.textContent = compactJsonPreview(result);
   } else if (tool === "patch_edit" || tool === "write_file" || tool === "patch_batch" || tool === "download_file") {
@@ -1269,14 +1488,13 @@ function finalizeToolCardSuccess(segment, event) {
       }
     }
     if (primary && !primary.querySelector(".tool-file-changes") && !primary.querySelector(".file-read-preview")) {
-      primary.innerHTML = `<div class="tool-run-note">Zakończono (brak wizualnego diff w tej karcie).</div>`;
+      primary.innerHTML = buildResultCompactHtml("Zakończono", [buildToolChip(compactToolResultSummary(tool, result), "ok")]);
     }
     if (detailEl) detailEl.textContent = compactJsonPreview(result);
   } else {
     if (titleEl) titleEl.textContent = `Gotowe: ${tool}`;
     if (primary) {
-      const snippet = compactJsonPreview(result).slice(0, 12000);
-      primary.innerHTML = `<pre class="tool-result-snippet">${escapeHtml(snippet)}</pre>`;
+      primary.innerHTML = buildGenericResultHtml(result);
     }
     if (detailEl) detailEl.textContent = compactJsonPreview(result);
   }
@@ -1298,7 +1516,7 @@ function finalizeToolCardError(segment, event) {
   if (titleEl) titleEl.textContent = `Błąd: ${event.tool}`;
   const primary = el.querySelector(".inline-event-primary");
   if (primary) {
-    primary.innerHTML = `<pre class="tool-error-body">${escapeHtml(msg)}</pre>`;
+    primary.innerHTML = buildResultCompactHtml("Błąd narzędzia", [buildToolChip(event.tool || "tool", "warn")], buildCodePreviewDetails("pokaż szczegóły", msg, 4000));
   }
   const detailWrap = el.querySelector(".inline-event-detail-wrap");
   if (detailWrap) {
@@ -1907,35 +2125,85 @@ function formatDownloadSize(bytes = 0) {
   return `${(value / 1024 / 1024).toFixed(0)} MB`;
 }
 
+function downloadEntryLabel(entry = {}) {
+  return entry.displayName || entry.fileName || entry.modelId || "model";
+}
+
+function downloadStateLabel(state = "") {
+  if (state === "queued") return "w kolejce";
+  if (state === "downloading") return "pobieranie";
+  if (state === "failed") return "błąd";
+  if (state === "cancelled") return "anulowano";
+  return state || "pobieranie";
+}
+
+function renderModelsDownloadInline(items = []) {
+  if (!modelsDownloadInline) return;
+  if (!items.length) {
+    modelsDownloadInline.classList.add("hidden");
+    modelsDownloadInline.innerHTML = "";
+    return;
+  }
+  const first = items[0];
+  const progress = Math.max(0, Math.min(100, Number(first.progress || 0)));
+  const extraCount = items.length > 1 ? ` +${items.length - 1}` : "";
+  modelsDownloadInline.classList.remove("hidden");
+  modelsDownloadInline.innerHTML = `
+    <div class="models-download-inline-title">
+      <span>Pobieranie modelu${extraCount}</span>
+      <strong>${progress}%</strong>
+    </div>
+    <div class="download-progress-container compact">
+      <div class="download-progress-fill" style="width:${progress}%"></div>
+    </div>
+    <div class="models-download-inline-name">${escapeHtml(downloadEntryLabel(first))}</div>
+  `;
+}
+
 function renderDownloadCenter() {
   if (!downloadCenter || !downloadCenterList || !downloadCenterCount) return;
   const items = [...modelDownloadState.values()];
   downloadCenterCount.textContent = String(items.length);
-  if (downloadCenterRestoreCount) downloadCenterRestoreCount.textContent = String(items.length);
   if (!items.length) {
     downloadCenter.classList.add("hidden");
-    if (downloadCenterRestore) downloadCenterRestore.classList.add("hidden");
-    downloadCenterCollapsed = false;
-  } else if (downloadCenterCollapsed) {
-    downloadCenter.classList.add("hidden");
-    if (downloadCenterRestore) downloadCenterRestore.classList.remove("hidden");
+    downloadCenter.classList.add("collapsed");
+    if (downloadCenterSummary) downloadCenterSummary.textContent = "Brak aktywnych pobrań.";
+    renderModelsDownloadInline([]);
+    downloadCenterCollapsed = true;
+    return;
   } else {
     downloadCenter.classList.remove("hidden");
-    if (downloadCenterRestore) downloadCenterRestore.classList.add("hidden");
   }
-  if (!items.length) {
-    downloadCenterList.innerHTML = `<div class="models-empty">Brak aktywnych pobrań.</div>`;
-    return;
+
+  downloadCenter.classList.toggle("collapsed", downloadCenterCollapsed);
+  if (downloadCenterToggle) {
+    downloadCenterToggle.textContent = downloadCenterCollapsed ? "+" : "−";
+    downloadCenterToggle.title = downloadCenterCollapsed ? "Rozwiń pobieranie" : "Zwiń pobieranie";
   }
+
+  const first = items[0];
+  const firstProgress = Math.max(0, Math.min(100, Number(first.progress || 0)));
+  const firstLabel = downloadEntryLabel(first);
+  if (downloadCenterSummary) {
+    downloadCenterSummary.innerHTML = `
+      <span class="download-center-summary-text">${escapeHtml(firstLabel)}</span>
+      <span class="download-center-summary-progress">${firstProgress}%</span>
+      <div class="download-progress-container compact">
+        <div class="download-progress-fill" style="width:${firstProgress}%"></div>
+      </div>
+    `;
+  }
+
   downloadCenterList.innerHTML = items.map((entry) => {
     const progress = Number(entry.progress || 0);
     const downloaded = formatDownloadSize(entry.downloaded);
     const total = Number(entry.total || 0) > 0 ? formatDownloadSize(entry.total) : "?? MB";
+    const label = downloadEntryLabel(entry);
     return `
       <div class="download-center-item">
         <div class="download-center-item-head">
-          <span class="download-center-model">${escapeHtml(entry.modelId)}</span>
-          <span class="download-center-state">${escapeHtml(entry.state)}</span>
+          <span class="download-center-model">${escapeHtml(label)}</span>
+          <span class="download-center-state">${escapeHtml(downloadStateLabel(entry.state))}</span>
         </div>
         <div class="download-progress-container">
           <div class="download-progress-fill" style="width:${Math.max(0, Math.min(100, progress))}%"></div>
@@ -1945,18 +2213,12 @@ function renderDownloadCenter() {
       </div>
     `;
   }).join("");
+  renderModelsDownloadInline(items);
 }
 
 if (downloadCenterToggle) {
   downloadCenterToggle.addEventListener("click", () => {
-    downloadCenterCollapsed = true;
-    renderDownloadCenter();
-  });
-}
-
-if (downloadCenterRestore) {
-  downloadCenterRestore.addEventListener("click", () => {
-    downloadCenterCollapsed = false;
+    downloadCenterCollapsed = !downloadCenterCollapsed;
     renderDownloadCenter();
   });
 }
@@ -2030,10 +2292,10 @@ if (addHfModel) {
     if (!url) return;
     addHfModel.disabled = true;
     try {
-      await window.endocode.addCustomModel(url);
+      const added = await window.endocode.addCustomModel(url);
       hfModelUrl.value = "";
-      await loadModels();
-      addInlineEvent("note", "Katalog", "Dodano własny model do listy.");
+      if (added?.model?.id) void window.downloadModel(added.model.id);
+      addInlineEvent("note", "Pobieranie", `Rozpoczęto pobieranie ${added?.model?.displayName || "modelu"}. Wpis w katalogu pojawi się po ukończeniu.`);
     } catch (e) {
       alert(e.message);
     } finally {
@@ -2489,8 +2751,12 @@ window.endocode.onEvent(async (event) => {
     }
   }
   if (event.type === "model-download-progress") {
+    const previous = modelDownloadState.get(event.modelId) || {};
     modelDownloadState.set(event.modelId, {
+      ...previous,
       modelId: event.modelId,
+      displayName: event.displayName || previous.displayName || "",
+      fileName: event.fileName || previous.fileName || "",
       state: "downloading",
       progress: event.progress,
       downloaded: event.downloaded,
@@ -2502,8 +2768,12 @@ window.endocode.onEvent(async (event) => {
   }
   if (event.type === "model-download-state") {
     if (event.state === "queued" || event.state === "downloading") {
+      const previous = modelDownloadState.get(event.modelId) || {};
       modelDownloadState.set(event.modelId, {
+        ...previous,
         modelId: event.modelId,
+        displayName: event.displayName || previous.displayName || "",
+        fileName: event.fileName || previous.fileName || "",
         state: event.state,
         progress: event.progress || 0,
         downloaded: event.downloaded || 0,
@@ -2547,7 +2817,7 @@ window.endocode.onEvent(async (event) => {
     removeInlineEventByActivityId(AGENT_NOTE_ACTIVITY_ID);
     const rawInput = String(event.text || "").trim();
     const shortInput = rawInput.length > 240 ? `${rawInput.slice(0, 240)}...` : rawInput;
-    upsertInlineEvent(AGENT_PHASE_ACTIVITY_ID, "activity", "Planowanie akcji", "Start planowania...");
+    upsertInlineEvent(AGENT_PHASE_ACTIVITY_ID, "activity", "Startuję zadanie", shortInput || "Przygotowuję kontekst i pierwszy krok.");
     showLive("Planowanie...", shortInput || "Przygotowanie kontekstu i kolejnych kroków.");
     return;
   }
@@ -2575,28 +2845,15 @@ window.endocode.onEvent(async (event) => {
   }
   if (event.type === "agent-phase") {
     const phase = String(event.phase || "");
-    const phaseLabel =
-      phase === "understand" ? "Analiza intencji"
-        : phase === "plan" ? "Planowanie"
-          : phase === "validate" ? "Walidacja"
-            : phase === "execute" ? "Wykonanie"
-              : phase === "observe" ? "Obserwacja"
-                : phase === "recover" ? "Recovery"
-                  : phase === "finalize" ? "Finalizacja"
-                    : "Agent";
-    const detail = [
-      event.intentClass ? `intent=${event.intentClass}` : "",
-      event.tool ? `tool=${event.tool}` : "",
-      event.reason ? `reason=${event.reason}` : "",
-      event.step ? `step=${event.step}` : "",
-    ].filter(Boolean).join(" · ");
-    const signature = `${phase}|${detail}`;
+    const phaseLabel = friendlyAgentPhaseLabel(phase, event);
+    const detail = friendlyAgentPhaseDetail(event);
+    const signature = `${phase}|${event.step || ""}|${detail}`;
     if (signature !== lastAgentPhaseSignature) {
       lastAgentPhaseSignature = signature;
-      const line = `${event.step ? `krok ${event.step}` : "krok"}: ${phaseLabel}${detail ? ` (${detail})` : ""}`;
+      const line = `${event.step ? `krok ${event.step}` : "teraz"} · ${phaseLabel}${detail ? ` · ${detail}` : ""}`;
       agentPhaseHistoryLines.push(line);
-      if (agentPhaseHistoryLines.length > 40) agentPhaseHistoryLines = agentPhaseHistoryLines.slice(-40);
-      upsertInlineEvent(AGENT_PHASE_ACTIVITY_ID, "activity", "Planowanie akcji", agentPhaseHistoryLines.join("\n"));
+      if (agentPhaseHistoryLines.length > 10) agentPhaseHistoryLines = agentPhaseHistoryLines.slice(-10);
+      upsertInlineEvent(AGENT_PHASE_ACTIVITY_ID, "activity", event.step ? `Krok ${event.step} · ${phaseLabel}` : phaseLabel, agentPhaseHistoryLines.join("\n"));
       showLive(event.step ? `Krok ${event.step}: ${phaseLabel}` : phaseLabel, detail || "Przetwarzanie");
     }
     return;
@@ -2655,7 +2912,7 @@ window.endocode.onEvent(async (event) => {
     const livePhrase = event.plainChat ? "Pisze…" : "Planuje akcję...";
 
     if (event.plainChat) {
-      upsertInlineEvent(MODEL_WRITING_ACTIVITY_ID, "note", "Pisze odpowiedź...", preview.slice(-800));
+      removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
       updateStreamingAssistantMessage(event.text || "", full);
       showLive(livePhrase, preview.slice(-500));
       return;
@@ -3258,7 +3515,7 @@ if (pickManualModelBtn) {
 
 window.addAndDownload = async (modelKey) => {
   setDiscoveryLoading("Przygotowuję model do pobrania...");
-  setDiscoveryStatus("Dodawanie modelu do biblioteki...");
+  setDiscoveryStatus("Przygotowuję pobieranie...");
   try {
     const model = lastDiscoveryResults.get(modelKey);
     if (!model || !model.downloadUrl) throw new Error("Ten wynik nie ma bezpośredniego linku do pliku .gguf.");
@@ -3271,7 +3528,7 @@ window.addAndDownload = async (modelKey) => {
     if (tabLibrary) tabLibrary.click();
     await loadModels();
     setDiscoveryStatus("Uruchamiam pobieranie...");
-    if (added?.model?.id) window.endocode.downloadModel(added.model.id);
+    if (added?.model?.id) void window.downloadModel(added.model.id);
   } catch (e) {
     alert(e.message);
     await runDiscoverySearch({ resetResults: true });
@@ -3280,7 +3537,7 @@ window.addAndDownload = async (modelKey) => {
 
 window.addAndDownloadFromFile = async (modelKey, fileName) => {
   setDiscoveryLoading("Przygotowuję wybrany plik do pobrania...");
-  setDiscoveryStatus("Dodawanie modelu do biblioteki...");
+  setDiscoveryStatus("Przygotowuję pobieranie...");
   try {
     const model = lastDiscoveryResults.get(modelKey);
     const files = Array.isArray(model?.files) ? model.files : [];
@@ -3296,7 +3553,7 @@ window.addAndDownloadFromFile = async (modelKey, fileName) => {
     });
     if (tabLibrary) tabLibrary.click();
     await loadModels();
-    if (added?.model?.id) window.endocode.downloadModel(added.model.id);
+    if (added?.model?.id) void window.downloadModel(added.model.id);
   } catch (e) {
     alert(e.message || String(e));
     await runDiscoverySearch({ resetResults: true });
