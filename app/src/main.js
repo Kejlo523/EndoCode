@@ -3175,6 +3175,11 @@ async function getServerModelId(port = DEFAULT_PORT) {
 }
 
 async function launchServerProcess(config, modelPath, port, contextTokens, gpuLayers) {
+  const installTarget = detectInstallTarget();
+  const preferredGpuBackend = (installTarget.runtimePreference || []).find((backend) => backend !== "cpu") || "cpu";
+  if (Number(gpuLayers || 0) > 0 && preferredGpuBackend !== "cpu") {
+    await installLlamaRuntime();
+  }
   await fsp.mkdir(path.join(ENDOCODE_HOME, "logs"), { recursive: true });
   const outLogPath = path.join(ENDOCODE_HOME, "logs", "local-codex-server.out.log");
   const errLogPath = path.join(ENDOCODE_HOME, "logs", "local-codex-server.err.log");
