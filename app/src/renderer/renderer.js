@@ -497,7 +497,7 @@ function showLive(label, detail = "") {
     "activity",
     cleanLabel,
     cleanDetail || "Przetwarzanie",
-    { defaultExpanded: true, keepExpanded: true, className: "live-chat-event", moveToBottom: true },
+    { defaultExpanded: false, keepExpanded: false, className: "live-chat-event", moveToBottom: true },
   );
   liveActivity.title = title;
   liveActivity.dataset.liveState = inferLiveState(cleanLabel, cleanDetail);
@@ -2830,6 +2830,8 @@ window.endocode.onEvent(async (event) => {
       showLive("Instalacja runtime", event.detail || "");
     } else if (event.status === "runtime-install-complete") {
       showLive("Instalacja runtime", event.detail || "");
+    } else if (event.status === "action-cooldown") {
+      showLive("Recovery", event.detail || "Pauza i korekta planu...");
     } else if (event.status === "server-killing") showLive("Kill switch...", event.detail || "");
     else if (event.status === "server-killed") showLive("Kill switch", event.detail || "");
     else if (event.status === "server-starting" || event.status === "server-stopping") showLive("Runtime modelu", event.detail || "");
@@ -2947,7 +2949,7 @@ window.endocode.onEvent(async (event) => {
       "activity",
       "Startuję zadanie",
       shortInput || "Przygotowuję kontekst i pierwszy krok.",
-      { defaultExpanded: true, keepExpanded: true, moveToBottom: true },
+      { defaultExpanded: false, keepExpanded: false, moveToBottom: true },
     );
     showLive("Planowanie...", shortInput || "Przygotowanie kontekstu i kolejnych kroków.");
     return;
@@ -2958,7 +2960,9 @@ window.endocode.onEvent(async (event) => {
     currentThinkingSegment = null;
     lastAgentPhaseSignature = "";
     removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
+    removeInlineEventByActivityId(AGENT_PHASE_ACTIVITY_ID);
     removeInlineEventByActivityId(AGENT_NOTE_ACTIVITY_ID);
+    removeInlineEventByActivityId(LIVE_CHAT_ACTIVITY_ID);
     if (!finalReceivedInRun && hasStreamingAssistantContent()) {
       finalizeStreamingAssistantMessage("", { overwriteText: false });
     }
@@ -2989,7 +2993,7 @@ window.endocode.onEvent(async (event) => {
         "activity",
         event.step ? `Krok ${event.step} · ${phaseLabel}` : phaseLabel,
         agentPhaseHistoryLines.join("\n"),
-        { defaultExpanded: true, keepExpanded: true, moveToBottom: true },
+        { defaultExpanded: false, keepExpanded: false, moveToBottom: true },
       );
       showLive(event.step ? `Krok ${event.step}: ${phaseLabel}` : phaseLabel, detail || "Przetwarzanie");
     }
@@ -3047,6 +3051,11 @@ window.endocode.onEvent(async (event) => {
     const preview = full.trim().slice(0, 50000);
     
     const livePhrase = event.plainChat ? "Pisze…" : "Planuje akcję...";
+    const planningLine = preview
+      .split("\n")
+      .map((line) => String(line || "").trim())
+      .filter(Boolean)
+      .pop() || "";
 
     if (event.plainChat) {
       removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
@@ -3064,7 +3073,8 @@ window.endocode.onEvent(async (event) => {
         return;
       }
     }
-    showLive(livePhrase, event.step ? `Krok ${event.step}` : "");
+    const planningDetail = planningLine || (event.step ? `Krok ${event.step}` : "Pracuje nad akcją");
+    showLive(livePhrase, planningDetail);
     return;
   }
 
@@ -3107,6 +3117,7 @@ window.endocode.onEvent(async (event) => {
   if (event.type === "final") {
     finalReceivedInRun = true;
     removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
+    removeInlineEventByActivityId(AGENT_PHASE_ACTIVITY_ID);
     if (hasStreamingAssistantContent()) {
       finalizeStreamingAssistantMessage(event.text || "");
     } else if (String(event.text || "").trim()) {

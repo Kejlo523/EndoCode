@@ -14,6 +14,23 @@ function createTurnOrchestrator(options = {}) {
     throw new Error("createTurnOrchestrator requires planner, toolExecutor and memory");
   }
 
+  function waitForRecoveryWindow(ms, signal) {
+    const delay = Math.max(0, Number(ms) || 0);
+    if (!delay) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (signal) signal.removeEventListener("abort", onAbort);
+        resolve();
+      }, delay);
+      const onAbort = () => {
+        clearTimeout(timer);
+        if (signal) signal.removeEventListener("abort", onAbort);
+        reject(new Error("Przerwano przez uzytkownika."));
+      };
+      if (signal) signal.addEventListener("abort", onAbort, { once: true });
+    });
+  }
+
   async function runTurn(params = {}) {
     const {
       signal,
@@ -45,6 +62,13 @@ function createTurnOrchestrator(options = {}) {
       let toolPayload;
       if (planned.repeated) {
         emit("agent-phase", { phase: "recover", step, reason: "repeated_action" });
+        const cooldownMs = Math.min(2800, 450 * Math.max(1, Number(planned.repeatCount) || 1));
+        emit("status", {
+          status: "action-cooldown",
+          detail: `Wykryto petle akcji. Pauza ${Math.round(cooldownMs / 100) / 10}s i korekta planu...`,
+          step,
+        });
+        await waitForRecoveryWindow(cooldownMs, signal);
         toolPayload = buildRepeatedActionBlock(action, planned.repeatCount);
       } else {
         emit("agent-phase", { phase: "execute", step, tool: action.tool || "" });
@@ -53,6 +77,12 @@ function createTurnOrchestrator(options = {}) {
       }
       if (!toolPayload?.ok && typeof onRecoverableError === "function") {
         emit("agent-phase", { phase: "recover", step, reason: "tool_error" });
+        emit("status", {
+          status: "action-cooldown",
+          detail: "Krotka pauza recovery przed kolejna proba...",
+          step,
+        });
+        await waitForRecoveryWindow(700, signal);
         await onRecoverableError({ step, action, toolPayload });
       } else {
         emit("agent-phase", { phase: "observe", step, tool: action.tool || "" });
