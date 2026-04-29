@@ -1,30 +1,54 @@
-# Local Codex App
+# EndoCode
 
-Desktopowy interfejs do lokalnych modeli kodujacych GGUF.
+EndoCode to desktopowa aplikacja Electron do pracy z lokalnym agentem kodującym (GGUF + llama.cpp), z naciskiem na:
+- szybki workflow patch-first,
+- transparentny podglad krokow agenta,
+- lokalne narzedzia i lokalne pliki.
 
-Modele sa definiowane w:
+## Podglad aplikacji
+
+![EndoCode app screenshot](./src/assets/app-screenshot.png)
+
+## Co potrafi
+
+- Chat i tryb agentowy (planowanie -> narzedzia -> final)
+- Praca na plikach: odczyt, zapis, patchowanie, diff i historia undo/redo
+- Integracja z lokalnym runtime (`llama-server`)
+- Zarzadzanie modelami GGUF (biblioteka, pobieranie, anulowanie pobierania)
+- Konfiguracja parametrow modelu z poziomu UI
+
+## Struktura i wymagania
+
+EndoCode zaklada projektowy layout katalogow w repo:
 
 ```text
-config\models.json
+EndoCode/
+  app/
+  config/
+  models/
+  runtime/
 ```
 
-Wybor modelu i intensywnosci pracy jest dostepny w gornej belce aplikacji. Zmiana modelu resetuje kontekst rozmowy i restartuje lokalny `llama-server`.
+Najwazniejsze:
+- konfiguracja modeli: `config/models.json`
+- runtime lokalny: `runtime/llama-server.exe`
 
-Modele moga miec dodatkowe parametry startowe, np. `reasoning: "off"` dla modeli, ktore domyslnie oddaja pusta tresc w `content` i przenosza generacje do pola reasoning.
-
-## Dev
+## Uruchomienie (dev)
 
 ```powershell
-\app
+cd app
 npm install
 npm start
 ```
 
-## EXE
+## Build EXE
 
 ```powershell
+cd app
 npm run dist
 ```
 
+## Uwagi
 
-Aplikacja szuka katalogu `models`, `runtime`, `workspace` i `config/model.json` w folderach nadrzednych.
+- Zmiana aktywnego modelu restartuje lokalny serwer modelu.
+- Aplikacja dziala lokalnie, wiec wydajnosc zalezy od CPU/GPU oraz ustawien runtime.
