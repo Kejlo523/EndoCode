@@ -958,12 +958,24 @@ function finalizeStreamingAssistantMessage(finalText = "", options = {}) {
 
 // ── Inline Events (replaces separate activity panel) ──
 const INLINE_EVENT_ICONS = {
-  tool: `<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M4 2l8 6-8 6V2z" fill="currentColor"/></svg>`,
+  tool: `<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="3" fill="currentColor"/><circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.1" opacity="0.28"/></svg>`,
   note: `<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.3"/><path d="M8 5v4M8 11v.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>`,
   error: `<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M8 1l7 13H1L8 1z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" fill="none"/></svg>`,
   change: `<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M3 8l3 3 7-7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
   activity: `<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="2" fill="currentColor"/><path d="M2 8h2M12 8h2M8 2v2M8 12v2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>`,
 };
+
+function shouldRenderToolInChat(tool) {
+  return !CHAT_SILENT_TOOLS.has(String(tool || ""));
+}
+
+function inferToolFromTitle(title = "") {
+  const text = String(title || "").toLowerCase();
+  for (const tool of CHAT_SILENT_TOOLS) {
+    if (new RegExp(`\\b${tool}\\b`, "i").test(text)) return tool;
+  }
+  return "";
+}
 
 function setInlineEventIconKind(el, nextKind) {
   const slot = el?.querySelector(".inline-event-icon");
@@ -1133,6 +1145,7 @@ function removeInlineEventByActivityId(activityId) {
 }
 
 const MODEL_WRITING_ACTIVITY_ID = "model-writing";
+const CHAT_SILENT_TOOLS = new Set(["mkdir", "cd", "pwd", "ls"]);
 let lastAgentPhaseSignature = "";
 let agentPhaseHistoryLines = [];
 
@@ -1353,11 +1366,121 @@ function collectDiffHunks(diff) {
   return { hunks, added, removed };
 }
 
+const DIFF_LANGUAGE_BY_EXT = {
+  js: "javascript",
+  mjs: "javascript",
+  cjs: "javascript",
+  jsx: "javascript",
+  ts: "typescript",
+  tsx: "typescript",
+  html: "xml",
+  htm: "xml",
+  css: "css",
+  scss: "scss",
+  sass: "scss",
+  json: "json",
+  md: "markdown",
+  markdown: "markdown",
+  py: "python",
+  ps1: "powershell",
+  sh: "bash",
+  bash: "bash",
+  zsh: "bash",
+  bat: "dos",
+  cmd: "dos",
+  java: "java",
+  cs: "csharp",
+  go: "go",
+  rs: "rust",
+  php: "php",
+  rb: "ruby",
+  c: "c",
+  h: "c",
+  cpp: "cpp",
+  cc: "cpp",
+  cxx: "cpp",
+  hpp: "cpp",
+  sql: "sql",
+  xml: "xml",
+  yml: "yaml",
+  yaml: "yaml",
+  toml: "toml",
+  ini: "ini",
+  dockerfile: "dockerfile",
+};
+
+function languageFromPath(filePath = "") {
+  const normalized = String(filePath || "").replace(/\\/g, "/").toLowerCase();
+  const name = normalized.split("/").pop() || "";
+  if (name === "dockerfile") return "dockerfile";
+  const ext = name.includes(".") ? name.split(".").pop() : "";
+  return DIFF_LANGUAGE_BY_EXT[ext] || ext || "plaintext";
+}
+
+function highlightDiffLine(text = "", language = "plaintext") {
+  const source = String(text ?? "");
+  const highlighter = window.hljs || globalThis.hljs;
+  try {
+    if (highlighter?.getLanguage?.(language)) {
+      return highlighter.highlight(source, { language, ignoreIllegals: true }).value;
+    }
+    if (highlighter?.highlightAuto && source.trim()) {
+      return highlighter.highlightAuto(source).value;
+    }
+  } catch {
+    // fall through to escaped plain text
+  }
+  return escapeHtml(source);
+}
+
+function toggleDiffDetails(details, expand = true) {
+  const summary = details?.querySelector(":scope > summary.diff-summary");
+  const collapse = details?.querySelector(":scope > .diff-collapse");
+  if (!details || !summary || !collapse) return;
+
+  const nextExpanded = Boolean(expand);
+  summary.setAttribute("aria-expanded", nextExpanded ? "true" : "false");
+  details.dataset.expanded = nextExpanded ? "true" : "false";
+
+  if (nextExpanded) {
+    details.open = true;
+    collapse.style.maxHeight = "0px";
+    collapse.style.opacity = "0";
+    requestAnimationFrame(() => {
+      const targetHeight = collapse.scrollHeight;
+      collapse.style.maxHeight = `${targetHeight}px`;
+      collapse.style.opacity = "1";
+    });
+    const onEnd = (event) => {
+      if (event.propertyName !== "max-height") return;
+      collapse.removeEventListener("transitionend", onEnd);
+      if (details.dataset.expanded === "true") collapse.style.maxHeight = "none";
+    };
+    collapse.addEventListener("transitionend", onEnd);
+    return;
+  }
+
+  const startHeight = collapse.scrollHeight;
+  collapse.style.maxHeight = `${startHeight}px`;
+  collapse.style.opacity = "1";
+  requestAnimationFrame(() => {
+    collapse.style.maxHeight = "0px";
+    collapse.style.opacity = "0";
+  });
+  const onEnd = (event) => {
+    if (event.propertyName !== "max-height") return;
+    collapse.removeEventListener("transitionend", onEnd);
+    if (details.dataset.expanded !== "true") details.open = false;
+  };
+  collapse.addEventListener("transitionend", onEnd);
+}
+
 /** DOM diff block: stats in summary, hunks scrollable, collapsed by default. */
 function buildDiffDetailsElement(diff, options = {}) {
   const details = document.createElement("details");
   details.className = "diff-details";
   details.open = options.open === true;
+  details.dataset.expanded = details.open ? "true" : "false";
   const summary = document.createElement("summary");
   summary.className = String(options.summaryClass || "diff-summary");
   const { hunks, added, removed } = collectDiffHunks(diff);
@@ -1367,6 +1490,7 @@ function buildDiffDetailsElement(diff, options = {}) {
     details.appendChild(summary);
     return details;
   }
+  const language = options.language || languageFromPath(options.path || "");
   if (options.summaryHtml) {
     summary.innerHTML = String(options.summaryHtml)
       .replaceAll("{{added}}", String(added))
@@ -1374,8 +1498,10 @@ function buildDiffDetailsElement(diff, options = {}) {
   } else {
     summary.innerHTML = `<span class="diff-stat-plus">+${added}</span> <span class="diff-stat-minus">−${removed}</span><span class="diff-toggle-hint">podgląd zmian</span>`;
   }
+  summary.setAttribute("aria-expanded", details.open ? "true" : "false");
   const inner = document.createElement("div");
   inner.className = "diff diff--scroll";
+  if (language) inner.dataset.language = language;
   for (const hunk of hunks) {
     const hWrap = document.createElement("div");
     hWrap.className = "diff-hunk";
@@ -1391,13 +1517,26 @@ function buildDiffDetailsElement(diff, options = {}) {
       ln.textContent = String(r.lineNo);
       const prefix = r.type === "add" ? "+ " : r.type === "remove" ? "− " : "  ";
       row.appendChild(ln);
-      row.appendChild(document.createTextNode(prefix + String(r.text ?? "")));
+      const prefixEl = document.createElement("span");
+      prefixEl.className = "diff-prefix";
+      prefixEl.textContent = prefix;
+      const code = document.createElement("code");
+      code.className = `diff-code hljs language-${language || "plaintext"}`;
+      code.innerHTML = highlightDiffLine(r.text ?? "", language);
+      row.append(prefixEl, code);
       hWrap.appendChild(row);
     }
     inner.appendChild(hWrap);
   }
+  const collapse = document.createElement("div");
+  collapse.className = "diff-collapse";
+  if (details.open) {
+    collapse.style.maxHeight = "none";
+    collapse.style.opacity = "1";
+  }
+  collapse.appendChild(inner);
   details.appendChild(summary);
-  details.appendChild(inner);
+  details.appendChild(collapse);
   return details;
 }
 
@@ -1457,6 +1596,8 @@ function createFileChangeBlock(change = {}) {
     open: false,
     summaryHtml,
     summaryClass: "diff-summary file-change-summary",
+    path: change.path || "",
+    language: languageFromPath(change.path || ""),
   });
   wrap.appendChild(details);
   return wrap;
@@ -1644,6 +1785,17 @@ function appendJsonDetails(el, payload) {
 
 function createToolCardSegment(event) {
   const label = toolActionLabel(event.tool, event.args);
+  const chatVisible = shouldRenderToolInChat(event.tool);
+  if (!chatVisible) {
+    return {
+      key: `tool-${event.tool || "unknown"}-${event.id || Date.now()}`,
+      tool: event.tool,
+      path: toolSegmentPath(event.tool, event.args),
+      startedAtMs: parseEventTimeMs(event),
+      el: null,
+      chatVisible: false,
+    };
+  }
   const el = addInlineEvent("tool", label, "", "", {
     variant: "toolcard",
     primaryHtml: buildToolPrimaryHtml(event.tool, event.args || {}),
@@ -1652,12 +1804,14 @@ function createToolCardSegment(event) {
     showDuration: true,
     duration: "00:00",
   });
+  el.setAttribute("data-tool", event.tool || "");
   const segment = {
     key: `tool-${event.tool || "unknown"}-${event.id || Date.now()}`,
     tool: event.tool,
     path: toolSegmentPath(event.tool, event.args),
     startedAtMs: parseEventTimeMs(event),
     el,
+    chatVisible: true,
   };
   return segment;
 }
@@ -2062,11 +2216,13 @@ async function switchToChat(chatId) {
         addMessage(entry.role, entry.text);
       } else if (entry.type === "event") {
         const isToolcard = entry.variant === "toolcard";
-        addInlineEvent(entry.kind, entry.title, isToolcard ? "" : (entry.body || ""), isToolcard ? "" : (entry.extraHtml || ""), {
+        if (isToolcard && !shouldRenderToolInChat(entry.tool || inferToolFromTitle(entry.title))) continue;
+        const restoredEvent = addInlineEvent(entry.kind, entry.title, isToolcard ? "" : (entry.body || ""), isToolcard ? "" : (entry.extraHtml || ""), {
           variant: entry.variant || "",
           primaryHtml: entry.primaryHtml || "",
           defaultExpanded: isToolcard ? false : entry.techExpanded === true,
         });
+        if (isToolcard && entry.tool) restoredEvent?.setAttribute("data-tool", entry.tool);
       } else if (entry.type === "thinking") {
         restoreThinkingBubble(entry);
       }
@@ -2163,6 +2319,8 @@ async function saveChatSession(firstMessage = null) {
         body: isToolcard ? "" : (el.querySelector(".inline-event-detail")?.textContent ?? el.getAttribute("data-body") ?? ""),
         extraHtml: isToolcard ? "" : extraFromDom,
       };
+      const tool = el.getAttribute("data-tool") || "";
+      if (tool) payload.tool = tool;
       if (primaryHtml) payload.primaryHtml = primaryHtml;
       if (techExpanded) payload.techExpanded = true;
       if (variant) payload.variant = variant;
@@ -2972,6 +3130,17 @@ conversation.addEventListener("click", (event) => {
     });
     return;
   }
+  const diffSummary = event.target.closest("summary.diff-summary");
+  if (diffSummary) {
+    const details = diffSummary.closest("details.diff-details");
+    if (!details) return;
+    if (!details.querySelector(":scope > .diff-collapse")) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const isExpanded = details.dataset.expanded === "true" && details.open;
+    toggleDiffDetails(details, !isExpanded);
+    return;
+  }
   const target = event.target.closest("button[data-quick-choice]");
   if (!target) return;
   const mode = target.getAttribute("data-quick-choice");
@@ -3271,9 +3440,12 @@ window.endocode.onEvent(async (event) => {
     return;
   }
   if (event.type === "model-raw") {
-    // Push raw JSON to live details panel instead of skipping
+    // Push raw action text to live details panel instead of skipping.
     const rawText = typeof event.raw === "string" ? event.raw : JSON.stringify(event.raw || event, null, 2);
-    pushLiveEntry("json", "Model JSON", rawText.slice(0, 5000));
+    const label = rawText.includes("<<<<<<< SEARCH") && rawText.includes(">>>>>>> REPLACE")
+      ? "Model patch"
+      : "Model action";
+    pushLiveEntry("json", label, rawText.slice(0, 5000));
     return;
   }
   if (event.type === "thinking-start") {
@@ -3357,7 +3529,7 @@ window.endocode.onEvent(async (event) => {
     removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
     clearLiveDraft();
     const segment = createToolCardSegment(event);
-    const durationEl = segment.el.querySelector(".inline-event-duration");
+    const durationEl = segment.el?.querySelector(".inline-event-duration");
     if (durationEl) startLiveDuration(segment.key, segment.startedAtMs, durationEl);
     activeToolSegments.push(segment);
     showMiniStatus(toolActionLabel(event.tool, event.args));
@@ -3369,10 +3541,12 @@ window.endocode.onEvent(async (event) => {
     if (segment?.key) stopLiveDuration(segment.key, parseEventTimeMs(event));
     if (!event.ok) {
       if (!finalizeToolCardError(segment, event)) {
-        addInlineEvent("error", `Błąd: ${event.tool}`, "", "", {
-          eventAt: event.at,
-          defaultExpanded: false,
-        });
+        if (segment?.chatVisible !== false) {
+          addInlineEvent("error", `Błąd: ${event.tool}`, "", "", {
+            eventAt: event.at,
+            defaultExpanded: false,
+          });
+        }
       }
       showMiniStatus(`Błąd: ${event.tool}`);
       pushLiveEntry("error", `Błąd: ${event.tool}`, toolResultDetailForLive(event.tool, event.result || {}, event), { key: segment?.key || "", eventAt: event.at });

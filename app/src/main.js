@@ -37,6 +37,13 @@ const MAX_FILE_BYTES = 220000;
 const FILE_HISTORY_SNAPSHOT_MAX_BYTES = 220000;
 /** Modele czasem generuja absurdalnie dlugie "url" (padding zer) — odcinamy przed fetch. */
 const MAX_TOOL_URL_LENGTH = 2048;
+const WHOLE_FILE_OVERWRITE_EXISTING_MAX_CHARS = 1400;
+const CODE_EDIT_EXTENSIONS = new Set([
+  ".html", ".htm", ".css", ".scss", ".sass", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx",
+  ".json", ".md", ".py", ".ps1", ".sh", ".bat", ".cmd", ".java", ".cs", ".go", ".rs",
+  ".php", ".rb", ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".sql", ".xml", ".yml",
+  ".yaml", ".toml", ".ini",
+]);
 const MODEL_JSON_RETRY_LIMIT = 2;
 const MODEL_CALL_RETRY_LIMIT = 1;
 const MODEL_STREAM_IDLE_TIMEOUT_MS = 20 * 60 * 1000;
@@ -209,10 +216,10 @@ Pracujesz na lokalnych modelach, lokalnych plikach i jawnych narzedziach. UI pok
 
 AUTONOMIA:
 - Dzialaj autonomicznie: sam zdecyduj czy potrzebny jest tool czy final.
-- Tryb runtime v2: zwracaj TYLKO jeden obiekt JSON akcji:
+- Tryb runtime v2 dla narzedzi innych niz edycje plikow: zwracaj jeden obiekt JSON akcji:
   {"tool":"nazwa","args":{...}} albo {"final":"odpowiedz po polsku"}.
-- Zero prose poza JSON. Zero markdown. Zero tablic.
-- Wyjatek dla patch-first: przy zadaniach filesystem mozesz zwrocic bezposrednio surowe bloki SEARCH/REPLACE (Aider-style), a runtime zamieni je na patch_batch.
+- Zero prose poza kontraktem. Zero tablic.
+- Wyjatek dla edycji plikow: mozesz zwrocic bezposrednio surowe bloki SEARCH/REPLACE (Aider-style), a runtime zamieni je na patch_batch.
 - Gdy potrzebujesz doprecyzowania od uzytkownika, zwroc to jako {"final":"pytanie"}.
 - Gdy odpowiedz ma byc finalna, zwroc jasny final dla uzytkownika.
 
@@ -228,10 +235,18 @@ PODSTAWOWY LOOP:
 6. Final po polsku: co zmieniono, jakie pliki, jaka weryfikacja.
 
 ZASADY EDYCJI:
-- Preferuj mechanike patch-first: patch_edit lub patch_batch z malymi, precyzyjnymi blokami.
+- Preferuj mechanike Aider-style patch-first: surowe bloki SEARCH/REPLACE albo patch_batch z malymi, precyzyjnymi blokami.
+- Dla istniejacego pliku NIE wkladaj calej zawartosci pliku do JSON write_file. Najpierw read_file, potem maly SEARCH/REPLACE.
+- Dla nowego pliku z kodem/HTML/CSS mozesz uzyc pustego SEARCH:
+  sciezka/do/pliku.ext
+  <<<<<<< SEARCH
+  =======
+  pelna tresc nowego pliku
+  >>>>>>> REPLACE
+- Taki pusty SEARCH utworzy plik, a gdy plik istnieje, dopisze tresc na koncu.
 - SEARCH musi byc dokladnym fragmentem z pliku (zachowaj whitespace i wciecia).
 - Gdy SEARCH nie pasuje, najpierw read_file i popraw blok SEARCH, zamiast przepisywac caly plik.
-- Dla nowych plikow mozna uzyc write_file overwrite.
+- Dla bardzo malych nowych plikow mozna uzyc write_file overwrite, ale przy wiekszym kodzie preferuj pusty SEARCH zamiast escapowania JSON.
 - Dla istniejacych plikow preferuj patch_edit/patch_batch z precyzyjnym SEARCH.
 - Append stosuj do celowych dopisek albo dzielenia duzego pliku na fragmenty.
 - Pelny overwrite istniejacego pliku tylko gdy plik jest generowany, bardzo maly, albo uzytkownik wyraznie chce przepisania.
@@ -4010,7 +4025,7 @@ function jsonRepairHintFromError(message) {
     return "Zwroc jeden obiekt {...}, nie tablice [...]. Jedna odpowiedz = jedno narzedzie lub final.";
   }
   if (/bad escaped|escape|invalid.*escape/i.test(message)) {
-    return "Prawdopodobnie niepoprawne sekwencje \\ w stringu (np. Windows path, HTML). Uzyj / w sciezkach; w tresci zamien problematyczne znaki na \\n lub skroc pole content i kontynuuj write_file w trybie append w nastepnym kroku.";
+    return "Prawdopodobnie niepoprawne sekwencje \\ w stringu (np. Windows path, HTML/CSS). Dla edycji plikow preferuj surowe bloki SEARCH/REPLACE zamiast wpychac kod do JSON.";
   }
   if (/unexpected end|unterminated|end of json/i.test(message)) {
     return "Prawdopodobnie obciety JSON (limit tokenow). Zwroc TEN SAM krok z krotszymi polami: krotszy URL, albo krotszy fragment write_file + nastepny krok append.";
@@ -4097,6 +4112,12 @@ function isPatchDriftTooLarge(previousRaw, nextRaw) {
 function makeJsonRepairPrompt(error, raw, options = {}) {
   const errMsg = String(error?.message || error).slice(0, 500);
   const location = options.location || extractJsonErrorLocation(errMsg, raw);
+  const filesystemPatchEscape = options.intentClass === "filesystem"
+    ? `\nPoniewaz to krok filesystem, jesli blad wynika z kodu w polu JSON (HTML/CSS/JS, backslashe, cudzyslowy), NIE naprawiaj go na sile jako JSON. Zamiast tego mozesz zwrocic surowe bloki Aider-style:\nsciezka/do/pliku.ext\n<<<<<<< SEARCH\nfragment 1:1 albo puste dla nowego pliku\n=======\nnowa tresc\n>>>>>>> REPLACE\n`
+    : "";
+  const responseContract = options.intentClass === "filesystem"
+    ? "Odpowiedz jednym poprawnym JSON-em zgodnym z kontraktem ALBO surowymi blokami SEARCH/REPLACE — bez tekstu przed/po, bez tablicy [...]."
+    : "Odpowiedz WYLACZNIE jednym poprawnym JSON-em zgodnym z kontraktem systemowym — bez Markdown, bez tekstu przed/po, bez tablicy [...] (tylko obiekt {...}).";
   const locationText = location?.line
     ? `Lokalizacja bledu: linia ${location.line}, kolumna ${location.column || "?"}.`
     : "Lokalizacja bledu: brak pewnej pozycji (napraw najblizszy uszkodzony fragment).";
@@ -4110,8 +4131,9 @@ Twoje zadanie: NAPRAW MINIMALNIE skladnie w istniejacym szkicu JSON — nie pisz
 Zachow ten sam "tool" i intencje "args" co w szkicu, jesli to mozliwe. Nie zmieniaj planu na inne narzedzie, chyba ze naprawa jest niemozliwa.
 Jesli naprawa wymaga skrocenia: zwroc poprawny JSON z krotszym args (np. krotszy url albo mniejszy fragment content + dalsza praca w kolejnym kroku przez append).
 Zmodyfikuj tylko uszkodzony fragment i zostaw pozostale pola bez zmian.
+${filesystemPatchEscape}
 
-Odpowiedz WYLACZNIE jednym poprawnym JSON-em zgodnym z kontraktem systemowym — bez Markdown, bez tekstu przed/po, bez tablicy [...] (tylko obiekt {...}).
+${responseContract}
 Jesli odzysk jest niemozliwy:
 {"note":"odzysk po bledzie JSON","final":"Nie udalo sie bezpiecznie kontynuowac."}
 
@@ -4313,13 +4335,20 @@ function validateModelAction(parsed) {
 function makeActionSchemaRepairPrompt(schemaError, raw, options = {}) {
   const location = options.location || extractJsonErrorLocation(String(schemaError || ""), raw);
   const context = buildJsonErrorContext(raw, location, 3);
+  const filesystemPatchEscape = options.intentClass === "filesystem"
+    ? `\nDla edycji plikow mozesz zamiast JSON zwrocic surowe bloki SEARCH/REPLACE. Dla nowego pliku uzyj pustego SEARCH; dla istniejacego pliku SEARCH musi byc dokladnym fragmentem z read_file.\n`
+    : "";
+  const responseContract = options.intentClass === "filesystem"
+    ? "Musisz zwrocic jeden obiekt JSON ALBO surowe bloki SEARCH/REPLACE bez tekstu przed/po."
+    : "Musisz zwrocic WYLACZNIE jeden obiekt JSON:";
   return `Poprzednia odpowiedz miala poprawna skladnie JSON, ale narusza KONTRAKT akcji.
 Blad: ${String(schemaError).slice(0, 500)}
 
 Napraw KONTRAKT przy zachowaniu intencji: ten sam "tool" (jesli byl blisko poprawny) albo popraw nazwe na jedna z listy; uzupelnij "final" albo "tool"+"args".
 Nie tworz nowego JSON od zera — popraw minimalnie istniejacy szkic.
+${filesystemPatchEscape}
 
-Musisz zwrocic WYLACZNIE jeden obiekt JSON:
+${responseContract}
 - albo koniec pracy: {"note":"...","final":"odpowiedz po polsku"}
 - albo narzedzie: {"note":"...","tool":"NAZWA","args":{}}
 
@@ -4352,17 +4381,35 @@ function getPreferredEditFormat(modelId = "", intentClass = "general") {
 function buildFilesystemPatchFirstReminder() {
   return [
     "PATCH_FIRST_REMINDER",
-    "Dla tego kroku preferuj Aider-style patch-first.",
-    "Priorytet: patch_batch z blokami SEARCH/REPLACE albo patch_edit.",
-    "Dla nowych plikow write_file jest OK.",
-    "Dla istniejacych plikow preferuj patch_edit/patch_batch, ale gdy trzeba mozesz uzyc write_file.",
-    "Mozesz zwrocic surowe bloki SEARCH/REPLACE bez JSON.",
+    "Dla tego kroku preferuj Aider-style patch-first zamiast duzego JSON z content.",
+    "Jesli edytujesz istniejacy plik: read_file istotnego fragmentu -> maly SEARCH/REPLACE.",
+    "Jesli tworzysz nowy plik z kodem/HTML/CSS/JS: uzyj pustego SEARCH w surowym bloku albo patch_batch, nie uciekaj calego pliku w JSON.",
+    "Format surowy:",
+    "sciezka/do/pliku.ext",
+    "<<<<<<< SEARCH",
+    "dokladny fragment albo pusto dla nowego pliku",
+    "=======",
+    "nowa tresc",
+    ">>>>>>> REPLACE",
+    "PowerShell, fetch_url, read_file, ls, mkdir i final nadal zwracaj jako normalny JSON action.",
   ].join("\n");
 }
 
 function enforceFilesystemPatchFirst(validatedAction) {
   const action = validatedAction?.action || null;
   if (!action || action.final) return null;
+  if (action.tool === "write_file") {
+    const targetPath = String(action.args?.path || "");
+    const content = String(action.args?.content ?? "");
+    const mode = String(action.args?.mode || "overwrite");
+    if (mode !== "append" && isCodeEditPath(targetPath) && content.length > 5000 && action.args?.allowLargeJsonContent !== true) {
+      return {
+        errorCode: "large_write_file_json_blocked",
+        error:
+          "write_file ma zbyt duzy content dla pliku kodu. Uzyj surowych Aider-style blokow SEARCH/REPLACE z pustym SEARCH dla nowego pliku albo patch_batch zamiast escapowac caly plik w JSON.",
+      };
+    }
+  }
   return null;
 }
 
@@ -4476,7 +4523,7 @@ async function getNextActionWithRepair(abortSignal, failedModelIds, step = null)
         }
       }
       if (attempt >= retryLimit) break;
-      const guidance = makeJsonRepairPrompt(error, raw, { step, attempt, retryLimit });
+      const guidance = makeJsonRepairPrompt(error, raw, { step, attempt, retryLimit, intentClass: currentAgentIntentClass });
       if (agentCore?.memory) {
         agentCore.memory.append("assistant", `Format error: ${error.message}`);
         agentCore.memory.append("user", guidance);
@@ -4493,7 +4540,7 @@ async function getNextActionWithRepair(abortSignal, failedModelIds, step = null)
       const guidance = makeActionSchemaRepairPrompt(
         `${validated.errorCode || "invalid_action"} ${validated.error || ""}`.trim(),
         raw,
-        { step, attempt, retryLimit },
+        { step, attempt, retryLimit, intentClass: currentAgentIntentClass },
       );
       if (agentCore?.memory) {
         agentCore.memory.append("assistant", `Schema error: ${validated.errorCode || "invalid_action"} ${validated.error}`);
@@ -4510,7 +4557,7 @@ async function getNextActionWithRepair(abortSignal, failedModelIds, step = null)
         const guidance = makeActionSchemaRepairPrompt(
           `${patchFirstGate.errorCode} ${patchFirstGate.error}`.trim(),
           raw,
-          { step, attempt, retryLimit },
+          { step, attempt, retryLimit, intentClass: currentAgentIntentClass },
         );
         if (agentCore?.memory) {
           agentCore.memory.append("assistant", `Schema error: ${patchFirstGate.errorCode} ${patchFirstGate.error}`);
@@ -5308,6 +5355,107 @@ function applyPatchStyleSearchReplace(content, search, replace, count = 1) {
   return null;
 }
 
+const PATCH_SEARCH_MARKER_RE = /^<{5,9}\s*SEARCH>?\s*$/i;
+const PATCH_DIVIDER_MARKER_RE = /^={5,9}\s*$/;
+const PATCH_REPLACE_MARKER_RE = /^>{5,9}\s*REPLACE\s*$/i;
+const PATCH_KNOWN_NAME_PATHS = new Set(["dockerfile", "makefile", "rakefile", "gemfile", "procfile", "readme", "license"]);
+
+function isPatchFenceLine(line = "") {
+  return /^`{3,}/.test(String(line || "").trim());
+}
+
+function stripPatchFilenameDecorations(line = "") {
+  let s = String(line || "").trim();
+  if (!s) return "";
+  if (isPatchFenceLine(s)) {
+    s = s.replace(/^`{3,}/, "").trim();
+    if (!s || /^[a-z0-9_+-]+$/i.test(s)) return "";
+  }
+  s = s
+    .replace(/^[-*]\s+/, "")
+    .replace(/^#+\s*/, "")
+    .replace(/^(?:file|path|filename)\s*[:=]\s*/i, "")
+    .replace(/:$/, "")
+    .trim();
+  s = s.replace(/^["'`*]+|["'`*]+$/g, "").trim();
+  return s;
+}
+
+function looksLikePatchPathCandidate(line = "") {
+  const s = stripPatchFilenameDecorations(line);
+  if (!s || s.length > 260) return false;
+  if (PATCH_SEARCH_MARKER_RE.test(s) || PATCH_DIVIDER_MARKER_RE.test(s) || PATCH_REPLACE_MARKER_RE.test(s)) return false;
+  if (/^(here|oto|ponizej|poniżej|diff|patch|changes?)\b/i.test(s)) return false;
+  if (/[<>|?*\u0000-\u001f]/.test(s)) return false;
+  const lower = s.toLowerCase();
+  if (PATCH_KNOWN_NAME_PATHS.has(lower)) return true;
+  if (/[\\/]/.test(s)) return true;
+  if (/^\.[a-z0-9_-]+$/i.test(s)) return true;
+  if (/\.[a-z0-9][a-z0-9_-]{0,15}$/i.test(s)) return true;
+  return false;
+}
+
+function normalizePatchPathCandidate(line = "") {
+  const s = stripPatchFilenameDecorations(line);
+  return looksLikePatchPathCandidate(s) ? s : "";
+}
+
+function lineWindowSimilarityScore(searchLines, windowLines) {
+  const len = Math.max(searchLines.length, windowLines.length, 1);
+  let score = 0;
+  for (let i = 0; i < len; i += 1) {
+    const left = String(searchLines[i] ?? "");
+    const right = String(windowLines[i] ?? "");
+    if (left === right) score += 1;
+    else if (left.trim() && left.trim() === right.trim()) score += 0.82;
+    else if (left.trim() && right.trim() && (left.trim().includes(right.trim()) || right.trim().includes(left.trim()))) score += 0.32;
+  }
+  return score / len;
+}
+
+function findSimilarPatchLines(search, content, contextRadius = 4) {
+  const searchLines = String(search || "").replace(/\r\n/g, "\n").split("\n");
+  const contentLines = String(content || "").replace(/\r\n/g, "\n").split("\n");
+  if (!searchLines.length || !contentLines.length) return "";
+  const windowLength = Math.max(1, Math.min(searchLines.length, contentLines.length));
+  let bestScore = 0;
+  let bestStart = -1;
+  for (let start = 0; start <= contentLines.length - windowLength; start += 1) {
+    const windowLines = contentLines.slice(start, start + windowLength);
+    const score = lineWindowSimilarityScore(searchLines, windowLines);
+    if (score > bestScore) {
+      bestScore = score;
+      bestStart = start;
+    }
+  }
+  if (bestStart < 0 || bestScore < 0.35) return "";
+  const start = Math.max(0, bestStart - contextRadius);
+  const end = Math.min(contentLines.length, bestStart + windowLength + contextRadius);
+  return contentLines.slice(start, end).join("\n");
+}
+
+function buildSearchReplaceNoMatchError(block, content = "") {
+  const similar = findSimilarPatchLines(block.search, content);
+  const pathLabel = String(block.path || "plik");
+  const searchPreview = String(block.search || "").slice(0, 2400);
+  const replacePreview = String(block.replace || "").slice(0, 1600);
+  const similarBlock = similar
+    ? `\n\nPodobny fragment znaleziony w ${pathLabel}:\n\`\`\`\n${similar.slice(0, 2400)}\n\`\`\``
+    : "";
+  return [
+    `SEARCH_REPLACE_NO_EXACT_MATCH path=${pathLabel}`,
+    "SEARCH block nie pasuje 1:1 do aktualnej zawartosci pliku.",
+    "Nie wysylaj ponownie zastosowanych juz blokow. Napraw tylko ten blok: uzyj read_file i skopiuj SEARCH dokladnie z pliku.",
+    "",
+    "<<<<<<< SEARCH",
+    searchPreview,
+    "=======",
+    replacePreview,
+    ">>>>>>> REPLACE",
+    similarBlock,
+  ].join("\n");
+}
+
 function parsePatchBatchText(patchText = "", defaultPath = "") {
   const lines = String(patchText || "").replace(/\r\n/g, "\n").split("\n");
   const blocks = [];
@@ -5319,18 +5467,18 @@ function parsePatchBatchText(patchText = "", defaultPath = "") {
       idx += 1;
       continue;
     }
-    if (line.trim() === "<<<<<<< SEARCH") {
+    if (PATCH_SEARCH_MARKER_RE.test(line.trim())) {
       if (!currentPath) throw new Error("Brak sciezki pliku przed blokiem SEARCH/REPLACE.");
       idx += 1;
       const searchLines = [];
-      while (idx < lines.length && lines[idx].trim() !== "=======") {
+      while (idx < lines.length && !PATCH_DIVIDER_MARKER_RE.test(lines[idx].trim())) {
         searchLines.push(lines[idx]);
         idx += 1;
       }
       if (idx >= lines.length) throw new Error("Brak separatora ======= w bloku SEARCH/REPLACE.");
       idx += 1;
       const replaceLines = [];
-      while (idx < lines.length && lines[idx].trim() !== ">>>>>>> REPLACE") {
+      while (idx < lines.length && !PATCH_REPLACE_MARKER_RE.test(lines[idx].trim())) {
         replaceLines.push(lines[idx]);
         idx += 1;
       }
@@ -5343,8 +5491,9 @@ function parsePatchBatchText(patchText = "", defaultPath = "") {
       idx += 1;
       continue;
     }
-    if (!line.trim().startsWith("```") && !line.includes("<<<<<<< SEARCH")) {
-      currentPath = line.trim().replace(/:$/, "");
+    const candidatePath = normalizePatchPathCandidate(line);
+    if (candidatePath) {
+      currentPath = candidatePath;
     }
     idx += 1;
   }
@@ -5370,11 +5519,7 @@ function recoverActionFromSearchReplaceBlocks(raw) {
 function isSuspiciousStatusOverwrite(targetPath, content, mode = "overwrite") {
   if (String(mode || "overwrite") === "append") return false;
   const ext = path.extname(String(targetPath || "")).toLowerCase();
-  const guardedExts = new Set([
-    ".html", ".htm", ".css", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
-    ".json", ".md", ".py", ".java", ".go", ".rs", ".php", ".rb", ".c", ".cpp", ".h", ".hpp",
-  ]);
-  if (!guardedExts.has(ext)) return false;
+  if (!CODE_EDIT_EXTENSIONS.has(ext)) return false;
   const text = String(content ?? "").trim();
   if (!text) return false;
   const shortish = text.length <= 220;
@@ -5382,6 +5527,77 @@ function isSuspiciousStatusOverwrite(targetPath, content, mode = "overwrite") {
   const noCodeMarkers = !/[<>{}[\];=]/.test(text) && !/\b(function|class|import|export|const|let|var|def|SELECT|INSERT)\b/i.test(text);
   const looksLikeStatus = /\b(zapisano|gotowe|pomyslnie|pomyślnie|utworzono|zaktualizowano|wykonano|all done|done|saved)\b/i.test(text);
   return shortish && lowLineCount && noCodeMarkers && looksLikeStatus;
+}
+
+function isCodeEditPath(targetPath = "") {
+  const ext = path.extname(String(targetPath || "")).toLowerCase();
+  const base = path.basename(String(targetPath || "")).toLowerCase();
+  return CODE_EDIT_EXTENSIONS.has(ext) || PATCH_KNOWN_NAME_PATHS.has(base);
+}
+
+function shouldRejectWholeFileOverwrite(targetPath, beforeSnapshot, content, mode = "overwrite", allowWholeFileOverwrite = false) {
+  if (allowWholeFileOverwrite === true) return false;
+  if (String(mode || "overwrite") === "append") return false;
+  if (!beforeSnapshot?.exists) return false;
+  if (!isCodeEditPath(targetPath)) return false;
+  const text = String(content ?? "");
+  if (text.length <= WHOLE_FILE_OVERWRITE_EXISTING_MAX_CHARS) return false;
+  return true;
+}
+
+async function applyPatchBlockToFile(block = {}) {
+  const target = normalizeInsideRoot(block.path);
+  const relativePath = relativeToRoot(target);
+  const search = String(block.search ?? "");
+  const replace = String(block.replace ?? "");
+  const beforeSnapshot = await snapshotFileForHistory(target);
+  const exists = beforeSnapshot.exists === true;
+  let before = "";
+
+  if (exists) {
+    before = await fsp.readFile(target, "utf8");
+  } else if (search.trim()) {
+    throw new Error(`SEARCH_REPLACE_TARGET_MISSING path=${relativePath} :: Plik nie istnieje. Dla nowego pliku uzyj pustego SEARCH.`);
+  }
+
+  let after;
+  let strategy;
+  let replaced = 1;
+  if (!search.trim()) {
+    after = before + replace;
+    strategy = exists ? "empty_search_append" : "empty_search_create";
+    replaced = 0;
+  } else {
+    const patched = applyPatchStyleSearchReplace(before, search, replace, 1);
+    if (!patched) throw new Error(buildSearchReplaceNoMatchError({ path: relativePath, search, replace }, before));
+    after = patched.updated;
+    strategy = patched.strategy;
+    replaced = patched.replaced;
+  }
+
+  await fsp.mkdir(path.dirname(target), { recursive: true });
+  await fsp.writeFile(target, after, "utf8");
+  const revision = recordFileRevision(
+    target,
+    exists ? snapshotFromKnownText(true, before) : snapshotFromKnownText(false, ""),
+    snapshotFromKnownText(true, after),
+    { action: exists ? "patch_edit" : "write_file" },
+  );
+  emit("file-change", {
+    path: relativePath,
+    action: exists ? "patch_edit" : "write_file",
+    diff: makeLineDiff(before, after),
+    before: textPreview(before),
+    after: textPreview(after),
+    history: revision.history,
+  });
+  return {
+    path: relativePath,
+    strategy,
+    replaced,
+    created: !exists,
+    bytes: Buffer.byteLength(after, "utf8"),
+  };
 }
 
 async function executeTool(action) {
@@ -5450,6 +5666,11 @@ async function executeTool(action) {
         "Odrzucono podejrzany overwrite: tresc wyglada jak komunikat statusu modelu, a nie zawartosc pliku. Zakoncz przez final zamiast zapisywac komunikat do pliku.",
       );
     }
+    if (shouldRejectWholeFileOverwrite(target, beforeSnapshot, args.content, args.mode, args.allowWholeFileOverwrite === true)) {
+      throw new Error(
+        "WHOLE_FILE_OVERWRITE_BLOCKED: istniejacy plik kodu jest za duzy na bezpieczny overwrite przez JSON. Uzyj Aider-style SEARCH/REPLACE: read_file istotnego fragmentu, potem patch_batch z malymi blokami albo surowe bloki SEARCH/REPLACE.",
+      );
+    }
     await fsp.mkdir(path.dirname(target), { recursive: true });
     if ((args.mode || "overwrite") === "append") {
       await fsp.appendFile(target, String(args.content ?? ""), "utf8");
@@ -5476,7 +5697,7 @@ async function executeTool(action) {
     if (!oldText) throw new Error("search nie moze byc puste.");
     const count = Number.isInteger(Number(args.count)) ? Number(args.count) : 1;
     const patched = applyPatchStyleSearchReplace(before, oldText, newText, count);
-    if (!patched) throw new Error(`SEARCH_REPLACE_NO_EXACT_MATCH path=${relativeToRoot(target)} :: SEARCH block failed to exactly match lines w pliku.`);
+    if (!patched) throw new Error(buildSearchReplaceNoMatchError({ path: relativeToRoot(target), search: oldText, replace: newText }, before));
     const after = patched.updated;
     await fsp.writeFile(target, after, "utf8");
     const revision = recordFileRevision(
@@ -5506,31 +5727,7 @@ async function executeTool(action) {
     const applied = [];
     for (const block of blocks) {
       if (!block.path) throw new Error("Blok SEARCH/REPLACE nie ma poprawnej sciezki pliku.");
-      const target = normalizeInsideRoot(block.path);
-      const before = await fsp.readFile(target, "utf8");
-      const patched = applyPatchStyleSearchReplace(before, block.search, block.replace, 1);
-      if (!patched) {
-        throw new Error(
-          `SEARCH_REPLACE_NO_EXACT_MATCH path=${block.path} :: SEARCH block failed to exactly match lines w pliku ${block.path}. Uzyj read_file i podaj dokladny fragment SEARCH.`,
-        );
-      }
-      const after = patched.updated;
-      await fsp.writeFile(target, after, "utf8");
-      const revision = recordFileRevision(
-        target,
-        snapshotFromKnownText(true, before),
-        snapshotFromKnownText(true, after),
-        { action: "patch_edit" },
-      );
-      applied.push({ path: relativeToRoot(target), strategy: patched.strategy });
-      emit("file-change", {
-        path: relativeToRoot(target),
-        action: "patch_edit",
-        diff: makeLineDiff(before, after),
-        before: textPreview(before),
-        after: textPreview(after),
-        history: revision.history,
-      });
+      applied.push(await applyPatchBlockToFile(block));
     }
     result = { appliedCount: applied.length, applied };
   } else if (tool === "run_powershell") {

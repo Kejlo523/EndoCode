@@ -1300,18 +1300,24 @@ select:focus {
   min-width: 0;
 }
 .inline-event-summary:not(.no-detail)::before {
-  content: "▸";
+  content: "";
   display: inline-block;
+  width: 5px;
+  height: 5px;
+  border-radius: 999px;
   flex-shrink: 0;
+  background: currentColor;
   color: var(--text-muted);
-  font-size: 9px;
-  transition: transform var(--transition), color var(--transition);
+  opacity: 0.38;
+  transition: transform var(--transition), opacity var(--transition), color var(--transition);
 }
 .inline-event[data-expanded="true"] .inline-event-summary:not(.no-detail)::before {
-  transform: rotate(90deg);
+  transform: scale(1.35);
+  opacity: 0.7;
 }
 .inline-event-summary:not(.no-detail):hover::before {
   color: var(--text-secondary);
+  opacity: 0.62;
 }
 .inline-event-summary.no-detail {
   cursor: default;
@@ -1432,12 +1438,20 @@ select:focus {
 }
 
 .thinking-toggle::before {
-  content: "▸";
-  transition: transform var(--transition);
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: currentColor;
+  opacity: 0.34;
+  transition: transform var(--transition), opacity var(--transition);
   display: inline-block;
-  font-size: 10px;
+  flex-shrink: 0;
 }
-.thinking-bubble.expanded .thinking-toggle::before { transform: rotate(90deg); }
+.thinking-bubble.expanded .thinking-toggle::before {
+  transform: scale(1.35);
+  opacity: 0.68;
+}
 
 .thinking-content {
   padding: 4px 0 8px 16px;
@@ -1502,15 +1516,19 @@ details.diff-details {
   border: none;
   background: transparent;
   overflow: hidden;
+  transition: border-color var(--transition), background var(--transition);
 }
 
-details.diff-details[open] {
+details.diff-details[data-expanded="true"] {
   border: 1px solid rgba(255, 255, 255, 0.08);
   background: #111111;
 }
 
 details.diff-details > summary.diff-summary {
   list-style: none;
+}
+details.diff-details > summary.diff-summary::marker {
+  content: "";
 }
 details.diff-details > summary.diff-summary::-webkit-details-marker {
   display: none;
@@ -1542,8 +1560,8 @@ details.diff-details > summary.diff-summary::-webkit-details-marker {
 .diff-summary.file-change-summary .file-change-head {
   width: 100%;
 }
-details.diff-details[open] > summary.diff-summary { padding: 6px 10px; }
-details.diff-details[open] > summary.diff-summary.file-change-summary { padding: 0; }
+details.diff-details[data-expanded="true"] > summary.diff-summary { padding: 6px 10px; }
+details.diff-details[data-expanded="true"] > summary.diff-summary.file-change-summary { padding: 0; }
 .diff-stat-plus { color: var(--success); }
 .diff-stat-minus { color: var(--danger); }
 .diff-toggle-hint {
@@ -1572,6 +1590,13 @@ details.diff-details[open] > summary.diff-summary.file-change-summary { padding:
   border-radius: 0;
 }
 
+.diff-collapse {
+  max-height: 0;
+  opacity: 0;
+  overflow: hidden;
+  transition: max-height 0.28s cubic-bezier(0.2, 0.8, 0.2, 1), opacity 0.18s ease;
+}
+
 .diff-hunk { border-bottom: 1px solid rgba(255, 255, 255, 0.06); }
 .diff-hunk:last-child { border-bottom: none; }
 .diff-hunk-header {
@@ -1586,23 +1611,44 @@ details.diff-details[open] > summary.diff-summary.file-change-summary { padding:
   padding: 1px 8px 1px 4px;
   white-space: pre-wrap;
   min-height: 18px;
-  display: flex;
+  display: grid;
+  grid-template-columns: 36px 18px minmax(0, 1fr);
   gap: 0;
+  align-items: start;
+  color: var(--text-secondary);
 }
 .diff-lineno {
-  display: inline-block;
-  width: 36px;
   text-align: right;
   padding-right: 8px;
   color: var(--text-muted);
   user-select: none;
-  flex-shrink: 0;
   opacity: 0.5;
 }
-.diff-row.add { background: rgba(139, 196, 154, 0.12); color: var(--success); }
-.diff-row.remove { background: rgba(224, 119, 125, 0.12); color: var(--danger); }
+.diff-prefix {
+  text-align: center;
+  color: var(--text-muted);
+  user-select: none;
+}
+.diff-code {
+  display: block;
+  min-width: 0;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  font-family: var(--mono);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.diff-code.hljs {
+  background: transparent;
+  padding: 0;
+}
+.diff-row.add { background: rgba(139, 196, 154, 0.12); }
+.diff-row.remove { background: rgba(224, 119, 125, 0.12); }
 .diff-row.same { color: var(--text-muted); }
 .diff-row.meta { color: var(--amber); }
+.diff-row.add .diff-prefix { color: var(--success); }
+.diff-row.remove .diff-prefix { color: var(--danger); }
 
 /* ══════════════ MINI STATUS (above composer) ════════════ */
 .mini-status {

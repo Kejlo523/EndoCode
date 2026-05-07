@@ -101,10 +101,13 @@ function buildMachineRepairPrompt(validationError, rawResponse) {
       "1) Uzyj read_file dla wskazanego pliku i skopiuj fragment 1:1 do SEARCH (z whitespace).",
       "2) Zwroc patch_batch albo patch_edit z mniejszymi blokami.",
       "3) Nie uzywaj write_file overwrite dla istniejacego pliku.",
+      "Mozesz tez zwrocic surowe bloki SEARCH/REPLACE bez JSON; runtime zamieni je na patch_batch.",
+      "Dla nowego pliku uzyj pustego SEARCH.",
       "Dopuszczalne odpowiedzi:",
       "- {\"tool\":\"read_file\",\"args\":{\"path\":\"...\",\"maxBytes\":30000}}",
       "- {\"tool\":\"patch_batch\",\"args\":{\"patch\":\"...\"}}",
       "- {\"tool\":\"patch_edit\",\"args\":{\"path\":\"...\",\"search\":\"...\",\"replace\":\"...\",\"count\":1}}",
+      "- albo surowo: path/to/file\\n<<<<<<< SEARCH\\n...\\n=======\\n...\\n>>>>>>> REPLACE",
       `last_raw=${String(rawResponse || "").slice(0, 700)}`,
     ].join("\n");
   }

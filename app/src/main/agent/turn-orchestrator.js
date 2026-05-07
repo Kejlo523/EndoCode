@@ -14,6 +14,53 @@ function createTurnOrchestrator(options = {}) {
     throw new Error("createTurnOrchestrator requires planner, toolExecutor and memory");
   }
 
+  function summarizeActionForMemory(action = {}) {
+    if (!action || typeof action !== "object") return JSON.stringify(action || {});
+    if (action.final) return JSON.stringify({ note: action.note || "", final: action.final });
+    const tool = action.tool || "";
+    const args = action.args || {};
+    if (tool === "write_file") {
+      return JSON.stringify({
+        note: action.note || "",
+        tool,
+        args: {
+          path: args.path || "",
+          mode: args.mode || "overwrite",
+          contentChars: String(args.content ?? "").length,
+        },
+      });
+    }
+    if (tool === "patch_edit") {
+      return JSON.stringify({
+        note: action.note || "",
+        tool,
+        args: {
+          path: args.path || "",
+          searchChars: String(args.search ?? "").length,
+          replaceChars: String(args.replace ?? "").length,
+          count: args.count ?? 1,
+        },
+      });
+    }
+    if (tool === "patch_batch") {
+      const blocks = Array.isArray(args.blocks) ? args.blocks : [];
+      return JSON.stringify({
+        note: action.note || "",
+        tool,
+        args: {
+          defaultPath: args.defaultPath || "",
+          patchChars: String(args.patch ?? "").length,
+          blocks: blocks.map((block) => ({
+            path: block?.path || args.defaultPath || "",
+            searchChars: String(block?.search ?? "").length,
+            replaceChars: String(block?.replace ?? "").length,
+          })),
+        },
+      });
+    }
+    return JSON.stringify(action);
+  }
+
   function waitForRecoveryWindow(ms, signal) {
     const delay = Math.max(0, Number(ms) || 0);
     if (!delay) return Promise.resolve();
@@ -87,7 +134,7 @@ function createTurnOrchestrator(options = {}) {
       } else {
         emit("agent-phase", { phase: "observe", step, tool: action.tool || "" });
       }
-      memory.append("assistant", JSON.stringify(action));
+      memory.append("assistant", summarizeActionForMemory(action));
       memory.append("user", `Tool result:\n${JSON.stringify(toolPayload)}`);
     }
     return { ok: true, final: "Osiagnieto limit krokow. Napisz, zeby kontynuowac." };
