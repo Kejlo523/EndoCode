@@ -161,7 +161,9 @@
         </div>
       </div>
 
-      <section class="conversation-area" id="conversationArea">
+      <div class="main-content-layout">
+        <div class="chat-column">
+          <section class="conversation-area" id="conversationArea">
         <div class="conversation-scroll" id="conversation">
           <!-- Welcome screen shown when empty -->
           <div class="welcome-screen" id="welcomeScreen">
@@ -240,18 +242,21 @@
           </div>
         </form>
       </div>
+        </div> <!-- end chat-column -->
+
+        <!-- ── LIVE DETAILS SIDEBAR ── -->
+        <aside class="live-details-panel" id="liveDetailsPanel">
+          <div class="live-details-header">
+            <span class="live-details-title">Szczegóły Live</span>
+            <button class="live-details-close" id="liveDetailsClose" title="Zamknij">&times;</button>
+          </div>
+          <div class="live-details-body" id="liveDetailsBody">
+            <div class="live-details-empty">Brak aktywnych akcji.</div>
+          </div>
+        </aside>
+      </div> <!-- end main-content-layout -->
     </main>
 
-    <!-- ── LIVE DETAILS SIDEBAR ── -->
-    <aside class="live-details-panel" id="liveDetailsPanel">
-      <div class="live-details-header">
-        <span class="live-details-title">Szczegóły Live</span>
-        <button class="live-details-close" id="liveDetailsClose" title="Zamknij">&times;</button>
-      </div>
-      <div class="live-details-body" id="liveDetailsBody">
-        <div class="live-details-empty">Brak aktywnych akcji.</div>
-      </div>
-    </aside>
     <div class="live-details-backdrop" id="liveDetailsBackdrop"></div>
   </div>
 

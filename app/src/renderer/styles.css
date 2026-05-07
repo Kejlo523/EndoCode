@@ -506,6 +506,23 @@ select:focus {
   background: rgba(240, 185, 82, 0.08);
 }
 
+/* ══════════════ CONVERSATION LAYOUT ══════════════ */
+.main-content-layout {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  overflow: hidden;
+}
+
+.chat-column {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+}
+
 /* ══════════════ CONVERSATION AREA ══════════════ */
 .conversation-area {
   flex: 1;
@@ -1531,9 +1548,6 @@ details.diff-details[open] > summary.diff-summary.file-change-summary { padding:
   padding: 4px 8px;
   min-height: 28px;
   animation: miniStatusIn 0.2s ease;
-  background: rgba(155, 122, 214, 0.06);
-  border-radius: 8px;
-  border: 1px solid rgba(155, 122, 214, 0.1);
 }
 
 @keyframes miniStatusIn {
@@ -1594,21 +1608,21 @@ details.diff-details[open] > summary.diff-summary.file-change-summary { padding:
 
 /* ══════════════ LIVE DETAILS SIDEBAR ══════════════ */
 .live-details-panel {
-  width: 0;
-  height: 100vh;
+  max-width: 0;
+  width: 340px;
+  height: 100%;
   background: var(--bg-deep);
-  border-left: 0 solid var(--border);
+  border-left: 1px solid transparent;
   z-index: 90;
   display: flex;
   flex-direction: column;
-  transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1), border-color 0.3s ease;
-  will-change: width;
+  transition: max-width 0.3s cubic-bezier(0.4, 0, 0.2, 1), border-color 0.3s ease;
   flex-shrink: 0;
   overflow: hidden;
 }
 .live-details-panel.open {
-  width: 340px;
-  border-left: 1px solid var(--border);
+  max-width: 340px;
+  border-left-color: var(--border);
 }
 
 .live-details-header {
