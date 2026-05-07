@@ -176,10 +176,13 @@
 
       <!-- ── COMPOSER ── -->
       <div class="composer-wrapper">
-        <div class="live-activity hidden" id="liveActivity">
-          <div class="live-pulse"></div>
-          <span class="live-label" id="liveLabel">Myśli...</span>
-          <span class="live-detail" id="liveDetail"></span>
+        <div class="mini-status hidden" id="miniStatus">
+          <span class="mini-status-dot"></span>
+          <span class="mini-status-text" id="miniStatusText"></span>
+          <button class="mini-status-live-btn" id="miniStatusLiveBtn" type="button" title="Pokaż szczegóły live">
+            <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M2 4h12M2 8h8M2 12h10" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+            Live
+          </button>
         </div>
         <div class="quick-choices-dock hidden" id="quickChoicesDock"></div>
         <div class="prompt-queue hidden" id="promptQueue">
@@ -238,6 +241,18 @@
         </form>
       </div>
     </main>
+
+    <!-- ── LIVE DETAILS SIDEBAR ── -->
+    <aside class="live-details-panel" id="liveDetailsPanel">
+      <div class="live-details-header">
+        <span class="live-details-title">Szczegóły Live</span>
+        <button class="live-details-close" id="liveDetailsClose" title="Zamknij">&times;</button>
+      </div>
+      <div class="live-details-body" id="liveDetailsBody">
+        <div class="live-details-empty">Brak aktywnych akcji.</div>
+      </div>
+    </aside>
+    <div class="live-details-backdrop" id="liveDetailsBackdrop"></div>
   </div>
 
   <!-- ── APPROVAL MODAL ── -->

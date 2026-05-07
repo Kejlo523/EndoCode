@@ -24,9 +24,12 @@ const newChatBtn = document.getElementById("newChatBtn");
 const chatHistoryList = document.getElementById("chatHistoryList");
 const composerWsName = document.getElementById("composerWsName");
 const composerAccess = document.getElementById("composerAccess");
-const liveActivity = document.getElementById("liveActivity");
-const liveLabel = document.getElementById("liveLabel");
-const liveDetail = document.getElementById("liveDetail");
+const miniStatus = document.getElementById("miniStatus");
+const miniStatusText = document.getElementById("miniStatusText");
+const liveDetailsPanel = document.getElementById("liveDetailsPanel");
+const liveDetailsBody = document.getElementById("liveDetailsBody");
+const liveDetailsClose = document.getElementById("liveDetailsClose");
+const liveDetailsBackdrop = document.getElementById("liveDetailsBackdrop");
 const quickChoicesDock = document.getElementById("quickChoicesDock");
 
 const attachBtn = document.getElementById("attachBtn");
@@ -474,47 +477,108 @@ async function processPromptQueue() {
   }
 }
 
-// ── Live Activity ──
-function inferLiveState(label, detail = "") {
-  const text = `${label} ${detail}`.toLowerCase();
-  if (/błąd|blad|error|nieudane|failed/.test(text)) return "error";
-  if (/gotowe|zakończ|zakoncz|zapisano|odczytano|pobrano|complete/.test(text)) return "done";
-  if (/pisz|zapis|patch|edyt|plik|diff|kreśl|kresl/.test(text)) return "write";
-  if (/czyta|odczyt|listuje|lista|katalog|ścieżk|sciezk|read|ls\b|pwd|cd\b/.test(text)) return "read";
-  if (/powershell|komend|runtime|server|kill|shell/.test(text)) return "shell";
-  if (/web|lookup|szuk|pobier|download|sieci|url/.test(text)) return "search";
-  if (/czeka|zatwierd|approval|kolejka/.test(text)) return "wait";
-  if (/myśli|mysli|plan|krok|analiz|walid|akcj|kontekst|finaliz/.test(text)) return "think";
-  return "work";
+// ── Mini Status (above composer) ──
+function showMiniStatus(label) {
+  const text = String(label || "").trim();
+  if (!text) { hideMiniStatus(); return; }
+  if (miniStatusText) miniStatusText.textContent = text;
+  if (miniStatus) miniStatus.classList.remove("hidden");
 }
 
+function hideMiniStatus() {
+  if (miniStatus) miniStatus.classList.add("hidden");
+  if (miniStatusText) miniStatusText.textContent = "";
+}
+
+// ── Live Details Panel ──
+let liveDetailsPanelOpen = false;
+const LIVE_DETAILS_MAX_ENTRIES = 60;
+
+function openLiveDetails() {
+  if (liveDetailsPanelOpen) return;
+  liveDetailsPanelOpen = true;
+  if (liveDetailsPanel) liveDetailsPanel.classList.add("open");
+  if (liveDetailsBackdrop) liveDetailsBackdrop.classList.add("visible");
+}
+
+function closeLiveDetails() {
+  if (!liveDetailsPanelOpen) return;
+  liveDetailsPanelOpen = false;
+  if (liveDetailsPanel) liveDetailsPanel.classList.remove("open");
+  if (liveDetailsBackdrop) liveDetailsBackdrop.classList.remove("visible");
+}
+
+function clearLiveDetails() {
+  if (liveDetailsBody) liveDetailsBody.innerHTML = '<div class="live-details-empty">Brak aktywnych akcji.</div>';
+}
+
+function pushLiveEntry(kind, label, detail = "") {
+  if (!liveDetailsBody) return;
+  const empty = liveDetailsBody.querySelector(".live-details-empty");
+  if (empty) empty.remove();
+  const safeLabel = escapeHtml(String(label || "").trim());
+  const safeDetail = escapeHtml(String(detail || "").trim()).slice(0, 3000);
+  const kindClass = kind ? `live-entry--${kind}` : "";
+  const entry = document.createElement("div");
+  entry.className = `live-entry ${kindClass}`;
+  entry.innerHTML = `
+    <div class="live-entry-label">${safeLabel}</div>
+    ${safeDetail ? `<div class="live-entry-detail">${safeDetail}</div>` : ""}
+  `;
+  liveDetailsBody.appendChild(entry);
+  // Limit entries
+  while (liveDetailsBody.children.length > LIVE_DETAILS_MAX_ENTRIES) {
+    liveDetailsBody.removeChild(liveDetailsBody.firstElementChild);
+  }
+  liveDetailsBody.scrollTop = liveDetailsBody.scrollHeight;
+}
+
+if (liveDetailsClose) liveDetailsClose.addEventListener("click", closeLiveDetails);
+if (liveDetailsBackdrop) liveDetailsBackdrop.addEventListener("click", closeLiveDetails);
+const miniStatusLiveBtn = document.getElementById("miniStatusLiveBtn");
+if (miniStatusLiveBtn) miniStatusLiveBtn.addEventListener("click", () => {
+  if (liveDetailsPanelOpen) closeLiveDetails(); else openLiveDetails();
+});
+
+// Compat wrappers — showLive/hideLive now update mini-status + push to live panel
+let _lastLiveLabel = "";
+let _liveDebounce = null;
 function showLive(label, detail = "") {
-  const cleanLabel = String(label || "Pracuję...").trim();
-  const cleanDetail = String(detail || "").replace(/\s+/g, " ").trim();
-  const title = cleanDetail ? `${cleanLabel}: ${cleanDetail}` : cleanLabel;
-  upsertInlineEvent(
-    LIVE_CHAT_ACTIVITY_ID,
-    "activity",
-    cleanLabel,
-    cleanDetail || "Przetwarzanie",
-    { defaultExpanded: false, keepExpanded: false, className: "live-chat-event", moveToBottom: true },
-  );
-  liveActivity.title = title;
-  liveActivity.dataset.liveState = inferLiveState(cleanLabel, cleanDetail);
-  liveActivity.setAttribute("aria-label", title);
-  liveLabel.textContent = cleanLabel;
-  // Belka live pokazuje tylko aktualny status (bez opisowych komentarzy).
-  liveDetail.textContent = "";
-  liveActivity.classList.remove("hidden");
+  showMiniStatus(label);
+  const sig = `${label}|${detail}`;
+  if (sig === _lastLiveLabel) return;
+  _lastLiveLabel = sig;
+  if (_liveDebounce) clearTimeout(_liveDebounce);
+  _liveDebounce = setTimeout(() => {
+    _liveDebounce = null;
+    pushLiveEntry("phase", label, detail);
+  }, 400);
 }
 
 function hideLive() {
-  liveActivity.classList.add("hidden");
-  liveActivity.removeAttribute("data-live-state");
-  liveActivity.removeAttribute("aria-label");
-  liveDetail.textContent = "";
-  liveLabel.textContent = "";
-  liveActivity.title = "";
+  hideMiniStatus();
+  _lastLiveLabel = "";
+  if (_liveDebounce) { clearTimeout(_liveDebounce); _liveDebounce = null; }
+}
+
+// ── Animated Collapse Helper ──
+function animateCollapse(el, expand) {
+  if (!el) return;
+  if (expand) {
+    el.classList.add("expanded");
+    el.style.maxHeight = el.scrollHeight + "px";
+    const onEnd = () => {
+      el.removeEventListener("transitionend", onEnd);
+      if (el.classList.contains("expanded")) el.style.maxHeight = "none";
+    };
+    el.addEventListener("transitionend", onEnd);
+  } else {
+    el.style.maxHeight = el.scrollHeight + "px";
+    requestAnimationFrame(() => {
+      el.style.maxHeight = "0";
+      el.classList.remove("expanded");
+    });
+  }
 }
 
 // ── Welcome Screen ──
@@ -565,7 +629,7 @@ function resetTurnActivity() {
 }
 
 function setLiveIdle() {
-  hideLive();
+  hideMiniStatus();
 }
 
 function compactToolResultSummary(tool, result = {}) {
@@ -785,7 +849,7 @@ function addInlineEvent(kind, title, body = "", extraHtml = "", options = {}) {
   const primaryBlock = showPrimary
     ? `<div class="inline-event-primary">${primaryHtml || (isToolcard ? "" : "")}</div>`
     : "";
-  const detailHiddenClass = techOpen ? "" : " hidden";
+  const detailExpandedClass = techOpen ? " expanded" : "";
 
   div.innerHTML = `
     <span class="inline-event-icon" aria-hidden="true">${iconMap[kind] || iconMap.note}</span>
@@ -795,7 +859,7 @@ function addInlineEvent(kind, title, body = "", extraHtml = "", options = {}) {
         ${expandToggle}
       </button>
       ${primaryBlock}
-      <div class="inline-event-detail-wrap${detailHiddenClass}" id="${detailId}">
+      <div class="inline-event-detail-wrap${detailExpandedClass}" id="${detailId}">
         ${normalizedBody ? `<div class="inline-event-detail">${escapeHtml(normalizedBody)}</div>` : ""}
         ${normalizedExtraHtml ? `<div class="inline-event-expand">${normalizedExtraHtml}</div>` : ""}
       </div>
@@ -810,11 +874,11 @@ function addInlineEvent(kind, title, body = "", extraHtml = "", options = {}) {
     summaryBtn.addEventListener("click", () => {
       const detailWrap = div.querySelector(".inline-event-detail-wrap");
       if (!detailWrap) return;
-      const expanded = !detailWrap.classList.contains("hidden");
-      detailWrap.classList.toggle("hidden", expanded);
-      div.setAttribute("data-expanded", expanded ? "false" : "true");
-      summaryBtn.setAttribute("aria-expanded", expanded ? "false" : "true");
-      if (!expanded) {
+      const isExpanded = detailWrap.classList.contains("expanded");
+      animateCollapse(detailWrap, !isExpanded);
+      div.setAttribute("data-expanded", isExpanded ? "false" : "true");
+      summaryBtn.setAttribute("aria-expanded", isExpanded ? "false" : "true");
+      if (!isExpanded) {
         requestAnimationFrame(() => {
           detailWrap.scrollTop = 0;
           smartScroll({ smooth: true });
@@ -825,6 +889,14 @@ function addInlineEvent(kind, title, body = "", extraHtml = "", options = {}) {
     });
   }
   conversation.appendChild(div);
+  // If starting expanded, ensure the detail wrap is visible immediately
+  if (techOpen) {
+    const dw = div.querySelector(".inline-event-detail-wrap");
+    if (dw) {
+      dw.style.maxHeight = "none";
+      dw.style.opacity = "1";
+    }
+  }
   syncInlineEventPersistAttrs(div);
   smartScroll();
   updateWelcome();
@@ -893,9 +965,6 @@ function removeInlineEventByActivityId(activityId) {
 }
 
 const MODEL_WRITING_ACTIVITY_ID = "model-writing";
-const AGENT_PHASE_ACTIVITY_ID = "agent-phase";
-const AGENT_NOTE_ACTIVITY_ID = "agent-note";
-const LIVE_CHAT_ACTIVITY_ID = "live-chat";
 let lastAgentPhaseSignature = "";
 let agentPhaseHistoryLines = [];
 
@@ -957,7 +1026,7 @@ function upsertInlineEvent(activityId, kind, title, body = "", options = {}) {
     }
     if (keepExpanded) {
       const detailWrap = el.querySelector(".inline-event-detail-wrap");
-      if (detailWrap) detailWrap.classList.remove("hidden");
+      if (detailWrap) animateCollapse(detailWrap, true);
       if (summaryBtn) summaryBtn.setAttribute("aria-expanded", "true");
       el.setAttribute("data-expanded", "true");
     }
@@ -1305,7 +1374,7 @@ function buildReadFileResultHtml(result = {}) {
     result.truncated ? buildToolChip("skrócone", "warn") : "",
   ].filter(Boolean);
   return buildResultCompactHtml(
-    `Odczyt: ${compactPath(result.path || "", 2) || "plik"}`,
+    "",
     chips,
     "",
   );
@@ -1326,7 +1395,7 @@ function buildShellResultHtml(result = {}) {
     stderr ? buildToolChip("stderr", "warn") : "",
   ].filter(Boolean);
   return buildResultCompactHtml(
-    "Wynik komendy",
+    "",
     chips,
     "",
   );
@@ -1334,7 +1403,7 @@ function buildShellResultHtml(result = {}) {
 
 function buildGenericResultHtml(result = {}) {
   return buildResultCompactHtml(
-    "Wynik narzędzia",
+    "",
     [],
     "",
   );
@@ -1378,13 +1447,25 @@ function createToolCardSegment(event) {
     showDuration: true,
     duration: "00:00",
   });
-  return {
+  const segment = {
     key: `tool-${event.tool || "unknown"}-${event.id || Date.now()}`,
     tool: event.tool,
     path: toolSegmentPath(event.tool, event.args),
     startedAtMs: parseEventTimeMs(event),
     el,
   };
+  // Add "Szczegóły" button to open live details panel
+  const detailsBtn = document.createElement("button");
+  detailsBtn.className = "live-details-btn";
+  detailsBtn.type = "button";
+  detailsBtn.textContent = "Szczegóły";
+  detailsBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    openLiveDetails();
+  });
+  const body = el.querySelector(".inline-event-body");
+  if (body) body.appendChild(detailsBtn);
+  return segment;
 }
 
 function syncFileHistoryControls(filePath, history = {}) {
@@ -1530,7 +1611,7 @@ function finalizeToolCardSuccess(segment, event) {
   if (ph) ph.remove();
 
   if (tool === "read_file") {
-    if (titleEl) titleEl.textContent = `Odczytano: ${result.path || segment.path || ""}`;
+    if (titleEl) titleEl.textContent = `Odczytano: ${compactPath(result.path || segment.path || "", 2)}`;
     if (primary) {
       primary.innerHTML = buildReadFileResultHtml(result);
     }
@@ -1574,7 +1655,7 @@ function finalizeToolCardSuccess(segment, event) {
         titleEl.textContent = `${labels.patch_batch} · ${result.appliedCount} plik(ów)`;
       } else {
         const pathHint = result.path || (Array.isArray(result.applied) && result.applied[0]?.path) || segment.path || "";
-        titleEl.textContent = `${labels[tool] || "Gotowe"}: ${pathHint}`;
+        titleEl.textContent = `${labels[tool] || "Gotowe"}: ${compactPath(pathHint, 2)}`;
       }
     }
     if (primary && !primary.querySelector(".tool-file-changes")) {
@@ -1626,7 +1707,7 @@ function finalizeToolCardError(segment, event) {
   }
   const detailWrap = el.querySelector(".inline-event-detail-wrap");
   if (detailWrap) {
-    detailWrap.classList.remove("hidden");
+    animateCollapse(detailWrap, true);
     const summaryBtn = el.querySelector(".inline-event-summary");
     if (summaryBtn) summaryBtn.setAttribute("aria-expanded", "true");
     el.setAttribute("data-expanded", "true");
@@ -1662,10 +1743,29 @@ function createThinkingBubble(step = null, options = {}) {
     </button>
     <div class="thinking-content"></div>
   `;
-  if (options.expanded === true) bubble.classList.add("expanded");
+  if (options.expanded === true) {
+    bubble.classList.add("expanded");
+    const initContent = bubble.querySelector(".thinking-content");
+    if (initContent) {
+      initContent.style.maxHeight = "240px";
+      initContent.style.opacity = "1";
+      initContent.classList.add("expanded");
+    }
+  }
 
   bubble.querySelector(".thinking-toggle").addEventListener("click", () => {
-    bubble.classList.toggle("expanded");
+    const isExpanded = bubble.classList.contains("expanded");
+    const contentEl = bubble.querySelector(".thinking-content");
+    if (isExpanded) {
+      bubble.classList.remove("expanded");
+      if (contentEl) animateCollapse(contentEl, false);
+    } else {
+      bubble.classList.add("expanded");
+      if (contentEl) {
+        animateCollapse(contentEl, true);
+        contentEl.style.maxHeight = "240px";
+      }
+    }
   });
   const content = bubble.querySelector(".thinking-content");
   if (content && options.content) content.textContent = String(options.content || "");
@@ -2939,19 +3039,11 @@ window.endocode.onEvent(async (event) => {
     agentPhaseHistoryLines = [];
     resetTurnActivity();
     removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
-    removeInlineEventByActivityId(AGENT_PHASE_ACTIVITY_ID);
-    removeInlineEventByActivityId(AGENT_NOTE_ACTIVITY_ID);
-    removeInlineEventByActivityId(LIVE_CHAT_ACTIVITY_ID);
+    clearLiveDetails();
     const rawInput = String(event.text || "").trim();
     const shortInput = rawInput.length > 240 ? `${rawInput.slice(0, 240)}...` : rawInput;
-    upsertInlineEvent(
-      AGENT_PHASE_ACTIVITY_ID,
-      "activity",
-      "Startuję zadanie",
-      shortInput || "Przygotowuję kontekst i pierwszy krok.",
-      { defaultExpanded: false, keepExpanded: false, moveToBottom: true },
-    );
-    showLive("Planowanie...", shortInput || "Przygotowanie kontekstu i kolejnych kroków.");
+    showMiniStatus("Startuję zadanie...");
+    pushLiveEntry("phase", "Startuję zadanie", shortInput || "Przygotowuję kontekst i pierwszy krok.");
     return;
   }
   if (event.type === "run-end") {
@@ -2960,22 +3052,22 @@ window.endocode.onEvent(async (event) => {
     currentThinkingSegment = null;
     lastAgentPhaseSignature = "";
     removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
-    removeInlineEventByActivityId(AGENT_PHASE_ACTIVITY_ID);
-    removeInlineEventByActivityId(AGENT_NOTE_ACTIVITY_ID);
-    removeInlineEventByActivityId(LIVE_CHAT_ACTIVITY_ID);
     if (!finalReceivedInRun && hasStreamingAssistantContent()) {
       finalizeStreamingAssistantMessage("", { overwriteText: false });
     }
     setBusy(false);
-    hideLive();
+    hideMiniStatus();
     currentThinkingBubble = null;
     updateContextInfo();
     return;
   }
   if (event.type === "note") {
     removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
-    upsertInlineEvent(AGENT_NOTE_ACTIVITY_ID, "note", "Notatka agenta", String(event.note || ""));
-    showLive("Plan", event.note);
+    const noteText = String(event.note || "").trim();
+    const shortNote = noteText.length > 80 ? noteText.slice(0, 80) + "..." : noteText;
+    addInlineEvent("note", shortNote || "Notatka", noteText.length > 80 ? noteText : "", "", { defaultExpanded: false });
+    showMiniStatus("Plan...");
+    pushLiveEntry("phase", "Notatka agenta", noteText);
     return;
   }
   if (event.type === "agent-phase") {
@@ -2988,19 +3080,17 @@ window.endocode.onEvent(async (event) => {
       const line = `${event.step ? `krok ${event.step}` : "teraz"} · ${phaseLabel}${detail ? ` · ${detail}` : ""}`;
       agentPhaseHistoryLines.push(line);
       if (agentPhaseHistoryLines.length > 10) agentPhaseHistoryLines = agentPhaseHistoryLines.slice(-10);
-      upsertInlineEvent(
-        AGENT_PHASE_ACTIVITY_ID,
-        "activity",
-        event.step ? `Krok ${event.step} · ${phaseLabel}` : phaseLabel,
-        agentPhaseHistoryLines.join("\n"),
-        { defaultExpanded: false, keepExpanded: false, moveToBottom: true },
-      );
-      showLive(event.step ? `Krok ${event.step}: ${phaseLabel}` : phaseLabel, detail || "Przetwarzanie");
+      // Only mini-status + live panel, no inline events in chat
+      const statusLabel = event.step ? `Krok ${event.step}: ${phaseLabel}` : phaseLabel;
+      showMiniStatus(statusLabel);
+      pushLiveEntry("phase", statusLabel, detail || "Przetwarzanie");
     }
     return;
   }
   if (event.type === "model-raw") {
-    // skip raw JSON in inline view for cleaner UX
+    // Push raw JSON to live details panel instead of skipping
+    const rawText = typeof event.raw === "string" ? event.raw : JSON.stringify(event.raw || event, null, 2);
+    pushLiveEntry("json", "Model JSON", rawText.slice(0, 5000));
     return;
   }
   if (event.type === "thinking-start") {
@@ -3060,7 +3150,7 @@ window.endocode.onEvent(async (event) => {
     if (event.plainChat) {
       removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
       updateStreamingAssistantMessage(event.text || "", full);
-      showLive(livePhrase, preview.slice(-500));
+      showMiniStatus(livePhrase);
       return;
     }
 
@@ -3069,12 +3159,12 @@ window.endocode.onEvent(async (event) => {
       if (liveFinal) {
         removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
         updateStreamingAssistantMessage("", liveFinal);
-        showLive("Pisze…", liveFinal.slice(-500));
+        showMiniStatus("Pisze…");
         return;
       }
     }
     const planningDetail = planningLine || (event.step ? `Krok ${event.step}` : "Pracuje nad akcją");
-    showLive(livePhrase, planningDetail);
+    showMiniStatus(livePhrase);
     return;
   }
 
@@ -3084,7 +3174,8 @@ window.endocode.onEvent(async (event) => {
     const durationEl = segment.el.querySelector(".inline-event-duration");
     if (durationEl) startLiveDuration(segment.key, segment.startedAtMs, durationEl);
     activeToolSegments.push(segment);
-    showLive(toolActionLabel(event.tool, event.args), toolActionDetail(event.tool, event.args, event.note || "") || shortPath(segment.path) || segment.path || "");
+    showMiniStatus(toolActionLabel(event.tool, event.args));
+    pushLiveEntry("tool", toolActionLabel(event.tool, event.args), toolActionDetail(event.tool, event.args, event.note || "") || shortPath(segment.path) || segment.path || "");
     return;
   }
   if (event.type === "tool-result") {
@@ -3097,10 +3188,12 @@ window.endocode.onEvent(async (event) => {
           defaultExpanded: true,
         });
       }
-      showLive(`Błąd: ${event.tool}`, event.error || "");
+      showMiniStatus(`Błąd: ${event.tool}`);
+      pushLiveEntry("error", `Błąd: ${event.tool}`, event.error || "");
     } else {
       finalizeToolCardSuccess(segment, event);
-      showLive(`Gotowe: ${event.tool}`, compactToolResultSummary(event.tool, event.result || {}));
+      showMiniStatus(`Gotowe: ${event.tool}`);
+      pushLiveEntry("tool", `Gotowe: ${event.tool}`, compactToolResultSummary(event.tool, event.result || {}));
     }
     return;
   }
@@ -3117,7 +3210,6 @@ window.endocode.onEvent(async (event) => {
   if (event.type === "final") {
     finalReceivedInRun = true;
     removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
-    removeInlineEventByActivityId(AGENT_PHASE_ACTIVITY_ID);
     if (hasStreamingAssistantContent()) {
       finalizeStreamingAssistantMessage(event.text || "");
     } else if (String(event.text || "").trim()) {
@@ -3131,7 +3223,7 @@ window.endocode.onEvent(async (event) => {
       });
     }
     activeRunStartedAtMs = null;
-    hideLive();
+    hideMiniStatus();
     saveChatSession(firstUserMessage);
   }
   if (event.type === "quick-choices") {
