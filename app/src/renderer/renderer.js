@@ -26,7 +26,6 @@ const composerWsName = document.getElementById("composerWsName");
 const composerAccess = document.getElementById("composerAccess");
 const miniStatus = document.getElementById("miniStatus");
 const miniStatusText = document.getElementById("miniStatusText");
-const miniStatusLiveBtn = document.getElementById("miniStatusLiveBtn");
 const liveDetailsPanel = document.getElementById("liveDetailsPanel");
 const liveDetailsBody = document.getElementById("liveDetailsBody");
 const liveDetailsClose = document.getElementById("liveDetailsClose");
@@ -497,10 +496,13 @@ function hideMiniStatus() {
 // ── Live Details Panel ──
 let liveDetailsPanelOpen = false;
 const LIVE_DETAILS_MAX_ENTRIES = 80;
+const LIVE_DRAFT_RENDER_INTERVAL_MS = 160;
 const liveEntryByKey = new Map();
+let pendingLiveDraft = null;
+let liveDraftTimer = null;
 
 function syncLivePanelButtons() {
-  const controls = [miniStatusLiveBtn, liveRailToggle].filter(Boolean);
+  const controls = [liveRailToggle].filter(Boolean);
   for (const control of controls) {
     control.classList.toggle("active", liveDetailsPanelOpen);
     control.setAttribute("aria-expanded", liveDetailsPanelOpen ? "true" : "false");
@@ -530,17 +532,41 @@ function clearLiveDetails() {
 }
 
 function renderLiveEntry(entry, kind, label, detail = "", options = {}) {
-  const safeLabel = escapeHtml(String(label || "").trim());
-  const safeDetail = escapeHtml(String(detail || "").trim()).slice(0, 5000);
-  const eventTime = formatClockFromIso(options.eventAt);
-  entry.className = `live-entry ${kind ? `live-entry--${kind}` : ""}${options.active ? " live-entry--active" : ""}`;
-  entry.innerHTML = `
-    <div class="live-entry-head">
-      <div class="live-entry-label">${safeLabel || "Akcja"}</div>
-      <time class="live-entry-time">${eventTime}</time>
-    </div>
-    ${safeDetail ? `<div class="live-entry-detail">${safeDetail}</div>` : ""}
-  `;
+  const className = `live-entry ${kind ? `live-entry--${kind}` : ""}${options.active ? " live-entry--active" : ""}`;
+  if (entry.className !== className) entry.className = className;
+  if (!entry.dataset.eventAt) entry.dataset.eventAt = options.eventAt || new Date().toISOString();
+
+  let head = entry.querySelector(".live-entry-head");
+  if (!head) {
+    head = document.createElement("div");
+    head.className = "live-entry-head";
+    const labelEl = document.createElement("div");
+    labelEl.className = "live-entry-label";
+    const timeEl = document.createElement("time");
+    timeEl.className = "live-entry-time";
+    head.append(labelEl, timeEl);
+    entry.appendChild(head);
+  }
+
+  const labelEl = head.querySelector(".live-entry-label");
+  const timeEl = head.querySelector(".live-entry-time");
+  const nextLabel = String(label || "").trim() || "Akcja";
+  const nextTime = formatClockFromIso(entry.dataset.eventAt);
+  if (labelEl && labelEl.textContent !== nextLabel) labelEl.textContent = nextLabel;
+  if (timeEl && timeEl.textContent !== nextTime) timeEl.textContent = nextTime;
+
+  const nextDetail = String(detail || "").trim().slice(0, 5000);
+  let detailEl = entry.querySelector(".live-entry-detail");
+  if (nextDetail) {
+    if (!detailEl) {
+      detailEl = document.createElement("div");
+      detailEl.className = "live-entry-detail";
+      entry.appendChild(detailEl);
+    }
+    if (detailEl.textContent !== nextDetail) detailEl.textContent = nextDetail;
+  } else if (detailEl) {
+    detailEl.remove();
+  }
 }
 
 function trimLiveEntries() {
@@ -552,6 +578,20 @@ function trimLiveEntries() {
   }
 }
 
+function isLiveDetailsNearBottom(threshold = 80) {
+  if (!liveDetailsBody) return true;
+  const distanceToBottom = liveDetailsBody.scrollHeight - liveDetailsBody.scrollTop - liveDetailsBody.clientHeight;
+  return distanceToBottom <= threshold;
+}
+
+function maybeScrollLiveDetails(force = false) {
+  if (!liveDetailsBody) return;
+  if (!force && !isLiveDetailsNearBottom()) return;
+  requestAnimationFrame(() => {
+    liveDetailsBody.scrollTop = liveDetailsBody.scrollHeight;
+  });
+}
+
 function pushLiveEntry(kind, label, detail = "", options = {}) {
   if (!liveDetailsBody) return;
   const empty = liveDetailsBody.querySelector(".live-details-empty");
@@ -559,16 +599,21 @@ function pushLiveEntry(kind, label, detail = "", options = {}) {
   const key = String(options.key || "").trim();
   if (key) {
     let keyedEntry = liveEntryByKey.get(key);
+    const wasNearBottom = isLiveDetailsNearBottom();
+    let created = false;
     if (!keyedEntry || !keyedEntry.isConnected) {
       keyedEntry = document.createElement("div");
       keyedEntry.dataset.liveKey = key;
       liveEntryByKey.set(key, keyedEntry);
       liveDetailsBody.appendChild(keyedEntry);
+      created = true;
     }
     renderLiveEntry(keyedEntry, kind, label, detail, options);
-    liveDetailsBody.appendChild(keyedEntry);
+    if (options.moveToBottom === true && liveDetailsBody.lastElementChild !== keyedEntry) {
+      liveDetailsBody.appendChild(keyedEntry);
+    }
     trimLiveEntries();
-    liveDetailsBody.scrollTop = liveDetailsBody.scrollHeight;
+    maybeScrollLiveDetails(created || wasNearBottom || options.forceScroll === true);
     return keyedEntry;
   }
 
@@ -580,15 +625,28 @@ function pushLiveEntry(kind, label, detail = "", options = {}) {
   renderLiveEntry(entry, kind, label, detail, options);
   liveDetailsBody.appendChild(entry);
   trimLiveEntries();
-  liveDetailsBody.scrollTop = liveDetailsBody.scrollHeight;
+  maybeScrollLiveDetails(true);
   return entry;
 }
 
 function updateLiveDraft(label, detail = "") {
-  pushLiveEntry("draft", label, detail, { key: "model-draft", active: true });
+  pendingLiveDraft = { label, detail };
+  if (liveDraftTimer) return;
+  liveDraftTimer = setTimeout(() => {
+    liveDraftTimer = null;
+    if (!pendingLiveDraft) return;
+    const next = pendingLiveDraft;
+    pendingLiveDraft = null;
+    pushLiveEntry("draft", next.label, next.detail, { key: "model-draft", active: true });
+  }, LIVE_DRAFT_RENDER_INTERVAL_MS);
 }
 
 function clearLiveDraft() {
+  pendingLiveDraft = null;
+  if (liveDraftTimer) {
+    clearTimeout(liveDraftTimer);
+    liveDraftTimer = null;
+  }
   const draft = liveEntryByKey.get("model-draft");
   if (draft?.isConnected) draft.remove();
   liveEntryByKey.delete("model-draft");
@@ -596,9 +654,6 @@ function clearLiveDraft() {
 
 if (liveDetailsClose) liveDetailsClose.addEventListener("click", closeLiveDetails);
 if (liveDetailsBackdrop) liveDetailsBackdrop.addEventListener("click", closeLiveDetails);
-if (miniStatusLiveBtn) miniStatusLiveBtn.addEventListener("click", () => {
-  if (liveDetailsPanelOpen) closeLiveDetails(); else openLiveDetails();
-});
 if (liveRailToggle) liveRailToggle.addEventListener("click", () => {
   if (liveDetailsPanelOpen) closeLiveDetails(); else openLiveDetails();
 });
@@ -836,6 +891,54 @@ function extractLiveAnswerFromDelta(fullText = "") {
     return out.trimStart();
   }
   return "";
+}
+
+function decodeJsonishString(value = "") {
+  const raw = String(value || "");
+  try {
+    return JSON.parse(`"${raw.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`);
+  } catch {
+    return raw
+      .replace(/\\n/g, "\n")
+      .replace(/\\t/g, "\t")
+      .replace(/\\"/g, '"')
+      .replace(/\\\\/g, "\\");
+  }
+}
+
+function extractQuotedJsonField(text = "", field = "") {
+  const re = new RegExp(`"${field}"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)`, "i");
+  const match = String(text || "").match(re);
+  return match?.[1] ? decodeJsonishString(match[1]) : "";
+}
+
+function compactModelDraftPreview(fullText = "", fallback = "") {
+  const text = String(fullText || "").trim();
+  if (!text) return String(fallback || "").trim();
+  const tool = extractQuotedJsonField(text, "tool");
+  const note = extractQuotedJsonField(text, "note");
+  const path = extractQuotedJsonField(text, "path") || extractQuotedJsonField(text, "url");
+  const mode = extractQuotedJsonField(text, "mode");
+  if (tool) {
+    return [
+      `akcja: ${tool}`,
+      path ? `cel: ${compactPath(path, 3) || shortenMiddle(path, 90)}` : "",
+      mode ? `tryb: ${mode}` : "",
+      note ? `notatka: ${shortenMiddle(note, 140)}` : "",
+    ].filter(Boolean).join("\n");
+  }
+
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const lastReadable = [...lines].reverse().find((line) => {
+    if (/^[{}\][,:"]+$/.test(line)) return false;
+    if (/^"(tool|args|content|replace|search|path|note)"\s*:/i.test(line)) return false;
+    return /[a-ząćęłńóśźż0-9]/i.test(line);
+  });
+  if (lastReadable && !/^\{/.test(lastReadable)) return shortenMiddle(lastReadable, 220);
+  return String(fallback || "Odbieram strukturę akcji...").trim();
 }
 
 function finalizeStreamingAssistantMessage(finalText = "", options = {}) {
@@ -1146,6 +1249,37 @@ function toolActionDetail(tool, args, note = "") {
   else if (tool === "patch_batch") parts.push("pakiet bloków SEARCH/REPLACE");
   else if (args && Object.keys(args).length) parts.push(compactJsonPreview(args));
   return parts.join("\n");
+}
+
+function toolResultDetailForLive(tool, result = {}, event = {}) {
+  if (!event?.ok) {
+    return `${event?.error || ""}${event?.recoveryHint ? `\nObejście: ${event.recoveryHint}` : ""}`.trim();
+  }
+  if (tool === "run_powershell") {
+    const stdout = String(result.stdout || "").trim();
+    const stderr = String(result.stderr || "").trim();
+    return [
+      result.cwd ? `[cwd] ${result.cwd}` : "",
+      Number.isFinite(Number(result.exitCode)) ? `[exit] ${result.exitCode}` : "",
+      stdout ? `[stdout]\n${stdout}` : "",
+      stderr ? `[stderr]\n${stderr}` : "",
+    ].filter(Boolean).join("\n\n") || "Brak danych wyjściowych.";
+  }
+  if (tool === "read_file") {
+    const content = String(result.content || "");
+    const stats = textStats(content);
+    return [
+      result.path ? `plik: ${result.path}` : "",
+      `${stats.lines} linii · ${formatBytes(stats.bytes)}`,
+      result.truncated ? "wynik skrócony" : "",
+      content ? `\n${content.slice(0, 5000)}` : "",
+    ].filter(Boolean).join("\n");
+  }
+  try {
+    return JSON.stringify(result || {}, null, 2).slice(0, 5000);
+  } catch {
+    return String(result || "").slice(0, 5000);
+  }
 }
 
 function toolActionLabel(tool, args) {
@@ -1510,8 +1644,7 @@ function appendJsonDetails(el, payload) {
 
 function createToolCardSegment(event) {
   const label = toolActionLabel(event.tool, event.args);
-  const detail = toolActionDetail(event.tool, event.args, event.note || "");
-  const el = addInlineEvent("tool", label, detail, "", {
+  const el = addInlineEvent("tool", label, "", "", {
     variant: "toolcard",
     primaryHtml: buildToolPrimaryHtml(event.tool, event.args || {}),
     eventAt: event.at,
@@ -1676,10 +1809,6 @@ function finalizeToolCardSuccess(segment, event) {
     if (primary) {
       primary.innerHTML = buildReadFileResultHtml(result);
     }
-    appendInlineEventExpandHtml(
-      el,
-      `<pre class="file-read-preview">${escapeHtml(String(result.content || ""))}</pre>`,
-    );
     if (detailEl) detailEl.textContent = "";
   } else if (tool === "run_powershell") {
     const exitCode = Number(result.exitCode);
@@ -1692,17 +1821,7 @@ function finalizeToolCardSuccess(segment, event) {
       const stdout = String(result.stdout || "").trim();
       const stderr = String(result.stderr || "").trim();
       primary.innerHTML = buildShellResultHtml({ ...result, stdout, stderr });
-      const snippet = [
-        result.cwd ? `[cwd] ${result.cwd}` : "",
-        stdout ? `[stdout]\n${stdout}` : "",
-        stderr ? `[stderr]\n${stderr}` : "",
-      ].filter(Boolean).join("\n\n");
-      appendInlineEventExpandHtml(
-        el,
-        `<pre class="tool-result-snippet">${escapeHtml(snippet || "Brak danych wyjściowych.")}</pre>`,
-      );
     }
-    appendJsonDetails(el, result);
     if (detailEl) detailEl.textContent = "";
   } else if (tool === "patch_edit" || tool === "write_file" || tool === "patch_batch" || tool === "download_file") {
     const labels = {
@@ -1743,7 +1862,6 @@ function finalizeToolCardSuccess(segment, event) {
     if (primary) {
       primary.innerHTML = buildGenericResultHtml(result);
     }
-    appendJsonDetails(el, result);
     if (detailEl) detailEl.textContent = "";
   }
 
@@ -1764,17 +1882,9 @@ function finalizeToolCardError(segment, event) {
   if (titleEl) titleEl.textContent = `Błąd: ${event.tool}`;
   const primary = el.querySelector(".inline-event-primary");
   if (primary) {
-    primary.innerHTML = buildResultCompactHtml("Błąd narzędzia", [buildToolChip(event.tool || "tool", "warn")], buildCodePreviewDetails("pokaż szczegóły", msg, 4000));
-  }
-  const detailWrap = el.querySelector(".inline-event-detail-wrap");
-  if (detailWrap) {
-    animateCollapse(detailWrap, true);
-    const summaryBtn = el.querySelector(".inline-event-summary");
-    if (summaryBtn) summaryBtn.setAttribute("aria-expanded", "true");
-    el.setAttribute("data-expanded", "true");
+    primary.innerHTML = buildResultCompactHtml("Błąd narzędzia", [buildToolChip(event.tool || "tool", "warn")], "");
   }
   const detailEl = el.querySelector(".inline-event-detail");
-  appendJsonDetails(el, { tool: event.tool, error: event.error, recoveryHint: event.recoveryHint });
   if (detailEl) detailEl.textContent = "";
   syncInlineEventPersistAttrs(el);
   return true;
@@ -1951,10 +2061,11 @@ async function switchToChat(chatId) {
       if (entry.type === "message") {
         addMessage(entry.role, entry.text);
       } else if (entry.type === "event") {
-        addInlineEvent(entry.kind, entry.title, entry.body || "", entry.extraHtml || "", {
+        const isToolcard = entry.variant === "toolcard";
+        addInlineEvent(entry.kind, entry.title, isToolcard ? "" : (entry.body || ""), isToolcard ? "" : (entry.extraHtml || ""), {
           variant: entry.variant || "",
           primaryHtml: entry.primaryHtml || "",
-          defaultExpanded: entry.techExpanded === true,
+          defaultExpanded: isToolcard ? false : entry.techExpanded === true,
         });
       } else if (entry.type === "thinking") {
         restoreThinkingBubble(entry);
@@ -2036,14 +2147,21 @@ async function saveChatSession(firstMessage = null) {
       const primaryEl = el.querySelector(".inline-event-primary");
       const primaryHtml = primaryEl ? primaryEl.innerHTML : "";
       const techWrap = el.querySelector(".inline-event-detail-wrap");
-      const techExpanded = Boolean(techWrap && !techWrap.classList.contains("hidden"));
       const variant = el.getAttribute("data-variant") || "";
+      const isToolcard = variant === "toolcard";
+      const techExpanded = Boolean(
+        !isToolcard
+        &&
+        techWrap
+        && techWrap.classList.contains("expanded")
+        && el.getAttribute("data-expanded") === "true",
+      );
       const payload = {
         type: "event",
         kind: el.getAttribute("data-kind") || "note",
         title: el.querySelector(".inline-event-title")?.textContent || el.getAttribute("data-title") || "",
-        body: el.querySelector(".inline-event-detail")?.textContent ?? el.getAttribute("data-body") ?? "",
-        extraHtml: extraFromDom,
+        body: isToolcard ? "" : (el.querySelector(".inline-event-detail")?.textContent ?? el.getAttribute("data-body") ?? ""),
+        extraHtml: isToolcard ? "" : extraFromDom,
       };
       if (primaryHtml) payload.primaryHtml = primaryHtml;
       if (techExpanded) payload.techExpanded = true;
@@ -3130,9 +3248,8 @@ window.endocode.onEvent(async (event) => {
   if (event.type === "note") {
     removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
     const noteText = String(event.note || "").trim();
-    const shortNote = noteText.length > 80 ? noteText.slice(0, 80) + "..." : noteText;
-    addInlineEvent("note", shortNote || "Notatka", noteText.length > 80 ? noteText : "", "", { defaultExpanded: false });
-    showMiniStatus("Plan...");
+    const shortNote = noteText.length > 90 ? `${noteText.slice(0, 90)}...` : noteText;
+    showMiniStatus(shortNote || "Plan...");
     pushLiveEntry("phase", "Notatka agenta", noteText, { eventAt: event.at });
     return;
   }
@@ -3165,7 +3282,7 @@ window.endocode.onEvent(async (event) => {
       return;
     }
     const startedAtMs = parseEventTimeMs(event);
-    currentThinkingBubble = createThinkingBubble(event.step, { expanded: true });
+    currentThinkingBubble = createThinkingBubble(event.step);
     const durationEl = currentThinkingBubble.querySelector(".thinking-duration");
     const segmentKey = `thinking-${event.step ?? "default"}-${event.id || Date.now()}`;
     if (durationEl) startLiveDuration(segmentKey, startedAtMs, durationEl);
@@ -3230,7 +3347,7 @@ window.endocode.onEvent(async (event) => {
         return;
       }
     }
-    const planningDetail = planningLine || (event.step ? `Krok ${event.step}` : "Pracuje nad akcją");
+    const planningDetail = compactModelDraftPreview(full, planningLine || (event.step ? `Krok ${event.step}` : "Pracuje nad akcją"));
     showMiniStatus(livePhrase);
     updateLiveDraft(event.step ? `Krok ${event.step}: model układa akcję` : "Model układa akcję", planningDetail.slice(0, 900));
     return;
@@ -3252,17 +3369,17 @@ window.endocode.onEvent(async (event) => {
     if (segment?.key) stopLiveDuration(segment.key, parseEventTimeMs(event));
     if (!event.ok) {
       if (!finalizeToolCardError(segment, event)) {
-        addInlineEvent("error", `Błąd: ${event.tool}`, `${event.error || ""}${event.recoveryHint ? `\nObejście: ${event.recoveryHint}` : ""}`, "", {
+        addInlineEvent("error", `Błąd: ${event.tool}`, "", "", {
           eventAt: event.at,
-          defaultExpanded: true,
+          defaultExpanded: false,
         });
       }
       showMiniStatus(`Błąd: ${event.tool}`);
-      pushLiveEntry("error", `Błąd: ${event.tool}`, event.error || "", { key: segment?.key || "", eventAt: event.at });
+      pushLiveEntry("error", `Błąd: ${event.tool}`, toolResultDetailForLive(event.tool, event.result || {}, event), { key: segment?.key || "", eventAt: event.at });
     } else {
       finalizeToolCardSuccess(segment, event);
       showMiniStatus(`Gotowe: ${event.tool}`);
-      pushLiveEntry("tool", `Gotowe: ${event.tool}`, compactToolResultSummary(event.tool, event.result || {}), { key: segment?.key || "", eventAt: event.at });
+      pushLiveEntry("tool", `Gotowe: ${event.tool}`, toolResultDetailForLive(event.tool, event.result || {}, event) || compactToolResultSummary(event.tool, event.result || {}), { key: segment?.key || "", eventAt: event.at });
     }
     return;
   }

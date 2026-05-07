@@ -1661,33 +1661,6 @@ details.diff-details[open] > summary.diff-summary.file-change-summary { padding:
   flex: 1;
 }
 
-.mini-status-live-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  background: rgba(155, 122, 214, 0.12);
-  border: 1px solid rgba(155, 122, 214, 0.2);
-  border-radius: 6px;
-  color: var(--accent);
-  width: 24px;
-  height: 22px;
-  padding: 0;
-  cursor: pointer;
-  flex-shrink: 0;
-  transition: all var(--transition);
-}
-.mini-status-live-btn:hover {
-  background: rgba(155, 122, 214, 0.22);
-  border-color: var(--accent);
-}
-.mini-status-live-btn svg {
-  opacity: 0.7;
-  transition: transform var(--transition);
-}
-.mini-status-live-btn.active svg {
-  transform: rotate(180deg);
-}
-
 /* ══════════════ LIVE DETAILS SIDEBAR ══════════════ */
 .live-rail-toggle {
   width: 24px;
@@ -2278,6 +2251,58 @@ details.diff-details[open] > summary.diff-summary.file-change-summary { padding:
 }
 .modal-btn.approve:hover { background: var(--accent-dim); }
 .modal-btn.reject { color: var(--text-secondary); }
+
+#approvalModal {
+  align-items: flex-end;
+  justify-content: center;
+  background: transparent;
+  backdrop-filter: none;
+  pointer-events: none;
+  padding: 0 18px 112px;
+  z-index: 95;
+}
+
+#approvalModal .approval-card {
+  pointer-events: auto;
+  width: min(var(--chat-content-w), calc(100vw - 36px));
+  max-height: min(42vh, 320px);
+  padding: 12px;
+  border-radius: 10px;
+  background: rgba(36, 36, 36, 0.98);
+  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.38);
+  animation: approvalDockIn 0.18s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+#approvalModal .modal-header {
+  margin-bottom: 8px;
+}
+
+#approvalModal .modal-title {
+  font-size: 13px;
+}
+
+#approvalModal .modal-cwd {
+  margin-bottom: 8px;
+  font-size: 10.5px;
+}
+
+#approvalModal .modal-command {
+  max-height: 92px;
+  padding: 9px 10px;
+  font-size: 12px;
+  order: 2;
+}
+
+#approvalModal .modal-actions-inline {
+  order: 3;
+  margin: 10px 0 0;
+  justify-content: flex-end;
+}
+
+@keyframes approvalDockIn {
+  from { opacity: 0; transform: translateY(10px) scale(0.99); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
 
 /* ══════════════ SETTINGS MODAL ══════════════ */
 .settings-card {
