@@ -8,6 +8,7 @@
       modelsInstalledList,
       modelsModal,
       modelsStatus,
+      modelsLocalSearch,
       modelRenderCacheLibrary,
       modelRenderCacheInstalled,
       escapeHtml,
@@ -16,6 +17,7 @@
     } = deps;
 
     let loadModelsInFlight = false;
+    let lastInstalledModels = [];
 
     function normalizeModelUiState(model) {
       const status = model.fileStatus || {};
@@ -100,14 +102,34 @@
   `;
     }
 
+    function filterModelsForTarget(models = [], targetEl = modelsList) {
+      if (targetEl !== modelsList || !modelsLocalSearch) return models;
+      const query = String(modelsLocalSearch.value || "").trim().toLowerCase();
+      if (!query) return models;
+      return models.filter((model) => {
+        const haystack = [
+          model.displayName,
+          model.id,
+          model.description,
+          model.author,
+          model.source,
+          model.sourceType,
+          model.kind,
+        ].map((value) => String(value || "").toLowerCase()).join(" ");
+        return haystack.includes(query);
+      });
+    }
+
     function renderModels(models = [], targetEl = modelsList, cacheMap = modelRenderCacheLibrary) {
       if (!targetEl) return;
-      if (!models.length) {
-        targetEl.innerHTML = `<div class="models-empty">Brak modeli w katalogu.</div>`;
+      const visibleModels = filterModelsForTarget(models, targetEl);
+      if (!visibleModels.length) {
+        const hasQuery = targetEl === modelsList && String(modelsLocalSearch?.value || "").trim();
+        targetEl.innerHTML = `<div class="models-empty">${hasQuery ? "Brak wyników dla wyszukiwania." : "Brak modeli w katalogu."}</div>`;
         cacheMap.clear();
         return;
       }
-      const normalized = models.map(normalizeModelUiState);
+      const normalized = visibleModels.map(normalizeModelUiState);
       const nextIds = new Set(normalized.map((model) => model.id));
       for (const [id] of cacheMap) {
         if (!nextIds.has(id)) cacheMap.delete(id);
@@ -170,6 +192,7 @@
       try {
         const models = await api.listModels();
         const installed = models.filter((model) => model.kind === "local-gguf" && model.fileStatus?.available);
+        lastInstalledModels = installed;
         renderModels(installed, modelsList, modelRenderCacheLibrary);
         renderModels(installed, modelsInstalledList, modelRenderCacheInstalled);
       } catch (e) {
@@ -182,6 +205,12 @@
 
     function setModelsStatus(text) {
       if (modelsStatus) modelsStatus.textContent = text;
+    }
+
+    if (modelsLocalSearch) {
+      modelsLocalSearch.addEventListener("input", () => {
+        renderModels(lastInstalledModels, modelsList, modelRenderCacheLibrary);
+      });
     }
 
     return {

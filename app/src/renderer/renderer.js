@@ -26,10 +26,12 @@ const composerWsName = document.getElementById("composerWsName");
 const composerAccess = document.getElementById("composerAccess");
 const miniStatus = document.getElementById("miniStatus");
 const miniStatusText = document.getElementById("miniStatusText");
+const miniStatusLiveBtn = document.getElementById("miniStatusLiveBtn");
 const liveDetailsPanel = document.getElementById("liveDetailsPanel");
 const liveDetailsBody = document.getElementById("liveDetailsBody");
 const liveDetailsClose = document.getElementById("liveDetailsClose");
 const liveDetailsBackdrop = document.getElementById("liveDetailsBackdrop");
+const liveRailToggle = document.getElementById("liveRailToggle");
 const quickChoicesDock = document.getElementById("quickChoicesDock");
 
 const attachBtn = document.getElementById("attachBtn");
@@ -51,6 +53,7 @@ const closeModels = document.getElementById("closeModels");
 const modelsList = document.getElementById("modelsList");
 const modelsInstalledList = document.getElementById("modelsInstalledList");
 const modelsStatus = document.getElementById("modelsStatus");
+const modelsLocalSearch = document.getElementById("modelsLocalSearch");
 const hfModelUrl = document.getElementById("hfModelUrl");
 const addHfModel = document.getElementById("addHfModel");
 const modelsLibraryStats = document.getElementById("modelsLibraryStats");
@@ -128,6 +131,7 @@ const modelsModule = window.EndoModules?.createModelsModule?.({
   modelsInstalledList,
   modelsModal,
   modelsStatus,
+  modelsLocalSearch,
   modelRenderCacheLibrary,
   modelRenderCacheInstalled,
   escapeHtml,
@@ -492,13 +496,24 @@ function hideMiniStatus() {
 
 // ── Live Details Panel ──
 let liveDetailsPanelOpen = false;
-const LIVE_DETAILS_MAX_ENTRIES = 60;
+const LIVE_DETAILS_MAX_ENTRIES = 80;
+const liveEntryByKey = new Map();
+
+function syncLivePanelButtons() {
+  const controls = [miniStatusLiveBtn, liveRailToggle].filter(Boolean);
+  for (const control of controls) {
+    control.classList.toggle("active", liveDetailsPanelOpen);
+    control.setAttribute("aria-expanded", liveDetailsPanelOpen ? "true" : "false");
+    control.title = liveDetailsPanelOpen ? "Ukryj akcje modelu" : "Pokaż akcje modelu";
+  }
+}
 
 function openLiveDetails() {
   if (liveDetailsPanelOpen) return;
   liveDetailsPanelOpen = true;
   if (liveDetailsPanel) liveDetailsPanel.classList.add("open");
   if (liveDetailsBackdrop) liveDetailsBackdrop.classList.add("visible");
+  syncLivePanelButtons();
 }
 
 function closeLiveDetails() {
@@ -506,39 +521,88 @@ function closeLiveDetails() {
   liveDetailsPanelOpen = false;
   if (liveDetailsPanel) liveDetailsPanel.classList.remove("open");
   if (liveDetailsBackdrop) liveDetailsBackdrop.classList.remove("visible");
+  syncLivePanelButtons();
 }
 
 function clearLiveDetails() {
+  liveEntryByKey.clear();
   if (liveDetailsBody) liveDetailsBody.innerHTML = '<div class="live-details-empty">Brak aktywnych akcji.</div>';
 }
 
-function pushLiveEntry(kind, label, detail = "") {
+function renderLiveEntry(entry, kind, label, detail = "", options = {}) {
+  const safeLabel = escapeHtml(String(label || "").trim());
+  const safeDetail = escapeHtml(String(detail || "").trim()).slice(0, 5000);
+  const eventTime = formatClockFromIso(options.eventAt);
+  entry.className = `live-entry ${kind ? `live-entry--${kind}` : ""}${options.active ? " live-entry--active" : ""}`;
+  entry.innerHTML = `
+    <div class="live-entry-head">
+      <div class="live-entry-label">${safeLabel || "Akcja"}</div>
+      <time class="live-entry-time">${eventTime}</time>
+    </div>
+    ${safeDetail ? `<div class="live-entry-detail">${safeDetail}</div>` : ""}
+  `;
+}
+
+function trimLiveEntries() {
+  if (!liveDetailsBody) return;
+  while (liveDetailsBody.children.length > LIVE_DETAILS_MAX_ENTRIES) {
+    const first = liveDetailsBody.firstElementChild;
+    if (first?.dataset?.liveKey) liveEntryByKey.delete(first.dataset.liveKey);
+    liveDetailsBody.removeChild(first);
+  }
+}
+
+function pushLiveEntry(kind, label, detail = "", options = {}) {
   if (!liveDetailsBody) return;
   const empty = liveDetailsBody.querySelector(".live-details-empty");
   if (empty) empty.remove();
-  const safeLabel = escapeHtml(String(label || "").trim());
-  const safeDetail = escapeHtml(String(detail || "").trim()).slice(0, 3000);
-  const kindClass = kind ? `live-entry--${kind}` : "";
-  const entry = document.createElement("div");
-  entry.className = `live-entry ${kindClass}`;
-  entry.innerHTML = `
-    <div class="live-entry-label">${safeLabel}</div>
-    ${safeDetail ? `<div class="live-entry-detail">${safeDetail}</div>` : ""}
-  `;
-  liveDetailsBody.appendChild(entry);
-  // Limit entries
-  while (liveDetailsBody.children.length > LIVE_DETAILS_MAX_ENTRIES) {
-    liveDetailsBody.removeChild(liveDetailsBody.firstElementChild);
+  const key = String(options.key || "").trim();
+  if (key) {
+    let keyedEntry = liveEntryByKey.get(key);
+    if (!keyedEntry || !keyedEntry.isConnected) {
+      keyedEntry = document.createElement("div");
+      keyedEntry.dataset.liveKey = key;
+      liveEntryByKey.set(key, keyedEntry);
+      liveDetailsBody.appendChild(keyedEntry);
+    }
+    renderLiveEntry(keyedEntry, kind, label, detail, options);
+    liveDetailsBody.appendChild(keyedEntry);
+    trimLiveEntries();
+    liveDetailsBody.scrollTop = liveDetailsBody.scrollHeight;
+    return keyedEntry;
   }
+
+  const signature = `${kind}|${String(label || "").trim()}|${String(detail || "").trim()}`;
+  const last = liveDetailsBody.lastElementChild;
+  if (last?.dataset?.signature === signature) return last;
+  const entry = document.createElement("div");
+  entry.dataset.signature = signature;
+  renderLiveEntry(entry, kind, label, detail, options);
+  liveDetailsBody.appendChild(entry);
+  trimLiveEntries();
   liveDetailsBody.scrollTop = liveDetailsBody.scrollHeight;
+  return entry;
+}
+
+function updateLiveDraft(label, detail = "") {
+  pushLiveEntry("draft", label, detail, { key: "model-draft", active: true });
+}
+
+function clearLiveDraft() {
+  const draft = liveEntryByKey.get("model-draft");
+  if (draft?.isConnected) draft.remove();
+  liveEntryByKey.delete("model-draft");
 }
 
 if (liveDetailsClose) liveDetailsClose.addEventListener("click", closeLiveDetails);
 if (liveDetailsBackdrop) liveDetailsBackdrop.addEventListener("click", closeLiveDetails);
-const miniStatusLiveBtn = document.getElementById("miniStatusLiveBtn");
 if (miniStatusLiveBtn) miniStatusLiveBtn.addEventListener("click", () => {
   if (liveDetailsPanelOpen) closeLiveDetails(); else openLiveDetails();
 });
+if (liveRailToggle) liveRailToggle.addEventListener("click", () => {
+  if (liveDetailsPanelOpen) closeLiveDetails(); else openLiveDetails();
+});
+syncLivePanelButtons();
 
 // Compat wrappers — showLive/hideLive now update mini-status + push to live panel
 let _lastLiveLabel = "";
@@ -551,7 +615,7 @@ function showLive(label, detail = "") {
   if (_liveDebounce) clearTimeout(_liveDebounce);
   _liveDebounce = setTimeout(() => {
     _liveDebounce = null;
-    pushLiveEntry("phase", label, detail);
+    pushLiveEntry("phase", label, detail, { key: "status-current", active: true });
   }, 400);
 }
 
@@ -843,6 +907,7 @@ function addInlineEvent(kind, title, body = "", extraHtml = "", options = {}) {
     ? `<span class="inline-event-duration">${escapeHtml(options.duration || "00:00")}</span>`
     : "";
   const hasDetail = Boolean(normalizedBody || normalizedExtraHtml);
+  if (hasDetail) div.classList.add("inline-event--has-detail");
   const detailId = `inline-event-detail-${crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36)}`;
   const expandLabel = isToolcard && hasDetail ? "Szczegóły techniczne" : "szczegóły";
   const expandToggle = hasDetail ? `<span class="inline-event-expand-toggle">${expandLabel}</span>` : "";
@@ -1024,6 +1089,7 @@ function upsertInlineEvent(activityId, kind, title, body = "", options = {}) {
       summaryBtn.disabled = !hasDetailsNow && !hadDetailsBefore;
       summaryBtn.classList.toggle("no-detail", summaryBtn.disabled);
     }
+    el.classList.toggle("inline-event--has-detail", hasDetailsNow || hadDetailsBefore);
     if (keepExpanded) {
       const detailWrap = el.querySelector(".inline-event-detail-wrap");
       if (detailWrap) animateCollapse(detailWrap, true);
@@ -1426,6 +1492,12 @@ function appendInlineEventExpandHtml(el, html = "") {
   const expand = ensureInlineEventExpand(el);
   if (!expand || !String(html || "").trim()) return;
   expand.insertAdjacentHTML("beforeend", html);
+  el.classList.add("inline-event--has-detail");
+  const summaryBtn = el.querySelector(".inline-event-summary");
+  if (summaryBtn) {
+    summaryBtn.disabled = false;
+    summaryBtn.classList.remove("no-detail");
+  }
   syncInlineEventPersistAttrs(el);
 }
 
@@ -1454,17 +1526,6 @@ function createToolCardSegment(event) {
     startedAtMs: parseEventTimeMs(event),
     el,
   };
-  // Add "Szczegóły" button to open live details panel
-  const detailsBtn = document.createElement("button");
-  detailsBtn.className = "live-details-btn";
-  detailsBtn.type = "button";
-  detailsBtn.textContent = "Szczegóły";
-  detailsBtn.addEventListener("click", (e) => {
-    e.stopPropagation();
-    openLiveDetails();
-  });
-  const body = el.querySelector(".inline-event-body");
-  if (body) body.appendChild(detailsBtn);
   return segment;
 }
 
@@ -1650,12 +1711,13 @@ function finalizeToolCardSuccess(segment, event) {
       patch_batch: "Zastosowano paczkę patchy",
       download_file: "Pobrano plik",
     };
+    el.classList.add("inline-event--file-action");
     if (titleEl) {
       if (tool === "patch_batch" && Number.isFinite(Number(result.appliedCount))) {
         titleEl.textContent = `${labels.patch_batch} · ${result.appliedCount} plik(ów)`;
       } else {
         const pathHint = result.path || (Array.isArray(result.applied) && result.applied[0]?.path) || segment.path || "";
-        titleEl.textContent = `${labels[tool] || "Gotowe"}: ${compactPath(pathHint, 2)}`;
+        titleEl.textContent = pathHint ? `${labels[tool] || "Gotowe"}: ${compactPath(pathHint, 2)}` : (labels[tool] || "Gotowe");
       }
     }
     if (primary && !primary.querySelector(".tool-file-changes")) {
@@ -1675,7 +1737,6 @@ function finalizeToolCardSuccess(segment, event) {
         if (bucket) bucket.appendChild(blockWrap);
       }
     }
-    appendJsonDetails(el, result);
     if (detailEl) detailEl.textContent = "";
   } else {
     if (titleEl) titleEl.textContent = `Gotowe: ${tool}`;
@@ -3043,7 +3104,7 @@ window.endocode.onEvent(async (event) => {
     const rawInput = String(event.text || "").trim();
     const shortInput = rawInput.length > 240 ? `${rawInput.slice(0, 240)}...` : rawInput;
     showMiniStatus("Startuję zadanie...");
-    pushLiveEntry("phase", "Startuję zadanie", shortInput || "Przygotowuję kontekst i pierwszy krok.");
+    pushLiveEntry("phase", "Startuję zadanie", shortInput || "Przygotowuję kontekst i pierwszy krok.", { active: true, eventAt: event.at });
     return;
   }
   if (event.type === "run-end") {
@@ -3052,12 +3113,17 @@ window.endocode.onEvent(async (event) => {
     currentThinkingSegment = null;
     lastAgentPhaseSignature = "";
     removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
+    clearLiveDraft();
+    if (Number.isFinite(activeRunStartedAtMs)) {
+      pushLiveEntry("phase", "Zadanie zakończone", `Czas: ${formatDurationMmSs(Date.now() - activeRunStartedAtMs)}`, { key: "status-current", eventAt: event.at });
+    }
     if (!finalReceivedInRun && hasStreamingAssistantContent()) {
       finalizeStreamingAssistantMessage("", { overwriteText: false });
     }
     setBusy(false);
     hideMiniStatus();
     currentThinkingBubble = null;
+    activeRunStartedAtMs = null;
     updateContextInfo();
     return;
   }
@@ -3067,7 +3133,7 @@ window.endocode.onEvent(async (event) => {
     const shortNote = noteText.length > 80 ? noteText.slice(0, 80) + "..." : noteText;
     addInlineEvent("note", shortNote || "Notatka", noteText.length > 80 ? noteText : "", "", { defaultExpanded: false });
     showMiniStatus("Plan...");
-    pushLiveEntry("phase", "Notatka agenta", noteText);
+    pushLiveEntry("phase", "Notatka agenta", noteText, { eventAt: event.at });
     return;
   }
   if (event.type === "agent-phase") {
@@ -3083,7 +3149,7 @@ window.endocode.onEvent(async (event) => {
       // Only mini-status + live panel, no inline events in chat
       const statusLabel = event.step ? `Krok ${event.step}: ${phaseLabel}` : phaseLabel;
       showMiniStatus(statusLabel);
-      pushLiveEntry("phase", statusLabel, detail || "Przetwarzanie");
+      pushLiveEntry("phase", statusLabel, detail || "Przetwarzanie", { key: `phase-${event.step || "now"}`, active: true, eventAt: event.at });
     }
     return;
   }
@@ -3099,7 +3165,7 @@ window.endocode.onEvent(async (event) => {
       return;
     }
     const startedAtMs = parseEventTimeMs(event);
-    currentThinkingBubble = createThinkingBubble(event.step);
+    currentThinkingBubble = createThinkingBubble(event.step, { expanded: true });
     const durationEl = currentThinkingBubble.querySelector(".thinking-duration");
     const segmentKey = `thinking-${event.step ?? "default"}-${event.id || Date.now()}`;
     if (durationEl) startLiveDuration(segmentKey, startedAtMs, durationEl);
@@ -3149,6 +3215,7 @@ window.endocode.onEvent(async (event) => {
 
     if (event.plainChat) {
       removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
+      clearLiveDraft();
       updateStreamingAssistantMessage(event.text || "", full);
       showMiniStatus(livePhrase);
       return;
@@ -3165,17 +3232,19 @@ window.endocode.onEvent(async (event) => {
     }
     const planningDetail = planningLine || (event.step ? `Krok ${event.step}` : "Pracuje nad akcją");
     showMiniStatus(livePhrase);
+    updateLiveDraft(event.step ? `Krok ${event.step}: model układa akcję` : "Model układa akcję", planningDetail.slice(0, 900));
     return;
   }
 
   if (event.type === "tool-start") {
     removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
+    clearLiveDraft();
     const segment = createToolCardSegment(event);
     const durationEl = segment.el.querySelector(".inline-event-duration");
     if (durationEl) startLiveDuration(segment.key, segment.startedAtMs, durationEl);
     activeToolSegments.push(segment);
     showMiniStatus(toolActionLabel(event.tool, event.args));
-    pushLiveEntry("tool", toolActionLabel(event.tool, event.args), toolActionDetail(event.tool, event.args, event.note || "") || shortPath(segment.path) || segment.path || "");
+    pushLiveEntry("tool", toolActionLabel(event.tool, event.args), toolActionDetail(event.tool, event.args, event.note || "") || shortPath(segment.path) || segment.path || "", { key: segment.key, active: true, eventAt: event.at });
     return;
   }
   if (event.type === "tool-result") {
@@ -3189,11 +3258,11 @@ window.endocode.onEvent(async (event) => {
         });
       }
       showMiniStatus(`Błąd: ${event.tool}`);
-      pushLiveEntry("error", `Błąd: ${event.tool}`, event.error || "");
+      pushLiveEntry("error", `Błąd: ${event.tool}`, event.error || "", { key: segment?.key || "", eventAt: event.at });
     } else {
       finalizeToolCardSuccess(segment, event);
       showMiniStatus(`Gotowe: ${event.tool}`);
-      pushLiveEntry("tool", `Gotowe: ${event.tool}`, compactToolResultSummary(event.tool, event.result || {}));
+      pushLiveEntry("tool", `Gotowe: ${event.tool}`, compactToolResultSummary(event.tool, event.result || {}), { key: segment?.key || "", eventAt: event.at });
     }
     return;
   }
@@ -3210,6 +3279,7 @@ window.endocode.onEvent(async (event) => {
   if (event.type === "final") {
     finalReceivedInRun = true;
     removeInlineEventByActivityId(MODEL_WRITING_ACTIVITY_ID);
+    clearLiveDraft();
     if (hasStreamingAssistantContent()) {
       finalizeStreamingAssistantMessage(event.text || "");
     } else if (String(event.text || "").trim()) {
@@ -3221,6 +3291,9 @@ window.endocode.onEvent(async (event) => {
         eventAt: event.at,
         defaultExpanded: false,
       });
+    }
+    if (Number.isFinite(activeRunStartedAtMs)) {
+      pushLiveEntry("phase", "Odpowiedź gotowa", `Czas: ${formatDurationMmSs(Date.now() - activeRunStartedAtMs)}`, { key: "status-current", eventAt: event.at });
     }
     activeRunStartedAtMs = null;
     hideMiniStatus();

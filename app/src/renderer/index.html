@@ -181,9 +181,8 @@
         <div class="mini-status hidden" id="miniStatus">
           <span class="mini-status-dot"></span>
           <span class="mini-status-text" id="miniStatusText"></span>
-          <button class="mini-status-live-btn" id="miniStatusLiveBtn" type="button" title="Pokaż szczegóły live">
-            <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M2 4h12M2 8h8M2 12h10" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
-            Live
+          <button class="mini-status-live-btn" id="miniStatusLiveBtn" type="button" title="Pokaż szczegóły akcji" aria-label="Pokaż szczegóły akcji" aria-expanded="false" aria-controls="liveDetailsPanel">
+            <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M6 3l5 5-5 5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </button>
         </div>
         <div class="quick-choices-dock hidden" id="quickChoicesDock"></div>
@@ -244,10 +243,16 @@
       </div>
         </div> <!-- end chat-column -->
 
+        <button class="live-rail-toggle" id="liveRailToggle" type="button" title="Pokaż akcje modelu" aria-label="Pokaż akcje modelu" aria-expanded="false" aria-controls="liveDetailsPanel">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+            <path d="M6 3l5 5-5 5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
+
         <!-- ── LIVE DETAILS SIDEBAR ── -->
         <aside class="live-details-panel" id="liveDetailsPanel">
           <div class="live-details-header">
-            <span class="live-details-title">Szczegóły Live</span>
+            <span class="live-details-title">Akcje modelu</span>
             <button class="live-details-close" id="liveDetailsClose" title="Zamknij">&times;</button>
           </div>
           <div class="live-details-body" id="liveDetailsBody">
@@ -304,6 +309,7 @@
       <div id="modelsLibraryView">
         <div class="models-toolbar">
           <div class="models-import-group">
+            <input type="search" id="modelsLocalSearch" placeholder="Szukaj w bibliotece..." autocomplete="off" />
             <input type="text" id="hfModelUrl" placeholder="Wklej link .gguf z HF, ModelScope, GitHub lub direct..." />
             <button class="modal-btn approve" id="addHfModel">Dodaj</button>
           </div>
