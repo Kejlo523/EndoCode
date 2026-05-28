@@ -13,9 +13,9 @@ function createAgentPlanner(options = {}) {
     actionCounts.clear();
   }
 
-  async function plan(signal, step, failedModelIds) {
+  async function plan(signal, step, failedModelIds, context = {}) {
     const { action, reasoning } = await nextAction(signal, failedModelIds, step);
-    const signature = typeof signatureForAction === "function" ? signatureForAction(action) : JSON.stringify(action || {});
+    const signature = typeof signatureForAction === "function" ? signatureForAction(action, context) : JSON.stringify(action || {});
     const count = actionCounts.get(signature) || 0;
     const repeatLimit = typeof getRepeatLimit === "function" ? getRepeatLimit(action) : 2;
     const repeated = count >= repeatLimit;

@@ -14,6 +14,8 @@ EndoCode to desktopowa aplikacja Electron do pracy z lokalnym agentem kodującym
 - Chat i tryb agentowy (planowanie -> narzedzia -> final)
 - Praca na plikach: odczyt, zapis, patchowanie, diff i historia undo/redo
 - Integracja z lokalnym runtime (`llama-server`)
+- Integracje modeli przez API: OpenAI, Claude, OpenRouter i DeepSeek
+- Jawne przełączniki pamięci: ogólna pamięć robocza i lekki kontekst między czatami
 - Zarzadzanie modelami GGUF (biblioteka, pobieranie, anulowanie pobierania)
 - Konfiguracja parametrow modelu z poziomu UI
 

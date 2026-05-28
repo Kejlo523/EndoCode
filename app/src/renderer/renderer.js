@@ -16,6 +16,9 @@ const promptQueueList = document.getElementById("promptQueueList");
 const promptQueueCount = document.getElementById("promptQueueCount");
 const modelSelect = document.getElementById("modelSelect");
 const reasoningSelect = document.getElementById("reasoningSelect");
+const generalMemoryToggle = document.getElementById("generalMemoryToggle");
+const crossChatMemoryToggle = document.getElementById("crossChatMemoryToggle");
+const memoryControls = document.getElementById("memoryControls");
 const accessToggle = document.getElementById("accessToggle");
 const accessLabel = document.getElementById("accessLabel");
 const workspaceLabel = document.getElementById("workspaceLabel");
@@ -101,6 +104,11 @@ let chatSessions = [];
 let activeChatId = null;
 let runtimeInstallInProgress = false;
 let currentSettingsModelId = null;
+let currentMemorySettings = {
+  generalMemoryEnabled: true,
+  crossChatMemoryEnabled: false,
+  crossChatMemoryActive: false,
+};
 let refreshStateInFlight = false;
 let updateSystemInFlight = false;
 let streamingAssistantMessage = null;
@@ -144,6 +152,7 @@ const API_PROVIDER_LABELS = {
   openai: "OpenAI",
   claude: "Claude",
   openrouter: "OpenRouter",
+  deepseek: "DeepSeek",
 };
 
 // ── Helpers ──
@@ -326,6 +335,8 @@ function setBusy(nextBusy) {
   sendBtn.disabled = false;
   modelSelect.disabled = nextBusy;
   reasoningSelect.disabled = nextBusy;
+  if (generalMemoryToggle) generalMemoryToggle.disabled = nextBusy;
+  if (crossChatMemoryToggle) crossChatMemoryToggle.disabled = nextBusy;
   if (sendBtn) {
     sendBtn.classList.toggle("run-stop", nextBusy);
     sendBtn.title = nextBusy ? "Zatrzymaj (Enter)" : "Wyślij (Enter)";
@@ -707,6 +718,46 @@ function updateWelcome() {
   if (welcome) {
     welcome.style.display = hasMessages ? "none" : "";
   }
+  renderWelcomeMemoryStatus();
+}
+
+function normalizeMemorySettingsForUi(settings = {}) {
+  return {
+    generalMemoryEnabled: settings.generalMemoryEnabled !== false,
+    crossChatMemoryEnabled: Boolean(settings.crossChatMemoryEnabled),
+    crossChatMemoryActive: Boolean(settings.crossChatMemoryActive),
+  };
+}
+
+function memoryStateText(enabled) {
+  return enabled ? "włączona" : "wyłączona";
+}
+
+function renderWelcomeMemoryStatus() {
+  const strip = document.getElementById("welcomeMemoryStrip");
+  if (!strip) return;
+  const general = currentMemorySettings.generalMemoryEnabled;
+  const cross = currentMemorySettings.crossChatMemoryEnabled;
+  const crossActive = currentMemorySettings.crossChatMemoryActive;
+  strip.innerHTML = `
+    <span class="welcome-memory-label">Pamięć nowego czatu</span>
+    <span class="welcome-memory-pill ${general ? "on" : "off"}">Ogólna: ${memoryStateText(general)}</span>
+    <span class="welcome-memory-pill ${cross ? "on" : "off"}">Między czatami: ${memoryStateText(cross)}${cross && crossActive ? " • aktywna" : ""}</span>
+  `;
+}
+
+function applyMemorySettingsToUi(settings = {}) {
+  currentMemorySettings = normalizeMemorySettingsForUi(settings);
+  if (generalMemoryToggle) generalMemoryToggle.checked = currentMemorySettings.generalMemoryEnabled;
+  if (crossChatMemoryToggle) crossChatMemoryToggle.checked = currentMemorySettings.crossChatMemoryEnabled;
+  if (memoryControls) {
+    memoryControls.classList.toggle("memory-controls-off", !currentMemorySettings.generalMemoryEnabled && !currentMemorySettings.crossChatMemoryEnabled);
+    memoryControls.title = [
+      `Pamięć ogólna: ${memoryStateText(currentMemorySettings.generalMemoryEnabled)}`,
+      `Pamięć między czatami: ${memoryStateText(currentMemorySettings.crossChatMemoryEnabled)}`,
+    ].join(" · ");
+  }
+  renderWelcomeMemoryStatus();
 }
 
 function isConversationNearBottom(threshold = 140) {
@@ -1476,6 +1527,12 @@ function toggleDiffDetails(details, expand = true) {
 }
 
 /** DOM diff block: stats in summary, hunks scrollable, collapsed by default. */
+function renderDiffSummaryHtml(summaryHtml, added, removed) {
+  return String(summaryHtml || "")
+    .replaceAll("{{added}}", String(added))
+    .replaceAll("{{removed}}", String(removed));
+}
+
 function buildDiffDetailsElement(diff, options = {}) {
   const details = document.createElement("details");
   details.className = "diff-details";
@@ -1485,16 +1542,14 @@ function buildDiffDetailsElement(diff, options = {}) {
   summary.className = String(options.summaryClass || "diff-summary");
   const { hunks, added, removed } = collectDiffHunks(diff);
   if (hunks.length === 0) {
-    if (options.summaryHtml) summary.innerHTML = String(options.summaryHtml);
+    if (options.summaryHtml) summary.innerHTML = renderDiffSummaryHtml(options.summaryHtml, added, removed);
     else summary.textContent = "Brak zmian w diffie";
     details.appendChild(summary);
     return details;
   }
   const language = options.language || languageFromPath(options.path || "");
   if (options.summaryHtml) {
-    summary.innerHTML = String(options.summaryHtml)
-      .replaceAll("{{added}}", String(added))
-      .replaceAll("{{removed}}", String(removed));
+    summary.innerHTML = renderDiffSummaryHtml(options.summaryHtml, added, removed);
   } else {
     summary.innerHTML = `<span class="diff-stat-plus">+${added}</span> <span class="diff-stat-minus">−${removed}</span><span class="diff-toggle-hint">podgląd zmian</span>`;
   }
@@ -2208,6 +2263,7 @@ async function switchToChat(chatId) {
       await refreshState();
     }
     await window.endocode.loadChatContext(chatId);
+    await refreshState();
     chatTitle.textContent = session.title || "Czat";
     firstUserMessage = session.title || null;
     // Replay all stored entries
@@ -2243,7 +2299,8 @@ async function switchToChat(chatId) {
 }
 
 async function startNewChat() {
-  await window.endocode.resetChat();
+  const state = await window.endocode.resetChat({ includeCrossChatMemory: true });
+  if (state) applyStateToUi(state);
   const newId = generateId();
   activeChatId = newId;
   firstUserMessage = null;
@@ -2259,6 +2316,7 @@ async function startNewChat() {
   ws.className = "welcome-screen";
   ws.id = "welcomeScreen";
   ws.innerHTML = `
+    <div class="welcome-memory-strip" id="welcomeMemoryStrip"></div>
     <div class="welcome-icon">
       <img src="../assets/icon.svg" alt="" width="56" height="56" />
     </div>
@@ -2266,6 +2324,7 @@ async function startNewChat() {
     <p class="welcome-sub">Opisz zadanie — EndoCode przeczyta pliki, zaproponuje zmiany i uruchomi komendy.</p>
   `;
   conversation.appendChild(ws);
+  renderWelcomeMemoryStatus();
   currentThinkingBubble = null;
   renderChatHistory();
 }
@@ -2471,6 +2530,7 @@ function applyStateToUi(state) {
   }
   renderModelSelect(state);
   renderReasoningSelect(state);
+  applyMemorySettingsToUi(state.memorySettings || {});
   updateAccessUI(state.accessLevel || "sandbox");
 }
 
@@ -2929,6 +2989,37 @@ accessToggle.addEventListener("click", async () => {
     addInlineEvent("error", "Błąd dostępu", e.message || String(e));
   }
 });
+
+async function updateMemorySettingsFromToggle(patch) {
+  if (appBusy) {
+    applyMemorySettingsToUi(currentMemorySettings);
+    return;
+  }
+  if (generalMemoryToggle) generalMemoryToggle.disabled = true;
+  if (crossChatMemoryToggle) crossChatMemoryToggle.disabled = true;
+  try {
+    const state = await window.endocode.updateMemorySettings(patch);
+    applyStateToUi(state);
+  } catch (e) {
+    addInlineEvent("error", "Pamięć", e.message || String(e));
+    await refreshState();
+  } finally {
+    if (generalMemoryToggle) generalMemoryToggle.disabled = false;
+    if (crossChatMemoryToggle) crossChatMemoryToggle.disabled = false;
+  }
+}
+
+if (generalMemoryToggle) {
+  generalMemoryToggle.addEventListener("change", () => {
+    void updateMemorySettingsFromToggle({ generalMemoryEnabled: generalMemoryToggle.checked });
+  });
+}
+
+if (crossChatMemoryToggle) {
+  crossChatMemoryToggle.addEventListener("change", () => {
+    void updateMemorySettingsFromToggle({ crossChatMemoryEnabled: crossChatMemoryToggle.checked });
+  });
+}
 
 modelSelect.addEventListener("change", async () => {
   setBusy(true);

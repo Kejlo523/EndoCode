@@ -115,6 +115,19 @@
       <header class="topbar">
         <div class="topbar-left">
           <h1 class="chat-title" id="chatTitle">Nowy czat</h1>
+          <div class="memory-controls" id="memoryControls" aria-label="Ustawienia pamięci">
+            <span class="memory-controls-label">Pamięć</span>
+            <label class="memory-switch" title="Pamięć robocza agenta w bieżącej pracy">
+              <input type="checkbox" id="generalMemoryToggle" />
+              <span class="memory-switch-track"></span>
+              <span class="memory-switch-text">Ogólna</span>
+            </label>
+            <label class="memory-switch" title="Lekki kontekst z poprzednich czatów dla nowego czatu">
+              <input type="checkbox" id="crossChatMemoryToggle" />
+              <span class="memory-switch-track"></span>
+              <span class="memory-switch-text">Czaty</span>
+            </label>
+          </div>
         </div>
         <div class="topbar-controls">
           <div class="control-pill">
@@ -167,6 +180,7 @@
         <div class="conversation-scroll" id="conversation">
           <!-- Welcome screen shown when empty -->
           <div class="welcome-screen" id="welcomeScreen">
+            <div class="welcome-memory-strip" id="welcomeMemoryStrip"></div>
             <div class="welcome-icon">
               <img src="../assets/icon.svg" alt="" width="56" height="56" />
             </div>

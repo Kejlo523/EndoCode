@@ -4,6 +4,7 @@ function createToolExecutor(options = {}) {
     onToolResult = () => {},
     onSourceUrl = () => {},
     validateAction = null,
+    getRecoveryHint = null,
   } = options;
 
   if (typeof executeTool !== "function") throw new Error("createToolExecutor requires executeTool");
@@ -18,6 +19,7 @@ function createToolExecutor(options = {}) {
             ok: false,
             error: checked?.error || "Action validation failed before execution.",
             errorCode: checked?.errorCode || "executor_validation_failed",
+            recoveryHint: typeof getRecoveryHint === "function" ? getRecoveryHint(new Error(checked?.error || "Action validation failed before execution."), action) : "",
           };
           onToolResult(payload);
           return payload;
@@ -32,7 +34,12 @@ function createToolExecutor(options = {}) {
       }
       return { ok: true, result };
     } catch (error) {
-      const payload = { tool: action?.tool, ok: false, error: error?.message || String(error) };
+      const payload = {
+        tool: action?.tool,
+        ok: false,
+        error: error?.message || String(error),
+        recoveryHint: typeof getRecoveryHint === "function" ? getRecoveryHint(error, action) : "",
+      };
       onToolResult(payload);
       return payload;
     }

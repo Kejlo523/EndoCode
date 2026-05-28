@@ -29,7 +29,7 @@ const { createSessionMemory } = require("./main/agent/session-memory");
 const { createAgentPlanner } = require("./main/agent/agent-planner");
 const { createToolExecutor } = require("./main/agent/tool-executor");
 const { createTurnOrchestrator } = require("./main/agent/turn-orchestrator");
-const { classifyIntent, validateAction, buildMachineRepairPrompt } = require("./main/agent/action-validator");
+const { classifyIntent, validateAction, buildMachineRepairPrompt, looksLikeFilePath, looksLikePlaceholderPath } = require("./main/agent/action-validator");
 const { registerAgentIpcHandlers } = require("./main/agent/ipc-compat");
 
 const DEFAULT_PORT = 8088;
@@ -38,6 +38,9 @@ const FILE_HISTORY_SNAPSHOT_MAX_BYTES = 220000;
 /** Modele czasem generuja absurdalnie dlugie "url" (padding zer) — odcinamy przed fetch. */
 const MAX_TOOL_URL_LENGTH = 2048;
 const WHOLE_FILE_OVERWRITE_EXISTING_MAX_CHARS = 1400;
+const FULL_SITE_MIN_HTML_CHARS = 1400;
+const FULL_SITE_MIN_CSS_CHARS = 1500;
+const WHOLE_FILE_REWRITE_MIN_CHARS = 900;
 const CODE_EDIT_EXTENSIONS = new Set([
   ".html", ".htm", ".css", ".scss", ".sass", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx",
   ".json", ".md", ".py", ".ps1", ".sh", ".bat", ".cmd", ".java", ".cs", ".go", ".rs",
@@ -229,29 +232,34 @@ ${TOOLS_PROMPT_BLOCK}
 PODSTAWOWY LOOP:
 1. Zrozum zadanie i sprawdz obecny folder. Przy operacjach na plikach i komendach uwzgledniaj biezacy folder jako kontekst sciezek; zmieniaj folder tylko gdy to ma sens dla zadania.
 2. Przed edycja istniejacego pliku przeczytaj istotny fragment.
-3. Zmieniaj najmniejszy sensowny fragment. Nie przepisuj calego pliku dla drobnej poprawki.
-4. Po bledzie przeczytaj dokladna tresc bledu, popraw przyczyne i sprobuj ponownie.
-5. Po zmianie uruchom waska weryfikacje: syntax check, test, smoke test albo odczyt pliku.
-6. Final po polsku: co zmieniono, jakie pliki, jaka weryfikacja.
+3. Gdy masz juz odczytany plik: nastepny krok ma byc edycja, test albo final z konkretna blokada. Nie czytaj w kolko tego samego pliku.
+4. Zmieniaj najmniejszy sensowny fragment. Nie przepisuj calego pliku dla drobnej poprawki.
+5. Po bledzie przeczytaj dokladna tresc bledu, popraw przyczyne i sprobuj ponownie.
+6. Po zmianie uruchom waska weryfikacje: syntax check, test, smoke test albo odczyt pliku.
+7. Final po polsku: co zmieniono, jakie pliki, jaka weryfikacja.
+
+CIAGLOSC ROZMOWY:
+- Gdy uzytkownik pisze "wszystko co wymieniles", "to co wyzej", "te punkty", "tak jak napisales" itp., odwolaj sie do ostatniej finalnej odpowiedzi asystenta z kontekstu i wykonaj te punkty.
+- Nie pros uzytkownika o ponowne podanie listy, jesli ta lista jest w RECENT_ASSISTANT_FINALS, Session summary albo historii zadania.
 
 ZASADY EDYCJI:
 - Preferuj mechanike Aider-style patch-first: surowe bloki SEARCH/REPLACE albo patch_batch z malymi, precyzyjnymi blokami.
 - Dla istniejacego pliku NIE wkladaj calej zawartosci pliku do JSON write_file. Najpierw read_file, potem maly SEARCH/REPLACE.
 - Dla nowego pliku z kodem/HTML/CSS mozesz uzyc pustego SEARCH:
-  sciezka/do/pliku.ext
+  folder/nazwa-pliku.ext
   <<<<<<< SEARCH
   =======
   pelna tresc nowego pliku
   >>>>>>> REPLACE
-- Taki pusty SEARCH utworzy plik, a gdy plik istnieje, dopisze tresc na koncu.
+- Taki pusty SEARCH utworzy plik tylko gdy plik nie istnieje. Dla istniejacego pliku uzyj dokladnego SEARCH albo jawnego write_file append.
 - SEARCH musi byc dokladnym fragmentem z pliku (zachowaj whitespace i wciecia).
 - Gdy SEARCH nie pasuje, najpierw read_file i popraw blok SEARCH, zamiast przepisywac caly plik.
 - Dla bardzo malych nowych plikow mozna uzyc write_file overwrite, ale przy wiekszym kodzie preferuj pusty SEARCH zamiast escapowania JSON.
 - Dla istniejacych plikow preferuj patch_edit/patch_batch z precyzyjnym SEARCH.
 - Append stosuj do celowych dopisek albo dzielenia duzego pliku na fragmenty.
-- Pelny overwrite istniejacego pliku tylko gdy plik jest generowany, bardzo maly, albo uzytkownik wyraznie chce przepisania.
+- Pelny overwrite istniejacego pliku tylko gdy plik jest generowany, bardzo maly, uzytkownik wyraznie chce przepisania, albo tworzysz kompletny artefakt strony/aplikacji (pelny HTML/CSS/JS), ktory runtime moze zweryfikowac.
 - SyntaxError/build error: nie panikuj. Odczytaj plik i linie z bledu, popraw minimalny region, rerun tego samego checka.
-- Jesli zapis sie nie uda, wyjasnij sobie powod z bledu: brak folderu -> mkdir (tylko gdy realnie brakuje), za dlugi content -> mniejsze chunki; odmowa -> alternatywa w workspace.
+- Jesli zapis sie nie uda, wyjasnij powod z bledu. Brak folderu -> mkdir tylko na folderze nadrzednym (np. endo-promo), nigdy na pelnej sciezce pliku (np. endo-promo/style.css). Za dlugi content -> SEARCH/REPLACE albo mniejsze bloki; odmowa -> alternatywa w workspace.
 
 ZASADY NARZEDZI I SIECI:
 - Nie zgaduj URL-i. Przy 404/403 wroc do strony glownej, dokumentacji, API albo uzyj extract_media.
@@ -308,6 +316,13 @@ const agentRecoveryMetrics = {
 let accessLevel = "sandbox"; // "sandbox" or "full"
 let chatHistory = [];
 let currentChatId = null;
+const DEFAULT_MEMORY_SETTINGS = {
+  generalMemoryEnabled: true,
+  crossChatMemoryEnabled: false,
+};
+let memorySettings = { ...DEFAULT_MEMORY_SETTINGS };
+let currentChatMemorySeed = "";
+let recentAssistantFinals = [];
 const fileRevisionHistory = new Map();
 const telemetryMonitor = createTelemetryMonitor();
 const baselineMetrics = createBaselineMetrics();
@@ -351,11 +366,13 @@ const API_PROVIDER_DEFAULTS = {
   openai: { id: "openai", label: "OpenAI", baseUrl: "https://api.openai.com/v1" },
   claude: { id: "claude", label: "Claude", baseUrl: "https://api.anthropic.com/v1" },
   openrouter: { id: "openrouter", label: "OpenRouter", baseUrl: "https://openrouter.ai/api/v1" },
+  deepseek: { id: "deepseek", label: "DeepSeek", baseUrl: "https://api.deepseek.com" },
 };
 let apiProviders = {
   openai: { enabled: false, apiKey: "", models: [], lastError: "", updatedAt: "" },
   claude: { enabled: false, apiKey: "", models: [], lastError: "", updatedAt: "" },
   openrouter: { enabled: false, apiKey: "", models: [], lastError: "", updatedAt: "" },
+  deepseek: { enabled: false, apiKey: "", models: [], lastError: "", updatedAt: "" },
 };
 const chatWebLookupCache = new Map();
 const runtimeRecoveryStateByModelId = new Map();
@@ -1079,8 +1096,97 @@ function saveAppSettings() {
     accessLevel,
     customModelSettingsByModelId,
     apiProviders,
+    memorySettings,
     workspaceRoot,
   });
+}
+
+function normalizeMemorySettings(raw = {}) {
+  return {
+    generalMemoryEnabled: raw?.generalMemoryEnabled == null
+      ? DEFAULT_MEMORY_SETTINGS.generalMemoryEnabled
+      : Boolean(raw.generalMemoryEnabled),
+    crossChatMemoryEnabled: raw?.crossChatMemoryEnabled == null
+      ? DEFAULT_MEMORY_SETTINGS.crossChatMemoryEnabled
+      : Boolean(raw.crossChatMemoryEnabled),
+  };
+}
+
+function getMemorySettingsForUi() {
+  return {
+    ...memorySettings,
+    crossChatMemoryActive: Boolean(memorySettings.crossChatMemoryEnabled && currentChatMemorySeed),
+  };
+}
+
+function normalizeAssistantFinalText(text = "") {
+  const clean = String(text || "").trim();
+  if (!clean) return "";
+  return textPreview(clean, 5000);
+}
+
+function rememberAssistantFinal(text = "") {
+  const clean = normalizeAssistantFinalText(text);
+  if (!clean) return;
+  recentAssistantFinals = [
+    { text: clean, at: new Date().toISOString(), chatId: currentChatId || "" },
+    ...recentAssistantFinals.filter((entry) => entry?.text !== clean),
+  ].slice(0, 3);
+}
+
+function extractAssistantFinalText(content = "") {
+  const text = String(content || "").trim();
+  if (!text) return "";
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === "object") {
+      if (typeof parsed.final === "string" && parsed.final.trim()) return parsed.final.trim();
+      if (parsed.tool || parsed.note) return "";
+    }
+  } catch {
+    // Plain assistant text is also a final answer in restored chats.
+  }
+  if (/^(Format error|Schema error|Execution failed):/i.test(text)) return "";
+  return text;
+}
+
+function rebuildRecentAssistantFinalsFromSession(session = {}) {
+  const finalTexts = [];
+  if (Array.isArray(session.fullContext)) {
+    for (const entry of session.fullContext) {
+      if (entry?.role !== "assistant") continue;
+      const finalText = extractAssistantFinalText(entry.content);
+      if (finalText) finalTexts.push(finalText);
+    }
+  }
+  if (!finalTexts.length && Array.isArray(session.entries)) {
+    for (const entry of session.entries) {
+      if (entry?.type !== "message" || entry.role !== "assistant") continue;
+      const finalText = extractAssistantFinalText(entry.text);
+      if (finalText) finalTexts.push(finalText);
+    }
+  }
+  recentAssistantFinals = [];
+  for (const finalText of finalTexts.slice(-3)) rememberAssistantFinal(finalText);
+}
+
+function getRecentAssistantFinalPromptMessages() {
+  if (!memorySettings.generalMemoryEnabled || !recentAssistantFinals.length) return [];
+  const blocks = recentAssistantFinals
+    .slice(0, 2)
+    .map((entry, index) => {
+      const label = index === 0 ? "najnowsza" : `poprzednia ${index + 1}`;
+      return `--- ${label} odpowiedz asystenta ---\n${entry.text}`;
+    });
+  return [{
+    role: "user",
+    content: [
+      "RECENT_ASSISTANT_FINALS",
+      "To sa ostatnie finalne odpowiedzi asystenta w tym czacie.",
+      "Gdy uzytkownik pisze np. 'wszystko co wymieniles', 'to co wyzej', 'zrob te punkty' albo 'tak jak napisales', odwolaj sie do tej tresci i dzialaj. Nie pytaj ponownie o liste, ktora sam podales.",
+      ...blocks,
+    ].join("\n"),
+  }];
 }
 
 function normalizeApiProviders(raw = {}) {
@@ -2696,6 +2802,142 @@ function createInitialMessages() {
   return [{ role: "system", content: createSystemPrompt() }];
 }
 
+function compactMemoryLine(value = "", max = 260) {
+  return compactWhitespace(value).slice(0, max);
+}
+
+function getSessionMessagesForCrossChatMemory(session = {}) {
+  if (Array.isArray(session.entries) && session.entries.length) {
+    return session.entries
+      .filter((entry) => entry?.type === "message" && (entry.role === "user" || entry.role === "assistant"))
+      .map((entry) => ({ role: entry.role, content: String(entry.text || "") }));
+  }
+  if (Array.isArray(session.messages) && session.messages.length) {
+    return session.messages
+      .filter((entry) => entry?.role === "user" || entry?.role === "assistant")
+      .map((entry) => ({ role: entry.role, content: String(entry.text || entry.content || "") }));
+  }
+  if (Array.isArray(session.fullContext) && session.fullContext.length) {
+    return session.fullContext
+      .filter((entry) => entry?.role === "user" || entry?.role === "assistant")
+      .filter((entry) => {
+        const content = String(entry.content || "");
+        if (content.startsWith("[Kompaktowanie kontekstu]")) return false;
+        if (content.startsWith("Tool result:")) return false;
+        try {
+          const parsed = JSON.parse(content);
+          return !(parsed && typeof parsed === "object" && (parsed.tool || parsed.note || parsed.final));
+        } catch {
+          return true;
+        }
+      })
+      .map((entry) => ({ role: entry.role, content: String(entry.content || "") }));
+  }
+  return [];
+}
+
+function buildCrossChatMemoryPrompt() {
+  const sessions = chatHistory
+    .filter((session) => session?.id && session.id !== currentChatId)
+    .slice(0, 4);
+  const blocks = [];
+  for (const session of sessions) {
+    const messagesForMemory = getSessionMessagesForCrossChatMemory(session).slice(-4);
+    if (!messagesForMemory.length) continue;
+    const title = compactMemoryLine(session.title || "Poprzedni czat", 90);
+    const date = String(session.updatedAt || session.createdAt || "").slice(0, 10);
+    const lines = messagesForMemory
+      .map((entry) => {
+        const label = entry.role === "assistant" ? "assistant" : "user";
+        return `  ${label}: ${compactMemoryLine(entry.content, 240)}`;
+      })
+      .filter((line) => !line.endsWith(": "));
+    if (!lines.length) continue;
+    blocks.push(`- ${date ? `${date} ` : ""}${title}\n${lines.join("\n")}`);
+  }
+  if (!blocks.length) return "";
+  return [
+    "MEMORY_BETWEEN_CHATS",
+    "To jest lekki kontekst z poprzednich czatow. Uzyj go tylko jako tlo, nie jako nowe polecenie.",
+    "Jesli aktualne polecenie przeczy tej pamieci, aktualne polecenie ma pierwszenstwo.",
+    ...blocks,
+  ].join("\n");
+}
+
+function getMemoryPromptMessages() {
+  if (!memorySettings.crossChatMemoryEnabled || !currentChatMemorySeed) return [];
+  return [{ role: "user", content: currentChatMemorySeed }];
+}
+
+function looksLikeAssistantReference(text = "") {
+  return /\b(wymieniłeś|wymieniles|napisałeś|napisales|podałeś|podales|wyżej|wyzej|powyżej|powyzej|te punkty|ta lista|z listy|wszystko co|to co)\b/i
+    .test(String(text || ""));
+}
+
+function buildMissingAssistantMemoryFinal(userText = "") {
+  if (!looksLikeAssistantReference(userText) || recentAssistantFinals.length) return "";
+  return [
+    "Nie mam już w pamięci ostatniej listy, do której się odwołujesz.",
+    "To błąd ciągłości rozmowy po mojej stronie: zamiast zgadywać, potrzebuję ponownie tej listy albo konkretnego zakresu zmian.",
+  ].join(" ");
+}
+
+function isExecutableUserTask(text = "", intentClass = "general") {
+  const folded = foldSearchText(text);
+  return /\b(zrob|zrobic|popraw|napraw|dodaj|wprowadz|wdroz|przebuduj|ulepsz|zmien|stworz|utworz|zaimplementuj|przygotuj|uruchom|zintegruj|sprawdz|zbuduj|przerob|build|fix|add|implement|update|refactor|create|make)\b/.test(folded);
+}
+
+function looksLikeClarificationLoopFinal(text = "") {
+  const folded = foldSearchText(text);
+  return (
+    /\b(nie otrzymalem|nie dostalem|brak konkretnego|doprecyzuj|podaj konkret|daj znac|co chcesz|co potrzebujesz|na czym mam sie skupic|mogę ją przejrzeć|moge ja przejrzec)\b/.test(folded)
+    || /\b(chcesz zebym|czy mam|czy chcesz)\b/.test(folded)
+  );
+}
+
+function buildActiveTaskContractPromptMessages() {
+  const userTask = String(currentAgentUserPrompt || "").trim();
+  if (!userTask) return [];
+  const lines = [
+    "ACTIVE_TASK_CONTRACT",
+    "Aktualne polecenie uzytkownika ponizej jest nadrzedne wobec starszych komunikatow narzedzi i summary.",
+    "Jesli to polecenie zawiera liste zmian albo odwoluje sie do poprzedniej listy, wykonaj je. Nie odpowiadaj pytaniem o zakres, jesli zakres jest juz w tym bloku lub RECENT_ASSISTANT_FINALS.",
+    `intent_class=${currentAgentIntentClass}`,
+    "current_user_request:",
+    userTask,
+  ];
+  if (isExecutableUserTask(userTask, currentAgentIntentClass)) {
+    lines.push("execution_rule: To jest zadanie wykonawcze. Wybierz narzedzie i dzialaj, zamiast finala typu 'co chcesz zebym zrobil'.");
+    if (currentAgentIntentClass === "filesystem") {
+      lines.push("filesystem_rule: Po udanym read_file tego samego pliku nie wolno wracac do identycznego read_file. Nastepny krok to patch_batch/write_file/run_powershell albo final z konkretna blokada.");
+      lines.push("rewrite_rule: Dla kompletnego generowanego artefaktu strony/aplikacji mozesz uzyc write_file overwrite, jesli tresc jest pelnym HTML/CSS/JS i nie jest placeholderem.");
+    }
+  }
+  return [{ role: "user", content: lines.join("\n") }];
+}
+
+function enforceAgentFinalPolicy(action = {}, step = null) {
+  if (!action?.final) return null;
+  if (!isExecutableUserTask(currentAgentUserPrompt, currentAgentIntentClass)) return null;
+  if (!looksLikeClarificationLoopFinal(action.final)) return null;
+  return {
+    errorCode: "premature_clarification_final",
+    error:
+      "Model probuje zakonczyc pytaniem o zakres mimo wykonawczego polecenia uzytkownika. Uzyj ACTIVE_TASK_CONTRACT / RECENT_ASSISTANT_FINALS i wykonaj narzedzie: read_file, patch_batch, write_file albo run_powershell.",
+  };
+}
+
+function resetCurrentChatState(options = {}) {
+  const includeCrossChatMemory = options.includeCrossChatMemory !== false;
+  messages = createInitialMessages();
+  currentChatId = null;
+  recentAssistantFinals = [];
+  currentChatMemorySeed = includeCrossChatMemory && memorySettings.crossChatMemoryEnabled
+    ? buildCrossChatMemoryPrompt()
+    : "";
+  if (agentCore?.memory) agentCore.memory.hardReset("");
+}
+
 function getModelsForUi() {
   const catalog = loadModelCatalog();
   const localModels = catalog.models.map((model) => {
@@ -2806,7 +3048,21 @@ async function switchToFallbackModel(reason, failedModelIds) {
 }
 
 function normalizeInsideRoot(rawPath = ".") {
-  const base = path.isAbsolute(String(rawPath)) ? String(rawPath) : path.join(cwd, String(rawPath));
+  const raw = String(rawPath || ".");
+  if (looksLikePlaceholderPath(raw)) {
+    throw new Error(`PLACEHOLDER_PATH_BLOCKED path=${raw} :: To wyglada jak przykladowa sciezka, nie realny plik w workspace. Uzyj konkretnej sciezki z zadania, np. index.html albo style.css.`);
+  }
+  const normalizedRaw = raw.replace(/\\/g, path.sep);
+  const cwdBaseName = path.basename(cwd).toLowerCase();
+  const firstSegment = normalizedRaw.split(/[\\/]+/).find(Boolean)?.toLowerCase() || "";
+  const shouldResolveFromWorkspaceRoot =
+    !path.isAbsolute(normalizedRaw)
+    && cwd !== workspaceRoot
+    && firstSegment
+    && firstSegment === cwdBaseName;
+  const base = path.isAbsolute(normalizedRaw)
+    ? normalizedRaw
+    : path.join(shouldResolveFromWorkspaceRoot ? path.dirname(cwd) : cwd, normalizedRaw);
   const resolved = path.resolve(base);
   if (accessLevel === "full") return resolved;
   const rel = path.relative(workspaceRoot, resolved);
@@ -3789,6 +4045,46 @@ function parseJsonAction(raw) {
   throw lastError || new Error(`Model nie zwrocil JSON: ${text.slice(0, 300)}`);
 }
 
+function unescapeLooseJsonString(value = "") {
+  return String(value || "")
+    .replace(/\\r\\n/g, "\n")
+    .replace(/\\n/g, "\n")
+    .replace(/\\t/g, "\t")
+    .replace(/\\"/g, "\"")
+    .replace(/\\\\/g, "\\");
+}
+
+function recoverPatchBatchFromMalformedJsonPatch(raw) {
+  const text = String(raw || "");
+  if (!/"tool"\s*:\s*"patch_batch"/i.test(text)) return null;
+  if (!text.includes("<<<<<<< SEARCH") || !text.includes(">>>>>>> REPLACE")) return null;
+  const patchKey = text.search(/"patch"\s*:\s*"/i);
+  if (patchKey < 0) return null;
+  const valueStart = text.indexOf("\"", text.indexOf(":", patchKey) + 1) + 1;
+  if (valueStart <= 0) return null;
+  const searchIndex = text.indexOf("<<<<<<< SEARCH", valueStart);
+  if (searchIndex < 0) return null;
+  const beforeSearch = unescapeLooseJsonString(text.slice(valueStart, searchIndex)).trim();
+  const pathLine = beforeSearch.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).pop();
+  if (!pathLine) return null;
+  const replaceEndMarker = ">>>>>>> REPLACE";
+  const replaceEnd = text.indexOf(replaceEndMarker, searchIndex);
+  if (replaceEnd < 0) return null;
+  const patchBody = text.slice(searchIndex, replaceEnd + replaceEndMarker.length);
+  const patchText = `${pathLine}\n${unescapeLooseJsonString(patchBody)}`;
+  try {
+    const blocks = parsePatchBatchText(patchText, "");
+    if (!Array.isArray(blocks) || !blocks.length) return null;
+    return {
+      note: "Auto-recover: extracted patch_batch from malformed JSON patch string.",
+      tool: "patch_batch",
+      args: { blocks },
+    };
+  } catch {
+    return null;
+  }
+}
+
 function parseActionEnvelope(raw) {
   let text = String(raw || "").trim();
   if (!text) throw new Error("Pusta odpowiedz modelu.");
@@ -3796,15 +4092,23 @@ function parseActionEnvelope(raw) {
     text = text.replace(/^```(?:[a-z0-9_-]+)?\s*/i, "").replace(/\s*```$/i, "").trim();
   }
   if (text.includes("<<<<<<< SEARCH") && text.includes(">>>>>>> REPLACE")) {
-    const blocks = parsePatchBatchText(text, "");
-    if (Array.isArray(blocks) && blocks.length) {
-      return {
-        note: "Aider-style SEARCH/REPLACE blocks detected.",
-        tool: "patch_batch",
-        args: { blocks },
-      };
+    try {
+      const blocks = parsePatchBatchText(text, "");
+      if (Array.isArray(blocks) && blocks.length) {
+        return {
+          note: "Aider-style SEARCH/REPLACE blocks detected.",
+          tool: "patch_batch",
+          args: { blocks },
+        };
+      }
+    } catch (error) {
+      const recovered = recoverPatchBatchFromMalformedJsonPatch(text);
+      if (recovered) return recovered;
+      throw error;
     }
   }
+  const recoveredPatchJson = recoverPatchBatchFromMalformedJsonPatch(text);
+  if (recoveredPatchJson) return recoveredPatchJson;
   const parsed = parseJsonAction(text);
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error("Action v2 requires a single JSON object.");
@@ -3929,14 +4233,10 @@ function extractUserPromptFromPlannerRaw(raw) {
 function recoverActionFromNaturalText(raw, options = {}) {
   const text = String(raw || "").trim();
   if (!text) return null;
-  const lowered = text.toLowerCase();
   const intentClass = options.intentClass || "general";
   const userPrompt = compactWhitespace(String(options.userPrompt || "").trim());
 
-  if (
-    intentClass === "web"
-    || /\b(fetch_url|internet|online|search|wyszukaj|duckduckgo)\b/i.test(text)
-  ) {
+  if (intentClass === "web") {
     const hintedPrompt = extractUserPromptFromPlannerRaw(text);
     const query = hintedPrompt || userPrompt || extractSearchQueryFromPlannerText(text);
     if (!query) return null;
@@ -3968,24 +4268,90 @@ function stableJson(value) {
   return JSON.stringify(value);
 }
 
-function actionSignature(action) {
-  return `${action?.tool || ""}:${stableJson(action?.args || {})}`;
+function actionPathHint(action = {}) {
+  const args = action.args || {};
+  if (args.path) return String(args.path);
+  if (args.defaultPath) return String(args.defaultPath);
+  if (Array.isArray(args.blocks) && args.blocks[0]?.path) return String(args.blocks[0].path);
+  return "";
+}
+
+function errorClassFromToolPayload(payload = {}) {
+  const text = `${payload?.errorCode || ""} ${payload?.error || ""}`;
+  if (/SEARCH_REPLACE_NO_EXACT_MATCH/i.test(text)) return "search_replace_no_match";
+  if (/PATH_COLLISION_DIRECTORY|EISDIR|To nie jest plik|path is directory|jest katalogiem/i.test(text)) return "path_directory_collision";
+  if (/MKDIR_FILE_PATH_BLOCKED|mkdir_file_path|wyglada jak plik|wyglada jak sciezka pliku/i.test(text)) return "mkdir_file_path";
+  if (/WHOLE_FILE_OVERWRITE|large_write_file/i.test(text)) return "large_write_file_blocked";
+  if (/FULL_SITE_UNDERBUILT_ARTIFACT/i.test(text)) return "underbuilt_full_site_artifact";
+  if (/EMPTY_SEARCH_EXISTING_FILE_BLOCKED/i.test(text)) return "empty_search_existing_file";
+  if (/repeated|zablokowano zapetlenie|zapetlenie/i.test(text)) return "repeated_action";
+  if (/ENOENT|nie znaleziono|not found/i.test(text)) return "path_missing";
+  return payload?.ok === false ? "tool_error" : "";
+}
+
+function compactActionForSignature(action = {}) {
+  const tool = action?.tool || "";
+  const args = action?.args || {};
+  if (tool === "write_file") {
+    return { tool, path: args.path || "", mode: args.mode || "overwrite", contentChars: String(args.content ?? "").length };
+  }
+  if (tool === "patch_edit") {
+    return {
+      tool,
+      path: args.path || "",
+      searchHash: crypto.createHash("sha1").update(String(args.search ?? "")).digest("hex").slice(0, 10),
+      replaceHash: crypto.createHash("sha1").update(String(args.replace ?? "")).digest("hex").slice(0, 10),
+    };
+  }
+  if (tool === "patch_batch") {
+    const blocks = Array.isArray(args.blocks) ? args.blocks : [];
+    const patchText = String(args.patch ?? "");
+    return {
+      tool,
+      defaultPath: args.defaultPath || "",
+      patchHash: patchText ? crypto.createHash("sha1").update(patchText).digest("hex").slice(0, 12) : "",
+      blocks: blocks.map((block) => ({
+        path: block?.path || args.defaultPath || "",
+        searchHash: crypto.createHash("sha1").update(String(block?.search ?? "")).digest("hex").slice(0, 10),
+        replaceHash: crypto.createHash("sha1").update(String(block?.replace ?? "")).digest("hex").slice(0, 10),
+      })),
+    };
+  }
+  return { tool, args };
+}
+
+function actionSignature(action, context = {}) {
+  const base = compactActionForSignature(action || {});
+  const lastErrorClass = errorClassFromToolPayload(context?.lastToolPayload || {});
+  if (!lastErrorClass) return stableJson(base);
+  const lastErrorPath = actionPathHint(context?.lastAction || {});
+  return stableJson({ ...base, afterError: lastErrorClass, afterPath: lastErrorPath });
 }
 
 function getActionRepeatLimit(action) {
   const tool = action?.tool;
   if (["fetch_url", "extract_media", "download_file"].includes(tool)) return 1;
+  if (["read_file"].includes(tool)) return 1;
+  if (["ls"].includes(tool)) return 2;
   if (["write_file", "patch_edit", "patch_batch"].includes(tool)) return 1;
   if (["run_powershell"].includes(tool)) return 2;
   return 3;
 }
 
 function buildRepeatedActionBlock(action, count) {
+  const pathHint = actionPathHint(action);
+  const isPatch = action?.tool === "patch_batch" || action?.tool === "patch_edit";
+  const isReadOnly = action?.tool === "read_file" || action?.tool === "ls";
   return {
     ok: false,
+    errorCode: "repeated_action",
     error: `Zablokowano zapetlenie: identyczna akcja '${action.tool}' byla juz wykonana ${count} raz(y) w tym zadaniu.`,
     recoveryHint:
-      "Nie powtarzaj tej samej akcji. Zmien taktyke: uzyj innego zrodla, innego URL, extract_media na stronie nadrzednej, read_file wynikow, albo zakoncz finalem z tym co wiadomo.",
+      isPatch
+        ? `Nie powtarzaj tego samego patcha${pathHint ? ` dla ${pathHint}` : ""}. Wykonaj read_file/ls dla aktywnej sciezki i popraw minimalny blok albo zakoncz finalem z konkretna blokada.`
+        : isReadOnly
+          ? `Masz juz odczyt${pathHint ? ` dla ${pathHint}` : ""}. Nastepna akcja musi byc patch_batch/write_file/run_powershell albo final z konkretna blokada; nie czytaj ponownie tego samego miejsca.`
+          : "Nie powtarzaj tej samej akcji. Zmien taktyke: uzyj innego narzedzia albo finalu z tym co wiadomo.",
   };
 }
 
@@ -4113,7 +4479,7 @@ function makeJsonRepairPrompt(error, raw, options = {}) {
   const errMsg = String(error?.message || error).slice(0, 500);
   const location = options.location || extractJsonErrorLocation(errMsg, raw);
   const filesystemPatchEscape = options.intentClass === "filesystem"
-    ? `\nPoniewaz to krok filesystem, jesli blad wynika z kodu w polu JSON (HTML/CSS/JS, backslashe, cudzyslowy), NIE naprawiaj go na sile jako JSON. Zamiast tego mozesz zwrocic surowe bloki Aider-style:\nsciezka/do/pliku.ext\n<<<<<<< SEARCH\nfragment 1:1 albo puste dla nowego pliku\n=======\nnowa tresc\n>>>>>>> REPLACE\n`
+    ? `\nPoniewaz to krok filesystem, jesli blad wynika z kodu w polu JSON (HTML/CSS/JS, backslashe, cudzyslowy), NIE naprawiaj go na sile jako JSON. Zamiast tego mozesz zwrocic surowe bloki Aider-style:\nfolder/nazwa-pliku.ext\n<<<<<<< SEARCH\nfragment 1:1 albo puste dla nowego pliku\n=======\nnowa tresc\n>>>>>>> REPLACE\n`
     : "";
   const responseContract = options.intentClass === "filesystem"
     ? "Odpowiedz jednym poprawnym JSON-em zgodnym z kontraktem ALBO surowymi blokami SEARCH/REPLACE — bez tekstu przed/po, bez tablicy [...]."
@@ -4238,12 +4604,12 @@ function normalizeToolArgsFromRoot(parsed, toolName) {
     cd: ["path"],
     ls: ["path", "maxEntries"],
     read_file: ["path", "maxBytes"],
-    write_file: ["path", "content", "mode"],
+    write_file: ["path", "content", "mode", "allowWholeFileOverwrite", "allowLargeJsonContent"],
     mkdir: ["path"],
     patch_edit: ["path", "search", "replace", "count"],
     patch_batch: ["patch", "defaultPath", "blocks"],
-    run_powershell: ["command", "timeout"],
-    fetch_url: ["url", "timeout", "raw"],
+    run_powershell: ["command", "timeout", "cwd"],
+    fetch_url: ["url", "timeout", "raw", "query", "search", "q"],
     extract_media: ["url", "timeout"],
     download_file: ["url", "path"],
   };
@@ -4328,6 +4694,13 @@ function validateModelAction(parsed) {
     if (!p || p === "." || p === "./") {
       return { ok: false, error: `Narzędzie ${toolName} wymaga poprawnego args.path wskazującego plik/folder (nie '.' ani pusty).` };
     }
+    if (toolName === "mkdir" && looksLikeFilePath(p)) {
+      return {
+        ok: false,
+        error:
+          `Narzędzie mkdir dostało ścieżkę wyglądającą jak plik (${p}). Utwórz tylko folder nadrzędny albo użyj patch_batch z pustym SEARCH do stworzenia pliku.`,
+      };
+    }
   }
   return { ok: true, action: { ...parsed, tool: toolName, args } };
 }
@@ -4335,6 +4708,20 @@ function validateModelAction(parsed) {
 function makeActionSchemaRepairPrompt(schemaError, raw, options = {}) {
   const location = options.location || extractJsonErrorLocation(String(schemaError || ""), raw);
   const context = buildJsonErrorContext(raw, location, 3);
+  if (/premature_clarification_final/i.test(String(schemaError || ""))) {
+    return `Poprzednia odpowiedz byla przedwczesnym pytaniem o zakres.
+Blad: ${String(schemaError).slice(0, 500)}
+
+Masz juz zakres w ACTIVE_TASK_CONTRACT / RECENT_ASSISTANT_FINALS / historii narzedzi.
+Nie zwracaj finala ani pytania doprecyzowujacego.
+Zwroc teraz jedno narzedzie, ktore realnie kontynuuje zadanie:
+- {"tool":"read_file","args":{"path":"sciezka-z-zadania","maxBytes":40000}}
+- {"tool":"patch_batch","args":{"patch":"..."}}
+- {"tool":"run_powershell","args":{"command":"...","timeout":60}}
+
+Odrzucona odpowiedz (fragment):
+${String(raw || "").slice(0, 1600)}`;
+  }
   const filesystemPatchEscape = options.intentClass === "filesystem"
     ? `\nDla edycji plikow mozesz zamiast JSON zwrocic surowe bloki SEARCH/REPLACE. Dla nowego pliku uzyj pustego SEARCH; dla istniejacego pliku SEARCH musi byc dokladnym fragmentem z read_file.\n`
     : "";
@@ -4356,7 +4743,7 @@ Dozwolone wartosci "tool" (dokladnie te stringi): ${allowedToolNamesList()}
 
 Nie uzywaj kluczy "name", "function" zamiast "tool". Nie zwracaj samego {"note":"..."} bez "final" ani bez "tool".
 Nigdy nie zwracaj JSON jako tablicy [...] — tylko jeden obiekt {...}.
-Jesli blad dotyczy zbyt dlugiego write_file w jednym kroku: zwroc krotszy poprawny write_file (overwrite lub append), reszte w nastepnych krokach.
+Jesli blad dotyczy zbyt dlugiego write_file w jednym kroku: zamien go na surowy SEARCH/REPLACE albo patch_batch; nie pakuj duzego CSS/HTML/JS do JSON.
 
 Jesli blad mowi o braku "final" / pustym "final", a uzytkownik pytal o mozliwosci („co potrafisz” itd.): zwroc np.
 {"note":"Mozliwosci agenta","final":"Pracuje w sandboxie plikow. Narzedzia: ${allowedToolNamesList()}. Odpowiadam po polsku."}
@@ -4383,14 +4770,18 @@ function buildFilesystemPatchFirstReminder() {
     "PATCH_FIRST_REMINDER",
     "Dla tego kroku preferuj Aider-style patch-first zamiast duzego JSON z content.",
     "Jesli edytujesz istniejacy plik: read_file istotnego fragmentu -> maly SEARCH/REPLACE.",
+    "Jesli juz odczytales ten sam plik w tym zadaniu, nie powtarzaj read_file. Przejdz do patch_batch/write_file/testu albo finala z blokada.",
     "Jesli tworzysz nowy plik z kodem/HTML/CSS/JS: uzyj pustego SEARCH w surowym bloku albo patch_batch, nie uciekaj calego pliku w JSON.",
+    "Jesli celowo przebudowujesz kompletna strone/aplikacje, pelny write_file overwrite jest dozwolony tylko dla kompletnego artefaktu (pelny HTML/CSS/JS, bez placeholdera).",
+    "Pusty SEARCH jest tylko dla nowego pliku; dla istniejacego pliku uzyj dokladnego SEARCH z read_file.",
     "Format surowy:",
-    "sciezka/do/pliku.ext",
+    "folder/nazwa-pliku.ext",
     "<<<<<<< SEARCH",
     "dokladny fragment albo pusto dla nowego pliku",
     "=======",
     "nowa tresc",
     ">>>>>>> REPLACE",
+    "Nie uzywaj mkdir na sciezce pliku. Dla endo-promo/style.css mkdir moze dotyczyc tylko endo-promo.",
     "PowerShell, fetch_url, read_file, ls, mkdir i final nadal zwracaj jako normalny JSON action.",
   ].join("\n");
 }
@@ -4398,15 +4789,33 @@ function buildFilesystemPatchFirstReminder() {
 function enforceFilesystemPatchFirst(validatedAction) {
   const action = validatedAction?.action || null;
   if (!action || action.final) return null;
+  if (action.tool === "fetch_url") {
+    const url = String(action.args?.url || "");
+    if (/duckduckgo\.com\/html\/\?q=/i.test(url)) {
+      return {
+        errorCode: "filesystem_search_recovery_blocked",
+        error:
+          "Zadanie jest filesystem/code, a akcja probuje szukac tresci promptu w DuckDuckGo. To jest bledne recovery. Wroc do read_file/patch_batch/run_powershell i realizuj lokalny cel zadania.",
+      };
+    }
+  }
   if (action.tool === "write_file") {
     const targetPath = String(action.args?.path || "");
     const content = String(action.args?.content ?? "");
     const mode = String(action.args?.mode || "overwrite");
-    if (mode !== "append" && isCodeEditPath(targetPath) && content.length > 5000 && action.args?.allowLargeJsonContent !== true) {
+    const safeWholeRewrite = shouldAllowWholeFileRewriteForTask(targetPath, content, mode);
+    if (mode !== "append" && isCodeEditPath(targetPath) && content.length > 5000 && action.args?.allowLargeJsonContent !== true && !safeWholeRewrite) {
       return {
         errorCode: "large_write_file_json_blocked",
         error:
-          "write_file ma zbyt duzy content dla pliku kodu. Uzyj surowych Aider-style blokow SEARCH/REPLACE z pustym SEARCH dla nowego pliku albo patch_batch zamiast escapowac caly plik w JSON.",
+          "write_file ma zbyt duzy content dla pliku kodu i nie wyglada na kompletny generowany artefakt. Uzyj surowych Aider-style blokow SEARCH/REPLACE z pustym SEARCH dla nowego pliku albo patch_batch zamiast escapowac caly plik w JSON.",
+      };
+    }
+    if (shouldRejectUnderbuiltFullSiteArtifact(targetPath, content, mode)) {
+      return {
+        errorCode: "underbuilt_full_site_artifact",
+        error:
+          `${buildUnderbuiltFullSiteError(targetPath, content)} Uzyj kompletnej zawartosci albo kontynuuj realnymi sekcjami, nie finalizuj placeholdera.`,
       };
     }
   }
@@ -4426,9 +4835,10 @@ async function getNextActionWithRepair(abortSignal, failedModelIds, step = null)
         detail: `Naprawiam format akcji (${attempt}/${retryLimit}).`,
       });
     }
+    const basePromptMessages = [...createInitialMessages(), ...getMemoryPromptMessages()];
     let promptMessages = agentCore?.memory
-      ? [...createInitialMessages(), ...agentCore.memory.getModelContext()]
-      : messages;
+      ? [...basePromptMessages, ...agentCore.memory.getModelContext()]
+      : [...basePromptMessages, ...messages.slice(1)];
     const model = getModelConfig();
     const modelSettings = getModelSettingsForId(model?.id || selectedModelId);
     const preferredEditFormat = getPreferredEditFormat(model?.id || selectedModelId, currentAgentIntentClass);
@@ -4442,6 +4852,13 @@ async function getNextActionWithRepair(abortSignal, failedModelIds, step = null)
         return shrinkRetainedMessageForCompaction(msg, maxChars);
       });
       promptMessages = [head, ...tail];
+    }
+    const durableTaskMessages = [
+      ...getRecentAssistantFinalPromptMessages(),
+      ...buildActiveTaskContractPromptMessages(),
+    ];
+    if (durableTaskMessages.length) {
+      promptMessages = [...promptMessages, ...durableTaskMessages];
     }
     if (preferredEditFormat === "search_replace") {
       promptMessages = [
@@ -4544,6 +4961,22 @@ async function getNextActionWithRepair(abortSignal, failedModelIds, step = null)
       );
       if (agentCore?.memory) {
         agentCore.memory.append("assistant", `Schema error: ${validated.errorCode || "invalid_action"} ${validated.error}`);
+        agentCore.memory.append("user", guidance);
+      }
+      continue;
+    }
+    const finalPolicyGate = enforceAgentFinalPolicy(validated.action, step);
+    if (finalPolicyGate) {
+      lastError = new Error(finalPolicyGate.error);
+      bumpAgentRecoveryMetric("schemaErrors");
+      if (attempt >= retryLimit) break;
+      const guidance = makeActionSchemaRepairPrompt(
+        `${finalPolicyGate.errorCode} ${finalPolicyGate.error}`.trim(),
+        raw,
+        { step, attempt, retryLimit, intentClass: currentAgentIntentClass },
+      );
+      if (agentCore?.memory) {
+        agentCore.memory.append("assistant", `Schema error: ${finalPolicyGate.errorCode} ${finalPolicyGate.error}`);
         agentCore.memory.append("user", guidance);
       }
       continue;
@@ -4878,7 +5311,22 @@ function getToolRecoveryHint(error, action) {
     return "Uzyj sciezki wzglednej w aktualnym workspace albo utworz podfolder w workspace i zapisz tam wynik. Nie probuj zapisywac poza sandboxiem.";
   }
   if (/ENOENT|nie znaleziono|Nie znaleziono/i.test(message)) {
-    return "Sprawdz ls/pwd, utworz brakujacy folder przez mkdir albo przeczytaj plik o poprawnej nazwie zanim ponowisz operacje.";
+    return "Sprawdz ls/pwd i sciezke. Jesli brakuje folderu, mkdir wykonaj tylko na folderze nadrzednym, nigdy na pelnej sciezce pliku.";
+  }
+  if (/MKDIR_FILE_PATH_BLOCKED|mkdir_file_path|wyglada jak sciezka pliku|wyglada jak plik/i.test(message)) {
+    return "To jest sciezka pliku, nie folderu. Uzyj mkdir tylko dla folderu nadrzednego, a plik utworz przez patch_batch z pustym SEARCH albo maly write_file.";
+  }
+  if (/FULL_SITE_UNDERBUILT_ARTIFACT/i.test(message)) {
+    return "Nie koncz na placeholderze. Zachowaj cel pelnej strony i wygeneruj kompletna zawartosc pliku przez patch_batch/surowy SEARCH/REPLACE albo kontynuuj realnymi sekcjami.";
+  }
+  if (/EMPTY_SEARCH_EXISTING_FILE_BLOCKED/i.test(message)) {
+    return "Pusty SEARCH jest tylko do nowego pliku. Dla istniejacego pliku wykonaj read_file i uzyj dokladnego SEARCH albo jawnego write_file append.";
+  }
+  if (/repeated_action|Zablokowano zapetlenie|zapetlenie/i.test(message)) {
+    return "Nie powtarzaj tej samej akcji. Jesli to byl read_file/ls, masz juz kontekst: wykonaj patch_batch/write_file/run_powershell albo final z konkretna blokada.";
+  }
+  if (/PATH_COLLISION_DIRECTORY|EISDIR|To nie jest plik|jest katalogiem|path is directory/i.test(message)) {
+    return "Sciezka koliduje z katalogiem albo nie jest plikiem. Uzyj ls folderu nadrzednego, nie usuwaj automatycznie; wybierz poprawna nazwe pliku albo zakoncz finalem z konkretna kolizja.";
   }
   if (/EACCES|EPERM|access denied|odmowa/i.test(message)) {
     return "Brak uprawnien. Zapisz alternatywny plik w workspace, np. output/ lub exports/, i poinformuj uzytkownika o obejściu.";
@@ -4902,7 +5350,7 @@ function getToolRecoveryHint(error, action) {
     return "Błąd 404/403. PRZESTAŃ ZGADYWAĆ linki URL w ciemno! Twoja hipoteza o adresie jest błędna. Natychmiast wróć na stronę główną domeny (lub do Google) i użyj narzędzia extract_media, aby odczytać PRAWDZIWE adresy z kodu HTML lub wyników wyszukiwania. Nie powtarzaj prób na podobnych linkach.";
   }
   if (tool === "write_file" || tool === "patch_edit" || tool === "patch_batch") {
-    return "Jesli zapis nie jest mozliwy (np. tekst za dlugi), zacznij od nowa zapisujac partiami przez mode 'append' w konkretnych miejscach. Jesli to nowy skrypt, sprawdz potem przez run_powershell czy sie wykonuje/otwiera poprawnie. W ostatecznosci utworz plik obok w exports/.";
+    return "Dla plikow kodu trzymaj patch-first: przy nowym pliku pusty SEARCH, przy istniejacym read_file i maly dokladny SEARCH. Nie powtarzaj tego samego duzego patcha w ciemno.";
   }
   if (/Nieznane narzedzie|undefined/i.test(message)) {
     return "Uzyto zlego lub nieistniejacego (undefined) narzedzia. Zmien na poprawne narzedzie z listy 'Dostepne narzedzia'.";
@@ -4962,7 +5410,7 @@ const SHELL_MUTATING_PATTERNS = [
 
 const SHELL_SAFE_READONLY_PATTERNS = [
   /(^|[^a-z0-9_])(pwd|cd|ls|dir|echo|whoami|date|time|hostname|ver|where|which)\b/i,
-  /(^|[^a-z0-9_])(get-childitem|get-location|get-process|get-date|get-command|get-history|systeminfo)\b/i,
+  /(^|[^a-z0-9_])(get-childitem|get-location|get-process|get-date|get-command|get-history|get-content|select-string|measure-object|test-path|systeminfo)\b/i,
 ];
 
 const SHELL_BACKGROUND_PATTERNS = [
@@ -4979,10 +5427,43 @@ function shouldRunShellInBackground(command = "") {
   return SHELL_BACKGROUND_PATTERNS.some((re) => re.test(cmd));
 }
 
-function runBackgroundShell(command) {
-  const child = spawn(command, {
-    cwd,
-    shell: true,
+function getPowerShellExecutable() {
+  const candidates = [];
+  if (process.platform === "win32") {
+    if (process.env.SystemRoot) {
+      candidates.push(path.join(process.env.SystemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"));
+    }
+    candidates.push("powershell.exe");
+  } else {
+    candidates.push("pwsh", "powershell");
+  }
+  for (const candidate of candidates) {
+    try {
+      if (path.isAbsolute(candidate) && fs.existsSync(candidate)) return candidate;
+      if (!path.isAbsolute(candidate)) return candidate;
+    } catch {
+      // try next candidate
+    }
+  }
+  return process.platform === "win32" ? "powershell.exe" : "pwsh";
+}
+
+function getPowerShellArgs(command = "") {
+  return [
+    "-NoLogo",
+    "-NoProfile",
+    "-NonInteractive",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-Command",
+    String(command || ""),
+  ];
+}
+
+function runBackgroundShell(command, commandCwd = cwd) {
+  const child = spawn(getPowerShellExecutable(), getPowerShellArgs(command), {
+    cwd: commandCwd,
+    shell: false,
     detached: true,
     stdio: "ignore",
     env: {
@@ -4995,7 +5476,7 @@ function runBackgroundShell(command) {
   });
   child.unref();
   return {
-    cwd: relativeToRoot(cwd),
+    cwd: relativeToRoot(commandCwd),
     exitCode: null,
     background: true,
     pid: child.pid,
@@ -5046,19 +5527,16 @@ async function runPowerShell(command, timeoutSeconds, commandCwd = cwd) {
   }
 
   if (shouldRunShellInBackground(command)) {
-    const prevCwd = cwd;
-    cwd = commandCwd;
-    const result = runBackgroundShell(command);
-    cwd = prevCwd;
+    const result = runBackgroundShell(command, commandCwd);
     emit("status", { status: "shell-background-started", detail: `Uruchomiono w tle: ${command}` });
     return result;
   }
 
   return new Promise((resolve) => {
     const timeout = Math.max(1, Math.min(Number(timeoutSeconds) || 60, 300)) * 1000;
-    const child = spawn(command, {
+    const child = spawn(getPowerShellExecutable(), getPowerShellArgs(command), {
       cwd: commandCwd,
-      shell: true,
+      shell: false,
       env: {
         ...process.env,
         TEMP: path.join(workspaceRoot, ".tmp"),
@@ -5397,6 +5875,9 @@ function looksLikePatchPathCandidate(line = "") {
 
 function normalizePatchPathCandidate(line = "") {
   const s = stripPatchFilenameDecorations(line);
+  if (looksLikePlaceholderPath(s)) {
+    throw new Error(`PLACEHOLDER_PATH_BLOCKED path=${s} :: Nie uzywaj placeholderow typu sciezka/do/index.html. Podaj realna sciezke z workspace.`);
+  }
   return looksLikePatchPathCandidate(s) ? s : "";
 }
 
@@ -5461,6 +5942,9 @@ function parsePatchBatchText(patchText = "", defaultPath = "") {
   const blocks = [];
   let idx = 0;
   let currentPath = String(defaultPath || "").trim();
+  if (looksLikePlaceholderPath(currentPath)) {
+    throw new Error(`PLACEHOLDER_PATH_BLOCKED path=${currentPath} :: Nie uzywaj placeholderow typu sciezka/do/index.html. Podaj realna sciezke z workspace.`);
+  }
   while (idx < lines.length) {
     const line = lines[idx];
     if (!line) {
@@ -5498,6 +5982,41 @@ function parsePatchBatchText(patchText = "", defaultPath = "") {
     idx += 1;
   }
   return blocks;
+}
+
+function normalizePatchBlocksForExecution(args = {}) {
+  if (!Array.isArray(args.blocks) || !args.blocks.length) {
+    return parsePatchBatchText(String(args.patch || ""), String(args.defaultPath || ""));
+  }
+  return args.blocks.map((block, index) => {
+    if (block?.searchChars !== undefined || block?.replaceChars !== undefined || block?.patchChars !== undefined) {
+      throw new Error(
+        "PATCH_BATCH_METADATA_NOT_EXECUTABLE :: To sa metadane pamieci (searchChars/replaceChars/patchChars), nie patch. Zwroc prawdziwe pola path/search/replace albo surowy SEARCH/REPLACE.",
+      );
+    }
+    const blockPath = String(block?.path || args.defaultPath || "").trim();
+    if (!blockPath) {
+      throw new Error(`INVALID_PATCH_BLOCK index=${index + 1} :: Blok SEARCH/REPLACE nie ma poprawnej sciezki pliku.`);
+    }
+    if (looksLikePlaceholderPath(blockPath)) {
+      throw new Error(
+        `PLACEHOLDER_PATH_BLOCKED path=${blockPath} :: To wyglada jak przykladowa sciezka. Uzyj realnej sciezki z workspace, bez sciezka/do ani path/to.`,
+      );
+    }
+    if (typeof block?.search !== "string" || typeof block?.replace !== "string") {
+      throw new Error(
+        `INVALID_PATCH_BLOCK index=${index + 1} :: patch_batch blocks wymagaja stringow path/search/replace. Nie uzywaj skroconych metadanych z TASK_STATE.`,
+      );
+    }
+    if (!block.search.trim() && !block.replace.trim()) {
+      throw new Error(`EMPTY_PATCH_BLOCK index=${index + 1} :: SEARCH i REPLACE sa puste.`);
+    }
+    return {
+      path: blockPath,
+      search: block.search,
+      replace: block.replace,
+    };
+  });
 }
 
 function recoverActionFromSearchReplaceBlocks(raw) {
@@ -5545,11 +6064,153 @@ function shouldRejectWholeFileOverwrite(targetPath, beforeSnapshot, content, mod
   return true;
 }
 
+function countMatches(text = "", re) {
+  return (String(text || "").match(re) || []).length;
+}
+
+function hasBalancedCurlyBraces(text = "") {
+  let depth = 0;
+  let seen = false;
+  for (const ch of String(text || "")) {
+    if (ch === "{") {
+      depth += 1;
+      seen = true;
+    } else if (ch === "}") {
+      depth -= 1;
+      if (depth < 0) return false;
+    }
+  }
+  return seen && depth === 0;
+}
+
+function looksLikeCompleteHtmlDocument(content = "") {
+  const text = String(content || "").trim();
+  if (text.length < WHOLE_FILE_REWRITE_MIN_CHARS) return false;
+  return (
+    /<!doctype\s+html/i.test(text)
+    && /<html[\s>]/i.test(text)
+    && /<head[\s>]/i.test(text)
+    && /<body[\s>]/i.test(text)
+    && /<\/body>/i.test(text)
+    && /<\/html>/i.test(text)
+  );
+}
+
+function looksLikeCompleteCssStylesheet(content = "") {
+  const text = String(content || "").trim();
+  if (text.length < WHOLE_FILE_REWRITE_MIN_CHARS) return false;
+  if (!hasBalancedCurlyBraces(text)) return false;
+  return countMatches(text, /{/g) >= 6 && /(^|\n)\s*[:.#a-zA-Z0-9_*@-][^{]+\{/m.test(text);
+}
+
+function looksLikeCompleteJsArtifact(content = "") {
+  const text = String(content || "").trim();
+  if (text.length < WHOLE_FILE_REWRITE_MIN_CHARS) return false;
+  if (!hasBalancedCurlyBraces(text)) return false;
+  return (
+    /\b(import|export|const|let|var|function|class|document\.|addEventListener)\b/.test(text)
+    && countMatches(text, /[;{}]/g) >= 8
+  );
+}
+
+function isCompleteGeneratedArtifact(targetPath = "", content = "") {
+  const ext = path.extname(String(targetPath || "")).toLowerCase();
+  if (ext === ".html" || ext === ".htm") return looksLikeCompleteHtmlDocument(content);
+  if (ext === ".css" || ext === ".scss" || ext === ".sass") return looksLikeCompleteCssStylesheet(content);
+  if ([".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx"].includes(ext)) return looksLikeCompleteJsArtifact(content);
+  return false;
+}
+
+function isGeneratedArtifactRewriteRequest() {
+  const folded = foldSearchText(currentAgentUserPrompt);
+  return (
+    isFullWebsiteRequest(currentAgentUserPrompt)
+    || /\b(przepisz|przebuduj|od nowa|zresetuj|full rewrite|rewrite|landing|promo|promocyjn|stronk|stron|artefakt)\b/.test(folded)
+  );
+}
+
+function shouldAllowWholeFileRewriteForTask(targetPath, content, mode = "overwrite", beforeSnapshot = null) {
+  if (String(mode || "overwrite") === "append") return false;
+  if (!isCodeEditPath(targetPath)) return false;
+  if (isSuspiciousStatusOverwrite(targetPath, content, mode)) return false;
+  if (shouldRejectUnderbuiltFullSiteArtifact(targetPath, content, mode)) return false;
+  if (!isCompleteGeneratedArtifact(targetPath, content)) return false;
+  if (beforeSnapshot && beforeSnapshot.exists === false) return true;
+  return isGeneratedArtifactRewriteRequest();
+}
+
+function foldSearchText(value = "") {
+  return String(value || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+}
+
+function isFullWebsiteRequest(text = "") {
+  const folded = foldSearchText(text);
+  const wantsWebsite = /\b(strona|strone|strony|website|site|landing|html|promocyjn|promo|portfolio|wizytowk)\b/.test(folded);
+  const wantsFull = /\b(pelna|pelny|pelne|pelni|rozbudowan|kompletn|full|complete|wszystko|cala|caly|profesjonaln|produkcyjn)\b/.test(folded);
+  return wantsWebsite && wantsFull;
+}
+
+function isFullWebsiteArtifactPath(targetPath = "") {
+  const ext = path.extname(String(targetPath || "")).toLowerCase();
+  return [".html", ".htm", ".css", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx"].includes(ext);
+}
+
+function looksLikePlaceholderArtifactContent(content = "") {
+  const folded = foldSearchText(content);
+  return (
+    /\b(czesc|witaj na naszej stronie|przykladow|nasza firma|wszelkie prawa zastrzezone)\b/.test(folded)
+    || /copyright\s*(?:©|\(c\))?\s*2023/i.test(String(content || ""))
+    || /font-family\s*:\s*arial\s*,\s*sans-serif/i.test(String(content || ""))
+    || /background-color\s*:\s*#f0f0f0/i.test(String(content || ""))
+  );
+}
+
+function underbuiltFullSiteReason(targetPath, content = "") {
+  const ext = path.extname(String(targetPath || "")).toLowerCase();
+  const text = String(content ?? "").trim();
+  if (!text) return "tresc jest pusta";
+  if (looksLikePlaceholderArtifactContent(text)) return "tresc wyglada jak placeholder/minimalny szablon";
+  if ((ext === ".html" || ext === ".htm") && text.length < FULL_SITE_MIN_HTML_CHARS) {
+    return `HTML ma tylko ${text.length} znakow`;
+  }
+  if (ext === ".css" && text.length < FULL_SITE_MIN_CSS_CHARS) {
+    return `CSS ma tylko ${text.length} znakow`;
+  }
+  return "";
+}
+
+function shouldRejectUnderbuiltFullSiteArtifact(targetPath, content, mode = "overwrite") {
+  if (String(mode || "overwrite") === "append") return false;
+  if (!isFullWebsiteRequest(currentAgentUserPrompt)) return false;
+  if (!isFullWebsiteArtifactPath(targetPath)) return false;
+  return Boolean(underbuiltFullSiteReason(targetPath, content));
+}
+
+function buildUnderbuiltFullSiteError(targetPath, content) {
+  const rel = path.isAbsolute(String(targetPath || "")) ? relativeToRoot(targetPath) : String(targetPath || "");
+  const reason = underbuiltFullSiteReason(targetPath, content) || "artefakt jest za maly";
+  return [
+    `FULL_SITE_UNDERBUILT_ARTIFACT path=${rel} :: ${reason}.`,
+    "Uzytkownik poprosil o pelna/rozbudowana strone, wiec nie zapisuj placeholdera jako gotowego efektu.",
+    "Zachowaj ten sam cel: dostarcz kompletna strone przez patch_batch / surowy SEARCH/REPLACE z pelna zawartoscia pliku albo kontynuuj realnymi sekcjami.",
+  ].join(" ");
+}
+
 async function applyPatchBlockToFile(block = {}) {
   const target = normalizeInsideRoot(block.path);
   const relativePath = relativeToRoot(target);
   const search = String(block.search ?? "");
   const replace = String(block.replace ?? "");
+  try {
+    const stat = await fsp.stat(target);
+    if (stat.isDirectory()) {
+      throw new Error(
+        `PATH_COLLISION_DIRECTORY path=${relativePath} :: Ta sciezka jest katalogiem, a patch_batch probuje traktowac ja jak plik. Nie usuwam katalogu automatycznie; wybierz poprawna sciezke pliku albo zakoncz finalem z prosba o decyzje.`,
+      );
+    }
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
   const beforeSnapshot = await snapshotFileForHistory(target);
   const exists = beforeSnapshot.exists === true;
   let before = "";
@@ -5564,8 +6225,13 @@ async function applyPatchBlockToFile(block = {}) {
   let strategy;
   let replaced = 1;
   if (!search.trim()) {
-    after = before + replace;
-    strategy = exists ? "empty_search_append" : "empty_search_create";
+    if (exists) {
+      throw new Error(
+        `EMPTY_SEARCH_EXISTING_FILE_BLOCKED path=${relativePath} :: Pusty SEARCH jest tylko do tworzenia nowego pliku. Dla istniejacego pliku uzyj read_file i dokladnego SEARCH albo jawnego write_file append.`,
+      );
+    }
+    after = replace;
+    strategy = "empty_search_create";
     replaced = 0;
   } else {
     const patched = applyPatchStyleSearchReplace(before, search, replace, 1);
@@ -5573,6 +6239,10 @@ async function applyPatchBlockToFile(block = {}) {
     after = patched.updated;
     strategy = patched.strategy;
     replaced = patched.replaced;
+  }
+
+  if (!exists && shouldRejectUnderbuiltFullSiteArtifact(target, after, "overwrite")) {
+    throw new Error(buildUnderbuiltFullSiteError(target, after));
   }
 
   await fsp.mkdir(path.dirname(target), { recursive: true });
@@ -5654,6 +6324,11 @@ async function executeTool(action) {
       content: buffer.subarray(0, maxBytes).toString("utf8"),
     };
   } else if (tool === "mkdir") {
+    if (looksLikeFilePath(args.path)) {
+      throw new Error(
+        `MKDIR_FILE_PATH_BLOCKED path=${args.path} :: To wyglada jak sciezka pliku, nie folderu. Uzyj mkdir tylko dla folderu nadrzednego, a plik utworz przez patch_batch z pustym SEARCH albo write_file.`,
+      );
+    }
     const target = normalizeInsideRoot(args.path);
     await fsp.mkdir(target, { recursive: true });
     result = { path: relativeToRoot(target) };
@@ -5666,10 +6341,15 @@ async function executeTool(action) {
         "Odrzucono podejrzany overwrite: tresc wyglada jak komunikat statusu modelu, a nie zawartosc pliku. Zakoncz przez final zamiast zapisywac komunikat do pliku.",
       );
     }
-    if (shouldRejectWholeFileOverwrite(target, beforeSnapshot, args.content, args.mode, args.allowWholeFileOverwrite === true)) {
+    const allowWholeFileRewrite = args.allowWholeFileOverwrite === true
+      || shouldAllowWholeFileRewriteForTask(target, args.content, args.mode, beforeSnapshot);
+    if (shouldRejectWholeFileOverwrite(target, beforeSnapshot, args.content, args.mode, allowWholeFileRewrite)) {
       throw new Error(
-        "WHOLE_FILE_OVERWRITE_BLOCKED: istniejacy plik kodu jest za duzy na bezpieczny overwrite przez JSON. Uzyj Aider-style SEARCH/REPLACE: read_file istotnego fragmentu, potem patch_batch z malymi blokami albo surowe bloki SEARCH/REPLACE.",
+        "WHOLE_FILE_OVERWRITE_BLOCKED: istniejacy plik kodu jest za duzy na bezpieczny overwrite przez JSON i nie przeszedl walidacji kompletnego artefaktu. Uzyj Aider-style SEARCH/REPLACE: read_file istotnego fragmentu, potem patch_batch z malymi blokami albo surowe bloki SEARCH/REPLACE.",
       );
+    }
+    if (shouldRejectUnderbuiltFullSiteArtifact(target, args.content, args.mode)) {
+      throw new Error(buildUnderbuiltFullSiteError(target, args.content));
     }
     await fsp.mkdir(path.dirname(target), { recursive: true });
     if ((args.mode || "overwrite") === "append") {
@@ -5680,7 +6360,12 @@ async function executeTool(action) {
     const after = await readTextIfExists(target);
     const afterSnapshot = await snapshotFileForHistory(target);
     const revision = recordFileRevision(target, beforeSnapshot, afterSnapshot, { action: "write_file" });
-    result = { path: relativeToRoot(target), bytes: fs.statSync(target).size, mode: args.mode || "overwrite" };
+    result = {
+      path: relativeToRoot(target),
+      bytes: fs.statSync(target).size,
+      mode: args.mode || "overwrite",
+      wholeFileRewriteAllowed: allowWholeFileRewrite,
+    };
     emit("file-change", {
       path: relativeToRoot(target),
       action: "write_file",
@@ -5716,13 +6401,7 @@ async function executeTool(action) {
       history: revision.history,
     });
   } else if (tool === "patch_batch") {
-    const blocks = Array.isArray(args.blocks) && args.blocks.length
-      ? args.blocks.map((block) => ({
-        path: String(block?.path || args.defaultPath || "").trim(),
-        search: String(block?.search ?? ""),
-        replace: String(block?.replace ?? ""),
-      }))
-      : parsePatchBatchText(String(args.patch || ""), String(args.defaultPath || ""));
+    const blocks = normalizePatchBlocksForExecution(args);
     if (!blocks.length) throw new Error("Brak blokow SEARCH/REPLACE do zastosowania.");
     const applied = [];
     for (const block of blocks) {
@@ -5882,7 +6561,7 @@ function messageContentToText(content) {
 
 function summarizeToolResultForCompaction(text) {
   const raw = String(text ?? "");
-  if (!raw.startsWith("Wynik narzedzia")) return null;
+  if (!raw.startsWith("Wynik narzedzia") && !raw.startsWith("Tool result:")) return null;
   const jsonStart = raw.indexOf("\n");
   if (jsonStart < 0) return "Narzędzie: wynik bez danych.";
   try {
@@ -5915,6 +6594,83 @@ function summarizeToolResultForCompaction(text) {
   } catch {
     return `Narzędzie: ${compactWhitespace(raw).slice(0, 260)}`;
   }
+}
+
+function summarizeToolPayloadForAgentMemory(payload = {}, action = {}) {
+  const tool = action?.tool || payload?.tool || "";
+  const base = {
+    ok: Boolean(payload?.ok),
+    tool,
+  };
+  if (!payload?.ok) {
+    return JSON.stringify({
+      ...base,
+      errorCode: payload?.errorCode || "",
+      error: textPreview(payload?.error || "", 1400),
+      recoveryHint: textPreview(payload?.recoveryHint || "", 900),
+    });
+  }
+
+  const result = payload?.result;
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    return JSON.stringify({ ...base, result });
+  }
+
+  if (tool === "read_file") {
+    return JSON.stringify({
+      ...base,
+      result: {
+        path: result.path,
+        bytes: result.bytes,
+        truncated: Boolean(result.truncated),
+        content: textPreview(result.content || "", 12000),
+      },
+    });
+  }
+
+  if (tool === "ls" && Array.isArray(result.entries)) {
+    return JSON.stringify({
+      ...base,
+      result: {
+        path: result.path,
+        entries: result.entries.slice(0, 120),
+        omittedEntries: Math.max(0, result.entries.length - 120),
+      },
+    });
+  }
+
+  if (tool === "run_powershell") {
+    return JSON.stringify({
+      ...base,
+      result: {
+        exitCode: result.exitCode,
+        stdout: textPreview(result.stdout || "", 4000),
+        stderr: textPreview(result.stderr || "", 4000),
+      },
+    });
+  }
+
+  if (tool === "fetch_url") {
+    return JSON.stringify({
+      ...base,
+      result: {
+        url: result.url,
+        status: result.status,
+        contentType: result.contentType,
+        truncated: Boolean(result.truncated),
+        content: textPreview(result.content || "", 6000),
+        contentHint: result.contentHint || "",
+      },
+    });
+  }
+
+  return JSON.stringify({
+    ...base,
+    result: JSON.parse(JSON.stringify(result, (_key, value) => {
+      if (typeof value === "string") return textPreview(value, 3000);
+      return value;
+    })),
+  });
 }
 
 function summarizeMessageForCompaction(msg) {
@@ -6097,12 +6853,12 @@ function formatChatFacingError(error, options = {}) {
 function getAgentCore() {
   if (!agentCore) {
     const memory = createSessionMemory({
-      maxTaskMessages: 8,
+      maxTaskMessages: 18,
       summarize: (batch) => batch.map(summarizeMessageForCompaction).join("\n"),
       detectIntentKey: (text) => compactWhitespace(String(text || "")).toLowerCase().slice(0, 220),
       shouldResetOnIntentChange: (_currentKey, _nextKey, userText) => {
         const text = String(userText || "").toLowerCase();
-        return /\b(nowe zadanie|od nowa|zresetuj|reset kontekstu|zacznij od zera|new task|start over)\b/.test(text);
+        return /\b(nowe zadanie|od nowa|zresetuj|twardy reset|pełny reset|pelny reset|reset kontekstu|zacznij od zera|new task|start over)\b/.test(text);
       },
     });
     const planner = createAgentPlanner({
@@ -6114,6 +6870,7 @@ function getAgentCore() {
       executeTool,
       onToolResult: (payload) => emit("tool-result", payload),
       validateAction: (action) => validateAction(action, { intentClass: currentAgentIntentClass }),
+      getRecoveryHint: getToolRecoveryHint,
     });
     const orchestrator = createTurnOrchestrator({
       planner,
@@ -6123,18 +6880,22 @@ function getAgentCore() {
       compactMessages,
       appendSourcesSection,
       buildRepeatedActionBlock,
+      summarizeToolPayloadForMemory: summarizeToolPayloadForAgentMemory,
       onRecoverableError: async ({ step, action, toolPayload }) => {
         if (!agentCore?.memory) return;
         bumpAgentRecoveryMetric("toolErrors");
         const repairHint = buildMachineRepairPrompt(
-          { errorCode: toolPayload?.errorCode || "tool_error", error: toolPayload?.error || "Tool failed." },
-          JSON.stringify(action || {}),
+          {
+            errorCode: toolPayload?.errorCode || "tool_error",
+            error: `${toolPayload?.error || "Tool failed."}${toolPayload?.recoveryHint ? `\nRecovery hint: ${toolPayload.recoveryHint}` : ""}`,
+          },
+          stableJson(compactActionForSignature(action || {})),
         );
         emit("status", {
           status: "action-recover",
           detail: `Recovery step ${step}: ${String(toolPayload?.error || "tool error").slice(0, 160)}`,
         });
-        agentCore.memory.append("assistant", `Execution failed: ${toolPayload?.error || "unknown error"}`);
+        agentCore.memory.append("assistant", `Execution failed: ${toolPayload?.error || "unknown error"}${toolPayload?.recoveryHint ? `\nRecovery hint: ${toolPayload.recoveryHint}` : ""}`);
         agentCore.memory.append("user", repairHint);
       },
     });
@@ -6154,6 +6915,9 @@ async function runAgent(userText) {
     await validateCurrentWorkspaceRoot();
     if (!isCloudModelSelected()) await ensureServer(DEFAULT_PORT);
     const core = getAgentCore();
+    if (!memorySettings.generalMemoryEnabled) {
+      core.memory.hardReset("");
+    }
 
     let content;
     if (typeof userText === "object" && userText !== null && userText.imageBase64) {
@@ -6173,6 +6937,15 @@ async function runAgent(userText) {
     currentAgentIntentClass = classifyIntent(content);
     currentAgentUserPrompt = content;
     emit("agent-phase", { phase: "understand", intentClass: currentAgentIntentClass });
+    const missingAssistantMemoryFinal = buildMissingAssistantMemoryFinal(content);
+    if (missingAssistantMemoryFinal) {
+      messages.push({ role: "user", content });
+      messages.push({ role: "assistant", content: JSON.stringify({ final: missingAssistantMemoryFinal }) });
+      rememberAssistantFinal(missingAssistantMemoryFinal);
+      emit("final", { text: missingAssistantMemoryFinal });
+      baselineMetrics.recordRun({ mode: "agent", latencyMs: Date.now() - startedAt, ok: false, backend: runtimeBackendStatus.activeBackend });
+      return { ok: false, error: missingAssistantMemoryFinal };
+    }
     messages.push({ role: "user", content });
 
     const model = getModelConfig();
@@ -6187,6 +6960,8 @@ async function runAgent(userText) {
       failedModelIds,
     });
     const finalText = String(result?.final || "");
+    messages.push({ role: "assistant", content: JSON.stringify({ final: finalText }) });
+    rememberAssistantFinal(finalText);
     emit("final", { text: finalText });
     try {
       const quickChoices = await Promise.race([
@@ -6197,7 +6972,6 @@ async function runAgent(userText) {
     } catch {
       // quick choices are optional and should never block final output
     }
-    messages.push({ role: "assistant", content: JSON.stringify({ final: finalText }) });
     baselineMetrics.recordRun({ mode: "agent", latencyMs: Date.now() - startedAt, ok: true, backend: runtimeBackendStatus.activeBackend });
     return { ok: true, final: finalText };
   } catch (error) {
@@ -6209,14 +6983,18 @@ async function runAgent(userText) {
       mode: "agent",
       modelName: getModelConfig()?.displayName,
     });
-    emit("final", { text: message });
     messages.push({
       role: "assistant",
       content: JSON.stringify({ note: "Zadanie zatrzymane z powodu bledu.", final: message }),
     });
+    rememberAssistantFinal(message);
+    emit("final", { text: message });
     baselineMetrics.recordRun({ mode: "agent", latencyMs: Date.now() - startedAt, ok: false, backend: runtimeBackendStatus.activeBackend });
     return { ok: false, error: message };
   } finally {
+    if (!memorySettings.generalMemoryEnabled && agentCore?.memory) {
+      agentCore.memory.hardReset("");
+    }
     runInProgress = false;
     runAbortController = null;
     emit("agent-recovery-metrics", { ...agentRecoveryMetrics });
@@ -6295,15 +7073,18 @@ async function runSimpleChat(userText) {
       }
       return false;
     };
-    const history = messages
-      .filter((msg) => (msg.role === "user" || msg.role === "assistant") && !isAgentControlMessage(msg))
-      .slice(-12)
-      .map((msg) => ({
-        role: msg.role,
-        content: stripSourceSectionsFromHistory(String(msg.content || "")).slice(0, 3000),
-      }));
+    const history = memorySettings.generalMemoryEnabled
+      ? messages
+        .filter((msg) => (msg.role === "user" || msg.role === "assistant") && !isAgentControlMessage(msg))
+        .slice(-12)
+        .map((msg) => ({
+          role: msg.role,
+          content: stripSourceSectionsFromHistory(String(msg.content || "")).slice(0, 3000),
+        }))
+      : [];
     const chatMessages = [
       { role: "system", content: CHAT_SYSTEM_PROMPT },
+      ...getMemoryPromptMessages(),
       ...history,
       { role: "user", content: text },
     ];
@@ -6464,6 +7245,7 @@ async function runSimpleChat(userText) {
     }
     messages.push({ role: "user", content: text });
     messages.push({ role: "assistant", content: reply });
+    rememberAssistantFinal(reply);
     emit("final", { text: reply, chatMode: true });
     baselineMetrics.recordRun({ mode: "chat", latencyMs: Date.now() - startedAt, ok: true, backend: runtimeBackendStatus.activeBackend });
     return { ok: true, final: reply };
@@ -6477,6 +7259,7 @@ async function runSimpleChat(userText) {
       modelName: getModelConfig()?.displayName,
     });
     emit("final", { text: message, chatMode: true });
+    rememberAssistantFinal(message);
     baselineMetrics.recordRun({ mode: "chat", latencyMs: Date.now() - startedAt, ok: false, backend: runtimeBackendStatus.activeBackend });
     return { ok: false, error: message };
   } finally {
@@ -6518,6 +7301,7 @@ function getState() {
     maxMessages: getActiveMaxMessages(),
     agentRuntime,
     accessLevel,
+    memorySettings: getMemorySettingsForUi(),
   };
 }
 
@@ -6582,6 +7366,7 @@ app.whenReady().then(async () => {
   if (settings.apiProviders && typeof settings.apiProviders === "object") {
     apiProviders = normalizeApiProviders(settings.apiProviders);
   }
+  memorySettings = normalizeMemorySettings(settings.memorySettings || {});
   // Legacy migration: global customModelSettings + maxMessages -> selectedModelId entry.
   if (settings.customModelSettings && typeof settings.customModelSettings === "object") {
     const targetModelId = selectedModelId || loadModelCatalog().defaultModelId;
@@ -6638,11 +7423,10 @@ ipcMain.handle("app:select-workspace", async () => {
   return getState();
 });
 ipcMain.handle("app:restore-workspace", async (_event, root) => restoreWorkspaceRoot(root));
-ipcMain.handle("app:reset-chat", () => {
-  messages = createInitialMessages();
-  if (agentCore?.memory) agentCore.memory.hardReset("");
-  currentChatId = null;
+ipcMain.handle("app:reset-chat", (_event, options = {}) => {
+  resetCurrentChatState({ includeCrossChatMemory: options?.includeCrossChatMemory !== false });
   emit("status", { status: "chat-reset", detail: "Wyczyszczono kontekst rozmowy." });
+  return getState();
 });
 ipcMain.handle("app:set-model", async (_event, modelId) => {
   const model = findModelById(modelId);
@@ -6663,6 +7447,8 @@ ipcMain.handle("app:set-reasoning", (_event, level) => {
   selectedReasoning = level;
   saveAppSettings();
   messages = createInitialMessages();
+  currentChatMemorySeed = "";
+  recentAssistantFinals = [];
   if (agentCore?.memory) agentCore.memory.hardReset("");
   emit("status", { status: "reasoning-selected", detail: `Intensywnosc: ${REASONING_LEVELS[level].label}` });
   return getState();
@@ -6709,10 +7495,38 @@ ipcMain.handle("app:set-access-level", (_event, level) => {
   emit("status", { status: "access-changed", detail: `Poziom dostepu: ${level === "full" ? "Pelny" : "Sandbox"}` });
   return { accessLevel };
 });
+ipcMain.handle("app:update-memory-settings", (_event, payload = {}) => {
+  const patch = payload && typeof payload === "object" ? payload : {};
+  const previous = { ...memorySettings };
+  memorySettings = normalizeMemorySettings({
+    ...memorySettings,
+    ...(Object.hasOwn(patch, "generalMemoryEnabled")
+      ? { generalMemoryEnabled: patch.generalMemoryEnabled }
+      : {}),
+    ...(Object.hasOwn(patch, "crossChatMemoryEnabled")
+      ? { crossChatMemoryEnabled: patch.crossChatMemoryEnabled }
+      : {}),
+  });
+  if (previous.generalMemoryEnabled && !memorySettings.generalMemoryEnabled && agentCore?.memory) {
+    agentCore.memory.hardReset("");
+  }
+  if (!memorySettings.crossChatMemoryEnabled) {
+    currentChatMemorySeed = "";
+  } else if (!currentChatId) {
+    currentChatMemorySeed = buildCrossChatMemoryPrompt();
+  }
+  saveAppSettings();
+  emit("status", {
+    status: "memory-settings-changed",
+    detail: `Pamiec ogolna: ${memorySettings.generalMemoryEnabled ? "on" : "off"}, miedzy czatami: ${memorySettings.crossChatMemoryEnabled ? "on" : "off"}.`,
+  });
+  return getState();
+});
 ipcMain.handle("app:save-chat", (_event, session) => {
   // Wzbogacamy sesje o pelny techniczny kontekst z pamieci main process
   if (session.id) {
     session.fullContext = messages;
+    currentChatId = session.id;
   }
   const idx = chatHistory.findIndex((c) => c.id === session.id);
   if (idx >= 0) chatHistory[idx] = session;
@@ -6726,6 +7540,9 @@ ipcMain.handle("app:load-chat-context", (_event, chatId) => {
   if (session && Array.isArray(session.fullContext)) {
     messages = session.fullContext;
     currentChatId = chatId;
+    currentChatMemorySeed = "";
+    rebuildRecentAssistantFinalsFromSession(session);
+    if (agentCore?.memory) agentCore.memory.hardReset("");
     // Odswiezamy system prompt na wypadek zmiany skilli/modelu w miedzyczasie
     refreshSystemPrompt();
     return { ok: true, messageCount: messages.length };

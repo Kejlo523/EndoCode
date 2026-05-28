@@ -525,6 +525,87 @@ select:focus {
   background: rgba(240, 185, 82, 0.08);
 }
 
+.memory-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.035);
+  min-width: 0;
+  flex-shrink: 0;
+}
+
+.memory-controls.memory-controls-off {
+  opacity: 0.72;
+}
+
+.memory-controls-label {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.memory-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 20px;
+  cursor: pointer;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.memory-switch input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.memory-switch-track {
+  width: 26px;
+  height: 14px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.12);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  position: relative;
+  flex-shrink: 0;
+  transition: background var(--transition), border-color var(--transition);
+}
+
+.memory-switch-track::after {
+  content: "";
+  position: absolute;
+  width: 8px;
+  height: 8px;
+  top: 2px;
+  left: 2px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.72);
+  transition: transform var(--transition), background var(--transition);
+}
+
+.memory-switch input:checked + .memory-switch-track {
+  background: rgba(139, 196, 154, 0.18);
+  border-color: rgba(139, 196, 154, 0.45);
+}
+
+.memory-switch input:checked + .memory-switch-track::after {
+  transform: translateX(12px);
+  background: var(--success);
+}
+
+.memory-switch input:disabled ~ .memory-switch-text,
+.memory-switch input:disabled + .memory-switch-track {
+  opacity: 0.55;
+  cursor: default;
+}
+
 /* ══════════════ CONVERSATION LAYOUT ══════════════ */
 .main-content-layout {
   display: flex;
@@ -602,6 +683,45 @@ select:focus {
   color: var(--text-secondary);
   max-width: 420px;
   line-height: 1.6;
+}
+
+.welcome-memory-strip {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  max-width: min(620px, 100%);
+  margin-bottom: 4px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.welcome-memory-label {
+  color: var(--text-secondary);
+  font-weight: 700;
+}
+
+.welcome-memory-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border-subtle);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.welcome-memory-pill.on {
+  color: var(--success);
+  border-color: rgba(139, 196, 154, 0.26);
+  background: rgba(139, 196, 154, 0.08);
+}
+
+.welcome-memory-pill.off {
+  color: var(--text-muted);
 }
 
 /* ── Messages ── */
@@ -2976,6 +3096,9 @@ details.diff-details[data-expanded="true"] > summary.diff-summary.file-change-su
   .control-pill select { min-width: 60px; font-size: 11px; }
   .pill-label { padding: 4px 6px; font-size: 9px; }
   .chat-title { font-size: 13px; }
+  .memory-controls { gap: 4px; padding: 3px 4px; }
+  .memory-controls-label,
+  .memory-switch-text { display: none; }
   .conversation-scroll { padding: 14px 10px 10px; }
   .models-toolbar { flex-direction: column; align-items: stretch; }
   .models-import-group { flex-direction: column; }

@@ -40,6 +40,7 @@ contextBridge.exposeInMainWorld("endocode", {
   getApiProviders: () => ipcRenderer.invoke("app:get-api-providers"),
   updateApiProvider: (payload) => ipcRenderer.invoke("app:update-api-provider", payload),
   refreshApiProviderModels: (providerId) => ipcRenderer.invoke("app:refresh-api-provider-models", providerId),
+  updateMemorySettings: (payload) => ipcRenderer.invoke("app:update-memory-settings", payload),
   openExternal: (url) => ipcRenderer.invoke("app:open-external", url),
   onEvent: (callback) => {
     const listener = (_event, payload) => callback(payload);
